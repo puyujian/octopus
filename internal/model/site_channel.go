@@ -193,6 +193,15 @@ type SiteSourceKeyUpdateRequest struct {
 	KeysToDelete []int                     `json:"keys_to_delete,omitempty"`
 }
 
+type SiteSourceKeyAutoCompletionResult struct {
+	SiteID         int    `json:"site_id"`
+	AccountID      int    `json:"account_id"`
+	AttemptedCount int    `json:"attempted_count"`
+	CompletedCount int    `json:"completed_count"`
+	PendingCount   int    `json:"pending_count"`
+	Message        string `json:"message"`
+}
+
 type SiteGroupProjectionUpdateRequest struct {
 	GroupKey           string `json:"group_key" binding:"required"`
 	ProjectionDisabled bool   `json:"projection_disabled"`

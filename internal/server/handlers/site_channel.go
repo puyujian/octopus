@@ -31,6 +31,7 @@ func init() {
 		Use(middleware.RequireJSON()).
 		AddRoute(router.NewRoute("/:siteId/account/:accountId/keys", http.MethodPost).Handle(createSiteChannelKey)).
 		AddRoute(router.NewRoute("/:siteId/account/:accountId/source-keys", http.MethodPut).Handle(updateSiteSourceKeys)).
+		AddRoute(router.NewRoute("/:siteId/account/:accountId/source-keys/auto-complete", http.MethodPost).Handle(autoCompleteSiteSourceKeys)).
 		AddRoute(router.NewRoute("/:siteId/account/:accountId/group-projection", http.MethodPut).Handle(updateSiteGroupProjection)).
 		AddRoute(router.NewRoute("/:siteId/account/:accountId/model-routes", http.MethodPut).Handle(updateSiteChannelModelRoutes)).
 		AddRoute(router.NewRoute("/:siteId/account/:accountId/model-disabled", http.MethodPut).Handle(updateSiteChannelModelDisabled)).
@@ -140,6 +141,20 @@ func updateSiteSourceKeys(c *gin.Context) {
 		return
 	}
 	resp.Success(c, data)
+}
+
+func autoCompleteSiteSourceKeys(c *gin.Context) {
+	siteID, accountID, ok := parseSiteChannelIDs(c)
+	if !ok {
+		return
+	}
+
+	result, err := sitesvc.AutoCompleteSiteSourceKeys(c.Request.Context(), siteID, accountID)
+	if err != nil {
+		resp.ErrorWithAppError(c, http.StatusBadGateway, apperror.Wrap(op.CodeSiteChannelSourceKeyUpdateFailed, "site source key auto-completion failed", err).WithStatus(http.StatusBadGateway))
+		return
+	}
+	resp.Success(c, result)
 }
 
 func updateSiteGroupProjection(c *gin.Context) {

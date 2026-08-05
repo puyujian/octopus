@@ -403,6 +403,15 @@ export type SiteSourceKeyUpdateRequest = {
     keys_to_delete?: number[];
 };
 
+export type SiteSourceKeyAutoCompletionResult = {
+    site_id: number;
+    account_id: number;
+    attempted_count: number;
+    completed_count: number;
+    pending_count: number;
+    message: string;
+};
+
 export type SiteGroupProjectionUpdateRequest = {
     group_key: string;
     projection_disabled: boolean;
@@ -550,6 +559,24 @@ export function useUpdateAnySiteSourceKeys() {
         },
         onError: (error) => {
             logger.error('site source key update failed:', error);
+        },
+    });
+}
+
+export function useAutoCompleteSiteSourceKeys() {
+    const queryClient = useQueryClient();
+
+    return useMutation({
+        mutationFn: async ({ siteId, accountId }: { siteId: number; accountId: number }) =>
+            apiClient.post<SiteSourceKeyAutoCompletionResult>(
+                getAccountPath(siteId, accountId, '/source-keys/auto-complete'),
+                {},
+            ),
+        onSuccess: () => {
+            invalidateSiteChannelAndRelated(queryClient);
+        },
+        onError: (error) => {
+            logger.error('site source key auto-completion failed:', error);
         },
     });
 }

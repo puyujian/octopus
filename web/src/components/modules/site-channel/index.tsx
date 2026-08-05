@@ -79,7 +79,6 @@ import {
     type SiteChannelAccount,
     type SiteChannelCard,
     type SiteChannelGroup,
-    type SiteSourceKeyUpdateRequest,
     type SiteModelDisableUpdateRequest,
     type SiteModelRouteType,
     type SiteModelRouteUpdateRequest,
@@ -90,7 +89,7 @@ import {
     useSiteChannelList,
     useUpdateSiteProjectedChannelSettings,
     useUpdateSiteGroupProjection,
-    useUpdateAnySiteSourceKeys,
+    useAutoCompleteSiteSourceKeys,
     useUpdateSiteSourceKeys,
     useUpdateSiteChannelModelDisabled,
     useUpdateSiteChannelModelRoutes,
@@ -110,7 +109,6 @@ import {
     type SiteChannelGroupFilter,
     type SiteSourceKeyFormItem,
     type SiteModelView,
-    buildSiteTokenManagementUrl,
     buildSourceKeyFormItems,
     buildSourceKeyUpdatePayload,
     collectPendingCompletionSites,
@@ -138,7 +136,6 @@ import {
 } from './ui-store';
 
 type SiteChannelPendingJump = PendingJump & { target: SiteChannelJumpTarget };
-type UnifiedCompletionInputState = Record<number, string>;
 type UnifiedCompletionErrorState = Record<string, string>;
 
 function makeAccountKey(siteId: number, accountId: number) {
@@ -156,10 +153,11 @@ function UnifiedCompletionDialog({
 }) {
     const t = useTranslations();
     const locale = useSettingStore((state) => state.locale);
-    const updateSourceKeys = useUpdateAnySiteSourceKeys();
-    const [inputValues, setInputValues] = useState<UnifiedCompletionInputState>({});
+    const autoCompleteSourceKeys = useAutoCompleteSiteSourceKeys();
     const [savingAccounts, setSavingAccounts] = useState<Record<string, boolean>>({});
     const [accountErrors, setAccountErrors] = useState<UnifiedCompletionErrorState>({});
+    const [completedAccounts, setCompletedAccounts] = useState<Record<string, boolean>>({});
+    const autoStartedAccountsRef = useRef<Set<string>>(new Set());
 
     const totalPendingCount = useMemo(
         () => sites.reduce((sum, site) => sum + site.pending_count, 0),
@@ -173,30 +171,6 @@ function UnifiedCompletionDialog({
     }, [open, totalPendingCount, onOpenChange]);
 
     useEffect(() => {
-        setInputValues((current) => {
-            const validIds = new Set<number>();
-            for (const site of sites) {
-                for (const account of site.accounts) {
-                    for (const item of account.items) {
-                        validIds.add(item.key_id);
-                    }
-                }
-            }
-
-            let changed = false;
-            const next: UnifiedCompletionInputState = {};
-            for (const [rawId, value] of Object.entries(current)) {
-                const keyId = Number(rawId);
-                if (!validIds.has(keyId)) {
-                    changed = true;
-                    continue;
-                }
-                next[keyId] = value;
-            }
-
-            return changed ? next : current;
-        });
-
         setSavingAccounts((current) => {
             const validKeys = new Set<string>();
             for (const site of sites) {
@@ -236,103 +210,72 @@ function UnifiedCompletionDialog({
             }
             return changed ? next : current;
         });
+
+        setCompletedAccounts((current) => {
+            const validKeys = new Set<string>();
+            for (const site of sites) {
+                for (const account of site.accounts) {
+                    validKeys.add(makeAccountKey(site.site_id, account.account_id));
+                }
+            }
+
+            let changed = false;
+            const next: Record<string, boolean> = {};
+            for (const [key, value] of Object.entries(current)) {
+                if (!validKeys.has(key)) {
+                    changed = true;
+                    continue;
+                }
+                next[key] = value;
+            }
+            return changed ? next : current;
+        });
     }, [sites]);
 
-    const handleInputChange = useCallback((keyId: number, value: string) => {
-        setInputValues((current) => ({
-            ...current,
-            [keyId]: value,
-        }));
-    }, []);
-
-    const handleOpenSite = useCallback((site: PendingCompletionSite) => {
-        const url = buildSiteTokenManagementUrl(site.base_url, site.platform);
-        if (!url) return;
-        window.open(url, '_blank', 'noopener,noreferrer');
-    }, []);
-
-    const handleSaveAccount = useCallback(async (site: PendingCompletionSite, accountId: number) => {
+    const handleAutoCompleteAccount = useCallback(async (site: PendingCompletionSite, accountId: number) => {
         const account = site.accounts.find((item) => item.account_id === accountId);
         if (!account) return;
 
         const accountKey = makeAccountKey(site.site_id, accountId);
-        const itemsToSave = account.items.filter((item) => {
-            const value = inputValues[item.key_id]?.trim() ?? '';
-            return value.length > 0;
-        });
-
-        if (itemsToSave.length === 0) {
-            setAccountErrors((current) => ({
-                ...current,
-                [accountKey]: '当前账号没有可提交的待补全 Key',
-            }));
-            return;
-        }
-
-        for (const item of itemsToSave) {
-            const value = inputValues[item.key_id]?.trim() ?? '';
-            if (!value) continue;
-            if (isMaskedTokenValue(value)) {
-                setAccountErrors((current) => ({
-                    ...current,
-                    [accountKey]: `分组「${item.group_name || item.group_key}」仍是脱敏值，必须填写完整 Key`,
-                }));
-                return;
-            }
-            if (!matchesMaskedToken(value, item.token)) {
-                setAccountErrors((current) => ({
-                    ...current,
-                    [accountKey]: `分组「${item.group_name || item.group_key}」的 Key 与已同步的脱敏值不匹配，请核对输入`,
-                }));
-                return;
-            }
-        }
-
-        const groupedByGroupKey = new Map<string, typeof itemsToSave>();
-        for (const item of itemsToSave) {
-            const current = groupedByGroupKey.get(item.group_key) ?? [];
-            current.push(item);
-            groupedByGroupKey.set(item.group_key, current);
-        }
 
         setSavingAccounts((current) => ({ ...current, [accountKey]: true }));
         setAccountErrors((current) => ({ ...current, [accountKey]: '' }));
 
         try {
-            for (const [groupKey, groupItems] of groupedByGroupKey.entries()) {
-                const payload: SiteSourceKeyUpdateRequest = {
-                    group_key: groupKey,
-                    keys_to_update: groupItems.map((item) => ({
-                        id: item.key_id,
-                        token: inputValues[item.key_id].trim(),
-                        enabled: true,
-                    })),
-                };
-
-                await updateSourceKeys.mutateAsync({
-                    siteId: site.site_id,
-                    accountId,
-                    payload,
-                });
-            }
-
-            setInputValues((current) => {
-                const next = { ...current };
-                for (const item of itemsToSave) {
-                    delete next[item.key_id];
-                }
-                return next;
+            const result = await autoCompleteSourceKeys.mutateAsync({
+                siteId: site.site_id,
+                accountId,
             });
-            toast.success(`账号「${account.account_name}」的待补全 Key 已保存并恢复启用`);
+            if (result.completed_count > 0) {
+                setCompletedAccounts((current) => ({ ...current, [accountKey]: true }));
+                toast.success(`账号「${account.account_name}」已自动补全 ${result.completed_count} 个 Key`);
+            } else {
+                setAccountErrors((current) => ({ ...current, [accountKey]: result.message }));
+            }
         } catch (error) {
             setAccountErrors((current) => ({
                 ...current,
-                [accountKey]: translateSiteMessage(locale, getErrorMessage(error, `账号「${account.account_name}」保存失败`), t),
+                [accountKey]: translateSiteMessage(locale, getErrorMessage(error, `账号「${account.account_name}」自动补全失败`), t),
             }));
         } finally {
             setSavingAccounts((current) => ({ ...current, [accountKey]: false }));
         }
-    }, [inputValues, locale, t, updateSourceKeys]);
+    }, [autoCompleteSourceKeys, locale, t]);
+
+    useEffect(() => {
+        if (!open) {
+            autoStartedAccountsRef.current.clear();
+            return;
+        }
+        for (const site of sites) {
+            for (const account of site.accounts) {
+                const accountKey = makeAccountKey(site.site_id, account.account_id);
+                if (autoStartedAccountsRef.current.has(accountKey)) continue;
+                autoStartedAccountsRef.current.add(accountKey);
+                void handleAutoCompleteAccount(site, account.account_id);
+            }
+        }
+    }, [open, sites, handleAutoCompleteAccount]);
 
     return (
         <Dialog open={open} onOpenChange={onOpenChange}>
@@ -345,7 +288,7 @@ function UnifiedCompletionDialog({
                             <Badge variant="outline" className="h-6 px-2 text-[11px]">{totalPendingCount} 项</Badge>
                         </DialogTitle>
                         <DialogDescription>
-                            同步到的脱敏 Key 不能直接继续投影，必须补全文明文 Key 才能恢复可用状态。
+                            打开此窗口后会使用站点账号的登录凭据自动读取并保存完整 Key；无需手动粘贴。
                         </DialogDescription>
                         <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-100">
                             建议一个站点下每个分组只保留一个 Key，只创建自己需要分组的 Key，这样同步和投影会更干净。
@@ -355,8 +298,6 @@ function UnifiedCompletionDialog({
                     <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5 sm:px-6">
                         <div className="space-y-4">
                             {sites.map((site) => {
-                                const targetUrl = buildSiteTokenManagementUrl(site.base_url, site.platform);
-
                                 return (
                                     <section key={site.site_id} className="rounded-3xl border border-border/70 bg-card/70 p-4">
                                         <div className="flex flex-col gap-3 border-b border-border/60 pb-4 md:flex-row md:items-start md:justify-between">
@@ -371,30 +312,20 @@ function UnifiedCompletionDialog({
                                                     </Badge>
                                                 </div>
                                                 <div className="text-xs text-muted-foreground">
-                                                    站点级跳转用于直接打开该站点的令牌管理页，处理更复杂的 Key 清理或分组治理。
+                                                    自动读取使用当前账号的站点登录凭据，完整 Key 只在服务端处理。
                                                 </div>
                                             </div>
-                                            <Button
-                                                type="button"
-                                                variant="outline"
-                                                className="rounded-2xl"
-                                                onClick={() => handleOpenSite(site)}
-                                                disabled={!targetUrl}
-                                            >
-                                                <ExternalLink className="size-4" />
-                                                打开令牌管理
-                                            </Button>
+                                            <div className="text-xs text-muted-foreground">
+                                                如自动读取失败，请检查站点账号权限或重新同步。
+                                            </div>
                                         </div>
 
                                         <div className="mt-4 space-y-3">
                                             {site.accounts.map((account) => {
                                                 const accountKey = makeAccountKey(site.site_id, account.account_id);
-                                                const enteredCount = account.items.filter((item) => {
-                                                    const value = inputValues[item.key_id]?.trim() ?? '';
-                                                    return value.length > 0;
-                                                }).length;
                                                 const isSaving = Boolean(savingAccounts[accountKey]);
                                                 const accountError = accountErrors[accountKey];
+                                                const isCompleted = Boolean(completedAccounts[accountKey]);
 
                                                 return (
                                                     <div key={account.account_id} className="rounded-2xl border border-border/60 bg-background/70 p-4">
@@ -405,24 +336,24 @@ function UnifiedCompletionDialog({
                                                                     <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
                                                                         待补全 {account.items.length}
                                                                     </Badge>
-                                                                    {enteredCount > 0 ? (
+                                                                    {isCompleted ? (
                                                                         <Badge variant="outline" className="h-5 px-1.5 text-[10px] border-primary/30 bg-primary/10 text-primary">
-                                                                            已填写 {enteredCount}
+                                                                            自动完成
                                                                         </Badge>
                                                                     ) : null}
                                                                 </div>
                                                                 <div className="mt-1 text-xs text-muted-foreground">
-                                                                    仅提交当前账号内已填写完整值的待补全 Key；保存后会自动启用并重新参与投影。
+                                                                    自动从站点管理接口获取完整 Key，保存后会自动启用并重新参与投影。
                                                                 </div>
                                                             </div>
                                                             <Button
                                                                 type="button"
                                                                 className="rounded-2xl"
-                                                                onClick={() => void handleSaveAccount(site, account.account_id)}
-                                                                disabled={isSaving || enteredCount === 0}
+                                                                onClick={() => void handleAutoCompleteAccount(site, account.account_id)}
+                                                                disabled={isSaving}
                                                             >
                                                                 <RefreshCw className={cn('size-4', isSaving && 'animate-spin')} />
-                                                                {isSaving ? '保存中...' : '保存本账号'}
+                                                                {isSaving ? '自动读取中...' : isCompleted ? '重新尝试' : '自动补全本账号'}
                                                             </Button>
                                                         </div>
 
@@ -446,16 +377,11 @@ function UnifiedCompletionDialog({
                                                                             <div className="truncate text-sm font-medium text-foreground">{item.key_name || `站点 Key #${item.key_id}`}</div>
                                                                             <div className="text-[11px] text-muted-foreground">当前值：{item.token_masked || item.token}</div>
                                                                         </div>
-                                                                        <label className="grid gap-1.5 text-xs text-muted-foreground">
-                                                                            输入完整 Key
-                                                                            <Input
-                                                                                value={inputValues[item.key_id] ?? ''}
-                                                                                onChange={(event) => handleInputChange(item.key_id, event.target.value)}
-                                                                                placeholder="填写完整明文 Key，保存后自动启用"
-                                                                                disabled={isSaving}
-                                                                                className="h-10 rounded-2xl"
-                                                                            />
-                                                                        </label>
+                                                                        <div className="flex items-end text-xs text-muted-foreground">
+                                                                            <div className="rounded-2xl border border-primary/20 bg-primary/5 px-3 py-2">
+                                                                                {isSaving ? '正在从站点读取完整 Key…' : isCompleted ? '已自动获取并恢复启用' : '等待自动读取'}
+                                                                            </div>
+                                                                        </div>
                                                                     </div>
                                                                 </div>
                                                             ))}

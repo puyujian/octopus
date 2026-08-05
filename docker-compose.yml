@@ -2,8 +2,8 @@ services:
   octopus:
     image: hureru/octopus
     ports:
-       - '8080:8080'
+       - '8280:8080'
     volumes:      
-       - '/path/to/data:/app/data'
+       - './data:/app/data'
     container_name: octopus
     restart: unless-stopped

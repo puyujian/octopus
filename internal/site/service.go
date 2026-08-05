@@ -83,3 +83,7 @@ func DetectPlatform(ctx context.Context, rawURL string) (model.SitePlatform, mod
 func CreateAccountToken(ctx context.Context, accountID int, req model.SiteChannelKeyCreateRequest) (*model.SiteSyncResult, error) {
 	return sitesync.CreateAccountToken(ctx, accountID, req)
 }
+
+func AutoCompleteSiteSourceKeys(ctx context.Context, siteID int, accountID int) (*model.SiteSourceKeyAutoCompletionResult, error) {
+	return sitesync.AutoCompleteSiteSourceKeys(ctx, siteID, accountID)
+}

@@ -1,9 +1,12 @@
 services:
   octopus:
-    image: hureru/octopus
+    build:
+      context: .
+      dockerfile: scripts/dockerfiles/Dockerfile.alpine
+    image: octopus:local
     ports:
        - '8280:8080'
-    volumes:      
+    volumes:
        - './data:/app/data'
     container_name: octopus
     restart: unless-stopped

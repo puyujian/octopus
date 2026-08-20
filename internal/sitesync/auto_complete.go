@@ -248,11 +248,9 @@ func fetchRemoteTokenKeyForAutoCompletion(ctx context.Context, siteRecord *model
 		if err != nil {
 			return "", err
 		}
-		payload, err := requestJSONWithManagedAccessToken(ctx, siteRecord, http.MethodPost, buildSiteURL(siteRecord.BaseURL, fmt.Sprintf("/api/token/%d/key", remoteToken.ID)), nil, accessToken, account)
-		if err != nil {
-			return "", err
-		}
-		return extractRemoteFullToken(payload), nil
+		// 兼容不同 new-api 系实现：部分站点仅支持 POST（如 runanytime.hxi.me），
+		// 部分站点仅支持 GET（如 wzw.pp.ua），依次尝试直到取到完整 Key。
+		return fetchManagedRemoteTokenKey(ctx, siteRecord, account, accessToken, remoteToken)
 
 	case model.SitePlatformAnyRouter:
 		accessToken, err := resolveAnyRouterManagedAccessToken(ctx, siteRecord, account)
@@ -260,11 +258,7 @@ func fetchRemoteTokenKeyForAutoCompletion(ctx context.Context, siteRecord *model
 			return "", err
 		}
 		userID, _ := anyRouterDiscoverUserID(ctx, siteRecord, account, accessToken)
-		payload, _, err := anyRouterRequestJSONWithCookies(ctx, siteRecord, http.MethodPost, buildSiteURL(siteRecord.BaseURL, fmt.Sprintf("/api/token/%d/key", remoteToken.ID)), nil, anyRouterAuthHeaders(accessToken, userID), account)
-		if err != nil {
-			return "", err
-		}
-		return extractRemoteFullToken(payload), nil
+		return fetchAnyRouterRemoteTokenKey(ctx, siteRecord, account, accessToken, userID, remoteToken)
 
 	case model.SitePlatformSub2API:
 		accessToken, err := ensureFreshSub2APIAccessToken(ctx, siteRecord, account, false)
@@ -276,6 +270,48 @@ func fetchRemoteTokenKeyForAutoCompletion(ctx context.Context, siteRecord *model
 	default:
 		return "", fmt.Errorf("平台 %s 不支持自动读取站点 Key", siteRecord.Platform)
 	}
+}
+
+func fetchManagedRemoteTokenKey(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string, remoteToken siteRemoteToken) (string, error) {
+	requestURL := buildSiteURL(siteRecord.BaseURL, fmt.Sprintf("/api/token/%d/key", remoteToken.ID))
+	var firstErr error
+	for _, method := range []string{http.MethodPost, http.MethodGet} {
+		payload, err := requestJSONWithManagedAccessToken(ctx, siteRecord, method, requestURL, nil, accessToken, account)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if key := extractRemoteFullToken(payload); key != "" && !model.IsMaskedSiteTokenValue(key) {
+			return key, nil
+		}
+	}
+	if firstErr != nil {
+		return "", firstErr
+	}
+	return "", fmt.Errorf("上游未返回完整 Key")
+}
+
+func fetchAnyRouterRemoteTokenKey(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string, userID int, remoteToken siteRemoteToken) (string, error) {
+	requestURL := buildSiteURL(siteRecord.BaseURL, fmt.Sprintf("/api/token/%d/key", remoteToken.ID))
+	var firstErr error
+	for _, method := range []string{http.MethodPost, http.MethodGet} {
+		payload, _, err := anyRouterRequestJSONWithCookies(ctx, siteRecord, method, requestURL, nil, anyRouterAuthHeaders(accessToken, userID), account)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if key := extractRemoteFullToken(payload); key != "" && !model.IsMaskedSiteTokenValue(key) {
+			return key, nil
+		}
+	}
+	if firstErr != nil {
+		return "", firstErr
+	}
+	return "", fmt.Errorf("上游未返回完整 Key")
 }
 
 func extractRemoteFullToken(payload map[string]any) string {

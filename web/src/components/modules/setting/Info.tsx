@@ -19,8 +19,22 @@ export function SettingInfo() {
 
     // 前端版本与后端当前版本不一致 → 浏览器缓存问题
     const isCacheMismatch = !!backendNowVersion && backendNowVersion !== APP_VERSION;
-    // 最新版本与后端当前版本不一致 → 有新版本可更新
-    const hasNewVersion = latestVersion && backendNowVersion && latestVersion !== backendNowVersion;
+    const isNewerVersion = (latest: string, current: string): boolean => {
+        const toParts = (v: string): number[] | null => {
+            const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(v.trim());
+            return m ? m.slice(1).map(Number) : null;
+        };
+        const l = toParts(latest);
+        const c = toParts(current);
+        if (!l || !c) return false;
+        for (let i = 0; i < 3; i++) {
+            if (l[i] > c[i]) return true;
+            if (l[i] < c[i]) return false;
+        }
+        return false;
+    };
+    // 最新版本 semver 高于后端当前版本 → 有新版本可更新
+    const hasNewVersion = isNewerVersion(latestVersion, backendNowVersion);
 
     const clearCacheAndReload = async () => {
         // 通知 Service Worker 清理缓存

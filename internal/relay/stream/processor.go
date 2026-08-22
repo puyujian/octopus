@@ -60,6 +60,13 @@ type StreamConfig struct {
 	OnFirstToken func()                                            // Called when first payload written
 	OnFinish     func(ctx context.Context, rawStream []byte) error // Called on stream end
 
+	// First-event validation: if non-nil, called before the first payload is
+	// written to the client. Returning an error aborts the stream before any
+	// bytes reach the client, allowing the relay to retry on a different
+	// channel. The output passed to the validator is the already-transformed
+	// SSE byte slice that would be written.
+	FirstEventValidator func(output []byte) error
+
 	// Passthrough-specific
 	BufferRawStream bool                // Enable raw stream buffering for metrics
 	TerminalEvents  map[string]struct{} // Protocol terminal events for early completion
@@ -216,6 +223,15 @@ func (p *StreamProcessor) processEvent(data []byte) error {
 		}
 	} else {
 		output = data // Passthrough
+	}
+
+	// Validate the first event before writing it to the client. This lets
+	// the relay detect upstream error events and retry on another channel
+	// instead of forwarding the error to the client.
+	if !p.payloadWritten && p.config.FirstEventValidator != nil {
+		if err := p.config.FirstEventValidator(output); err != nil {
+			return err
+		}
 	}
 
 	if _, err := p.config.Writer.Write(output); err != nil {

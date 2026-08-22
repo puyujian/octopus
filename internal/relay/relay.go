@@ -717,12 +717,13 @@ func (ra *relayAttempt) handleWSStreamResponseV2(ctx context.Context, reader *ws
 
 	// Create StreamProcessor
 	processor := stream.NewStreamProcessor(stream.StreamConfig{
-		Source:            stream.NewWSSource(reader),
-		Transform:         transform,
-		Writer:            ra.getStreamWriter(),
-		Context:           ctx,
-		FirstTokenTimeout: firstTokenTimeout,
-		HeartbeatInterval: streamHeartbeatInterval(),
+		Source:               stream.NewWSSource(reader),
+		Transform:            transform,
+		Writer:               ra.getStreamWriter(),
+		Context:              ctx,
+		FirstTokenTimeout:    firstTokenTimeout,
+		HeartbeatInterval:   streamHeartbeatInterval(),
+		FirstEventValidator: ra.firstEventValidator(),
 		OnFirstToken: func() {
 			ra.metrics.SetFirstTokenTime(time.Now())
 			ra.stopFirstTokenTimer()
@@ -1051,6 +1052,21 @@ func (ra *relayAttempt) sendRequest(req *http.Request) (*http.Response, error) {
 	return response, nil
 }
 
+// firstEventValidator returns a function that validates the first SSE event
+// before it is written to the client. If the first event is an upstream error,
+// the function returns an error so the StreamProcessor aborts before writing
+// anything, allowing the relay to retry on a different channel.
+func (ra *relayAttempt) firstEventValidator() func([]byte) error {
+	format := ra.internalRequest.RawAPIFormat
+	return func(output []byte) error {
+		if err := inspectFirstSSEEvent(format, output); err != nil {
+			log.Warnf("first event validation failed, will retry: %v", err)
+			return err
+		}
+		return nil
+	}
+}
+
 // handleStreamResponseV2 uses StreamProcessor for unified stream handling.
 func (ra *relayAttempt) handleStreamResponseV2(ctx context.Context, response *http.Response) error {
 	defer ra.closeFirstTokenBudget()
@@ -1077,12 +1093,13 @@ func (ra *relayAttempt) handleStreamResponseV2(ctx context.Context, response *ht
 
 	// Create StreamProcessor
 	processor := stream.NewStreamProcessor(stream.StreamConfig{
-		Source:            stream.NewSSESource(response.Body, maxSSEEventSize),
-		Transform:         transform,
-		Writer:            ra.getStreamWriter(),
-		Context:           ctx,
-		FirstTokenTimeout: firstTokenTimeout,
-		HeartbeatInterval: streamHeartbeatInterval(),
+		Source:               stream.NewSSESource(response.Body, maxSSEEventSize),
+		Transform:            transform,
+		Writer:               ra.getStreamWriter(),
+		Context:              ctx,
+		FirstTokenTimeout:    firstTokenTimeout,
+		HeartbeatInterval:   streamHeartbeatInterval(),
+		FirstEventValidator: ra.firstEventValidator(),
 		OnFirstToken: func() {
 			ra.metrics.SetFirstTokenTime(time.Now())
 			ra.stopFirstTokenTimer()
@@ -1138,14 +1155,15 @@ func (ra *relayAttempt) handleStreamResponsePassthroughV2(ctx context.Context, r
 
 	// Create StreamProcessor
 	processor := stream.NewStreamProcessor(stream.StreamConfig{
-		Source:            stream.NewRawSource(response.Body, 32*1024),
-		Transform:         nil, // Passthrough: no transformation
-		Writer:            ra.getStreamWriter(),
-		Context:           ctx,
-		FirstTokenTimeout: firstTokenTimeout,
-		HeartbeatInterval: streamHeartbeatInterval(),
-		BufferRawStream:   true,
-		TerminalEvents:    cfg.TerminalEvents,
+		Source:               stream.NewRawSource(response.Body, 32*1024),
+		Transform:            nil, // Passthrough: no transformation
+		Writer:               ra.getStreamWriter(),
+		Context:              ctx,
+		FirstTokenTimeout:    firstTokenTimeout,
+		HeartbeatInterval:   streamHeartbeatInterval(),
+		FirstEventValidator: ra.firstEventValidator(),
+		BufferRawStream:      true,
+		TerminalEvents:       cfg.TerminalEvents,
 		OnFirstToken: func() {
 			ra.metrics.SetFirstTokenTime(time.Now())
 			ra.stopFirstTokenTimer()

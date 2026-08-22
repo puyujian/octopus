@@ -48,6 +48,23 @@ func TestTransformRequestFillsDefaultGeminiApiVersion(t *testing.T) {
 	}
 }
 
+func TestTransformRequestUsesInboundGeminiApiVersionPath(t *testing.T) {
+	outbound := &MessagesOutbound{}
+	request := newGeminiRequestForRouting(false)
+	request.RawPath = "/v1alpha/models/gemini-2.5-pro:generateContent"
+	httpReq, err := outbound.TransformRequest(
+		context.Background(), request,
+		"https://generativelanguage.googleapis.com",
+		"secret-key",
+	)
+	if err != nil {
+		t.Fatalf("TransformRequest: %v", err)
+	}
+	if got := httpReq.URL.Path; got != "/v1alpha/models/gemini-2.5-pro:generateContent" {
+		t.Fatalf("expected inbound v1alpha path to be preserved, got %s", got)
+	}
+}
+
 // Explicit `/v1` or `/v1beta` paths must survive verbatim — we only back-fill
 // when no version is present at all.
 func TestTransformRequestPreservesExplicitGeminiApiVersion(t *testing.T) {

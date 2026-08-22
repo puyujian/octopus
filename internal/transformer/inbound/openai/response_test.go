@@ -75,7 +75,7 @@ func TestConvertToInternalRequestMarksPassthroughForUnsupportedInputItem(t *test
 	}
 }
 
-func TestConvertToInternalRequestDoesNotMarkPassthroughForSupportedFileAndAudioInputs(t *testing.T) {
+func TestConvertToInternalRequestPreservesFileAndAudioInputsAsRawFragments(t *testing.T) {
 	req := &ResponsesRequest{
 		Model: "gpt-4o",
 		Input: ResponsesInput{Items: []ResponsesItem{
@@ -94,8 +94,8 @@ func TestConvertToInternalRequestDoesNotMarkPassthroughForSupportedFileAndAudioI
 	if err != nil {
 		t.Fatalf("convertToInternalRequest failed: %v", err)
 	}
-	if internalReq.HasOpenAIResponsesPassthrough() {
-		t.Fatalf("expected supported file/audio inputs to stay normalized without passthrough")
+	if !internalReq.HasOpenAIResponsesPassthrough() {
+		t.Fatalf("expected file/audio inputs to require Responses raw preservation")
 	}
 	if len(internalReq.Messages) != 1 || len(internalReq.Messages[0].Content.MultipleContent) != 2 {
 		t.Fatalf("expected supported file/audio inputs to normalize into message content, got %#v", internalReq.Messages)
@@ -105,6 +105,10 @@ func TestConvertToInternalRequestDoesNotMarkPassthroughForSupportedFileAndAudioI
 	}
 	if internalReq.Messages[0].Content.MultipleContent[1].Type != "input_audio" {
 		t.Fatalf("expected input_audio content part, got %#v", internalReq.Messages[0].Content.MultipleContent[1])
+	}
+	ext := internalReq.GetOpenAIResponsesOptions()
+	if len(ext.RawInputFragments) != 1 || ext.RawInputFragments[0].Type != "message" {
+		t.Fatalf("expected mixed message to be retained as one raw fragment, got %#v", ext.RawInputFragments)
 	}
 }
 
@@ -122,8 +126,8 @@ func TestConvertToInternalRequestNormalizesTopLevelInputFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("convertToInternalRequest failed: %v", err)
 	}
-	if internalReq.HasOpenAIResponsesPassthrough() {
-		t.Fatalf("expected top-level input_file to stay normalized without passthrough")
+	if !internalReq.HasOpenAIResponsesPassthrough() {
+		t.Fatalf("expected top-level input_file to require Responses raw preservation")
 	}
 	if len(internalReq.Messages) != 1 {
 		t.Fatalf("expected one normalized message, got %#v", internalReq.Messages)
@@ -136,6 +140,10 @@ func TestConvertToInternalRequestNormalizesTopLevelInputFile(t *testing.T) {
 	}
 	if internalReq.Messages[0].Content.MultipleContent[0].File == nil || internalReq.Messages[0].Content.MultipleContent[0].File.FileID != "file_456" {
 		t.Fatalf("expected normalized file reference to preserve file_id, got %#v", internalReq.Messages[0].Content.MultipleContent[0].File)
+	}
+	ext := internalReq.GetOpenAIResponsesOptions()
+	if len(ext.RawInputFragments) != 1 || ext.RawInputFragments[0].Type != "input_file" {
+		t.Fatalf("expected top-level input_file raw fragment, got %#v", ext.RawInputFragments)
 	}
 }
 

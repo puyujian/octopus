@@ -15,10 +15,10 @@ func TestResolveWSConversationStateFallsBackToStoredState(t *testing.T) {
 
 	stored := &wsConversationState{
 		DownstreamSessionID: "ws_a",
-		RequestModel:   "gpt-5.4",
-		ChannelID:      11,
-		ChannelKeyID:   22,
-		LastResponseID: "resp_saved",
+		RequestModel:        "gpt-5.4",
+		ChannelID:           11,
+		ChannelKeyID:        22,
+		LastResponseID:      "resp_saved",
 	}
 	storeWSConversationState(7, "gpt-5.4", stored, time.Minute)
 
@@ -53,9 +53,9 @@ func TestResolveWSConversationStateDoesNotRestoreStoredStateForFreshConnection(t
 
 	storeWSConversationState(7, "gpt-5.4", &wsConversationState{
 		DownstreamSessionID: "ws_a",
-		RequestModel:   "gpt-5.4",
-		LastResponseID: "resp_saved",
-		Transcript:     []transformerModel.Message{{Role: "assistant"}},
+		RequestModel:        "gpt-5.4",
+		LastResponseID:      "resp_saved",
+		Transcript:          []transformerModel.Message{{Role: "assistant"}},
 	}, time.Minute)
 
 	resolved := resolveWSConversationState(7, "gpt-5.4", nil, false, "ws_b")
@@ -70,9 +70,9 @@ func TestResolveWSConversationStateRestoresStoredStateForContinuation(t *testing
 
 	storeWSConversationState(7, "gpt-5.4", &wsConversationState{
 		DownstreamSessionID: "ws_a",
-		RequestModel:   "gpt-5.4",
-		LastResponseID: "resp_saved",
-		Transcript:     []transformerModel.Message{{Role: "assistant"}},
+		RequestModel:        "gpt-5.4",
+		LastResponseID:      "resp_saved",
+		Transcript:          []transformerModel.Message{{Role: "assistant"}},
 	}, time.Minute)
 
 	local := &wsConversationState{RequestModel: "other-model"}
@@ -97,8 +97,8 @@ func TestResolveWSConversationStateIsSessionScoped(t *testing.T) {
 
 	storeWSConversationState(7, "gpt-5.4", &wsConversationState{
 		DownstreamSessionID: "ws_a",
-		RequestModel:       "gpt-5.4",
-		LastResponseID:     "resp_saved",
+		RequestModel:        "gpt-5.4",
+		LastResponseID:      "resp_saved",
 	}, time.Minute)
 
 	if resolved := resolveWSConversationState(7, "gpt-5.4", nil, true, "ws_b"); resolved != nil {

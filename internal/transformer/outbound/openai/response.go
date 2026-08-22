@@ -14,10 +14,14 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/samber/lo"
 
+	"github.com/bestruirui/octopus/internal/transformer/bridge"
 	"github.com/bestruirui/octopus/internal/transformer/model"
+	"github.com/looplj/axonhub/llm/transformer"
+	axonResponses "github.com/looplj/axonhub/llm/transformer/openai/responses"
 )
 
 // ResponseOutbound implements the Outbound interface for OpenAI Responses API.
@@ -32,6 +36,31 @@ type ResponseOutbound struct {
 	// message, function_call), so function calls may start above 0, while
 	// the Chat Completions protocol expects dense 0-based tool_calls indices.
 	toolCallIndexes map[int]int
+
+	// inner is the axonhub Responses outbound converter used for response
+	// and stream parsing (request serialization stays local).
+	inner   transformer.Outbound
+	streams *model.AxonStreamBridge
+}
+
+// ensureAxon lazily initializes the AxonHub Responses converter with the
+// actual channel endpoint and key used by the current relay attempt.
+func (o *ResponseOutbound) ensureAxon(baseURL, key string) (transformer.Outbound, error) {
+	if o.inner != nil {
+		return o.inner, nil
+	}
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = "https://api.openai.com/v1"
+	}
+	if strings.TrimSpace(key) == "" {
+		key = "placeholder"
+	}
+	inner, err := axonResponses.NewOutboundTransformer(baseURL, key)
+	if err != nil {
+		return nil, err
+	}
+	o.inner = inner
+	return inner, nil
 }
 
 func (o *ResponseOutbound) toolCallIndexFor(outputIndex int) int {
@@ -53,34 +82,55 @@ func (o *ResponseOutbound) TransformRequest(ctx context.Context, request *model.
 
 	request.NormalizeMessages()
 
-	// Convert to Responses API request format
-	responsesReq := ConvertToResponsesRequest(request)
-
-	body, err := json.Marshal(responsesReq)
+	inner, err := o.ensureAxon(baseUrl, key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal responses api request: %w", err)
+		return nil, err
+	}
+	req, axonRequest, err := model.BuildAxonHTTPRequest(ctx, inner, request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to transform Responses request with AxonHub: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "", bytes.NewReader(body))
+	// AxonHub owns the Responses input/tool/message conversion.  Keep the
+	// fields that are intentionally represented as raw local extensions until
+	// the upstream common model grows them.
+	overlay, err := json.Marshal(ConvertToResponsesRequest(request))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to marshal Responses extensions: %w", err)
 	}
-
-	// Set headers
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+key)
+	axonRequest.Body, err = model.MergeJSONFields(axonRequest.Body, overlay,
+		"background", "prompt", "conversation", "context_management", "stream_options")
+	if err != nil {
+		return nil, err
+	}
+	// AxonHub reconstructs the normalized Responses input from the common
+	// message model.  When the inbound request carried a raw input array,
+	// that projection can omit provider-native items (for example
+	// input_file/input_audio) or leave an empty message beside them.  The
+	// local Responses adapter has already sanitized the complete raw array;
+	// use it as the authoritative wire input in that case.
+	if len(request.OpenAIRawInputItems()) > 0 {
+		axonRequest.Body, err = model.MergeJSONFields(axonRequest.Body, overlay, "input")
+		if err != nil {
+			return nil, err
+		}
+	}
+	axonRequest.Body, err = model.MergeJSONObjects(axonRequest.Body, overlay, "reasoning")
+	if err != nil {
+		return nil, err
+	}
+	axonRequest.JSONBody = append([]byte(nil), axonRequest.Body...)
+	req, err = bridge.BuildHTTPRequest(ctx, axonRequest)
+	if err != nil {
+		return nil, err
+	}
 	applyOpenAIOrgProjectHeaders(req, request)
-
-	// Parse and set URL
-	parsedUrl, err := url.Parse(strings.TrimSuffix(baseUrl, "/"))
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse base url: %w", err)
+	if request.Stream != nil && *request.Stream {
+		if o.streams == nil {
+			o.streams = model.NewAxonStreamBridge(inner)
+		}
+		o.streams.SetRequest(axonRequest)
 	}
-	parsedUrl.Path = parsedUrl.Path + "/responses"
-	req.URL = parsedUrl
-	req.Method = http.MethodPost
-
 	return req, nil
 }
 
@@ -144,40 +194,111 @@ func rewriteRawResponsesRequestModel(rawBody []byte, modelName string) ([]byte, 
 }
 
 func (o *ResponseOutbound) TransformResponse(ctx context.Context, response *http.Response) (*model.InternalLLMResponse, error) {
+	inner, err := o.ensureAxon("", "")
+	if err != nil {
+		return nil, err
+	}
 	if response == nil {
 		return nil, fmt.Errorf("response is nil")
 	}
+	if response.Body == nil {
+		return nil, fmt.Errorf("response body is nil")
+	}
 
+	// AxonHub owns the common Responses conversion. Keep a copy of the raw
+	// body at this protocol boundary as well: the current upstream common
+	// message model does not yet carry generated Responses audio metadata, so
+	// a small compatibility overlay is needed after the shared conversion.
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
-
-	if len(body) == 0 {
-		return nil, fmt.Errorf("response body is empty")
+	sharedResponse := *response
+	sharedResponse.Body = io.NopCloser(bytes.NewReader(body))
+	sharedResponse.ContentLength = int64(len(body))
+	converted, err := model.TransformResponse(ctx, inner, &sharedResponse)
+	if err != nil {
+		return nil, err
 	}
 
-	// Check for error response
-	if response.StatusCode >= 400 {
-		var errResp struct {
-			Error model.ErrorDetail `json:"error"`
+	var rawResponse ResponsesResponse
+	if json.Unmarshal(body, &rawResponse) == nil {
+		fallback := convertToLLMResponseFromResponses(&rawResponse)
+		if converted == nil {
+			return fallback, nil
 		}
-		if err := json.Unmarshal(body, &errResp); err == nil && errResp.Error.Message != "" {
-			return nil, &model.ResponseError{
-				StatusCode: response.StatusCode,
-				Detail:     errResp.Error,
-			}
+		mergeResponsesCompatibility(converted, fallback)
+	}
+	return converted, nil
+}
+
+// mergeResponsesCompatibility fills only fields that the shared AxonHub
+// response model cannot currently represent. The AxonHub conversion remains
+// authoritative for common content, reasoning and tool semantics; the local
+// fallback supplies protocol-only fields such as message audio, refusal and
+// inline tool results.
+func mergeResponsesCompatibility(dst, fallback *model.InternalLLMResponse) {
+	if dst == nil || fallback == nil {
+		return
+	}
+	if dst.PreviousResponseID == nil {
+		dst.PreviousResponseID = fallback.PreviousResponseID
+	}
+	if dst.Usage == nil {
+		dst.Usage = fallback.Usage
+	}
+	if dst.Error == nil {
+		dst.Error = fallback.Error
+	}
+	if len(dst.RawResponsesOutputItems) == 0 {
+		dst.RawResponsesOutputItems = append(json.RawMessage(nil), fallback.RawResponsesOutputItems...)
+	}
+	for index := range dst.Choices {
+		if index >= len(fallback.Choices) {
+			break
 		}
-		return nil, fmt.Errorf("HTTP error %d: %s", response.StatusCode, string(body))
+		choice := &dst.Choices[index]
+		fallbackChoice := &fallback.Choices[index]
+		if choice.FinishReason == nil {
+			choice.FinishReason = fallbackChoice.FinishReason
+		}
+		if choice.Message == nil {
+			choice.Message = fallbackChoice.Message
+			continue
+		}
+		if fallbackChoice.Message == nil {
+			continue
+		}
+		message := choice.Message
+		fallbackMessage := fallbackChoice.Message
+		if message.ID == "" {
+			message.ID = fallbackMessage.ID
+		}
+		if message.Refusal == "" {
+			message.Refusal = fallbackMessage.Refusal
+		}
+		if message.Audio == nil {
+			message.Audio = fallbackMessage.Audio
+		}
+		if len(message.Annotations) == 0 {
+			message.Annotations = fallbackMessage.Annotations
+		}
+		if len(message.InlineToolResults) == 0 {
+			message.InlineToolResults = fallbackMessage.InlineToolResults
+		}
+		if len(message.Content.MultipleContent) == 0 && message.Content.Content == nil {
+			message.Content = fallbackMessage.Content
+		}
+		if len(message.ReasoningItems) == 0 {
+			message.ReasoningItems = fallbackMessage.ReasoningItems
+		}
+		if message.ReasoningContent == nil {
+			message.ReasoningContent = fallbackMessage.ReasoningContent
+		}
+		if message.ReasoningSignature == nil {
+			message.ReasoningSignature = fallbackMessage.ReasoningSignature
+		}
 	}
-
-	var resp ResponsesResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal responses api response: %w", err)
-	}
-
-	// Convert to internal response
-	return convertToLLMResponseFromResponses(&resp), nil
 }
 
 func (o *ResponseOutbound) TransformStreamEvent(ctx context.Context, eventData []byte) ([]model.StreamEvent, error) {
@@ -250,7 +371,7 @@ func (o *ResponseOutbound) TransformStreamEvent(ctx context.Context, eventData [
 			events = append(events, model.StreamEvent{Kind: model.StreamEventKindToolCallStart, ID: base.ID, Model: base.Model, Index: base.Index, ToolCall: &toolCall})
 		}
 
-	case "response.reasoning_summary_text.delta":
+	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 		o.mergeReasoningDelta(streamEvent)
 		if streamEvent.Delta != "" {
 			events = append(events, model.StreamEvent{Kind: model.StreamEventKindThinkingDelta, ID: base.ID, Model: base.Model, Index: base.Index, Delta: &model.StreamDelta{Thinking: streamEvent.Delta}})
@@ -327,6 +448,23 @@ func (o *ResponseOutbound) TransformStreamEvent(ctx context.Context, eventData [
 }
 
 func (o *ResponseOutbound) TransformStream(ctx context.Context, eventData []byte) (*model.InternalLLMResponse, error) {
+	if o.streams != nil {
+		converted, err := o.streams.Feed(ctx, eventData)
+		if err != nil || converted == nil {
+			return converted, err
+		}
+		// The shared stream transformer has the same protocol-only gap as the
+		// non-stream path for generated audio/refusal/inline output metadata.
+		// The completed event still contains the authoritative output array, so
+		// apply the same narrow compatibility overlay at that boundary.
+		var streamEvent struct {
+			Response *ResponsesResponse `json:"response,omitempty"`
+		}
+		if json.Unmarshal(eventData, &streamEvent) == nil && streamEvent.Response != nil {
+			mergeResponsesCompatibility(converted, convertToLLMResponseFromResponses(streamEvent.Response))
+		}
+		return converted, nil
+	}
 	events, err := o.TransformStreamEvent(ctx, eventData)
 	if err != nil {
 		return nil, err
@@ -414,9 +552,11 @@ type ResponsesItem struct {
 	Annotations []ResponsesAnnotation `json:"annotations,omitempty"`
 
 	// Function call fields
-	CallID    string `json:"call_id,omitempty"`
-	Name      string `json:"name,omitempty"`
-	Arguments string `json:"arguments,omitempty"`
+	CallID    string  `json:"call_id,omitempty"`
+	Name      string  `json:"name,omitempty"`
+	Namespace string  `json:"namespace,omitempty"`
+	Arguments string  `json:"arguments,omitempty"`
+	Input     *string `json:"input,omitempty"`
 
 	// Function call output
 	Output        *ResponsesInput `json:"output,omitempty"`
@@ -429,9 +569,13 @@ type ResponsesItem struct {
 	Quality      *string `json:"quality,omitempty"`
 	Size         *string `json:"size,omitempty"`
 
+	// Generated audio metadata on a Responses message item.
+	Audio *ResponsesOutputAudio `json:"audio,omitempty"`
+
 	// Reasoning fields
 	Summary          []ResponsesReasoningSummary `json:"summary,omitempty"`
 	EncryptedContent *string                     `json:"encrypted_content,omitempty"`
+	CreatedBy        *string                     `json:"created_by,omitempty"`
 
 	// Multimodal input passthrough for Responses→Responses routing. O-H6.
 	FileID     *string              `json:"file_id,omitempty"`
@@ -446,6 +590,15 @@ type ResponsesItem struct {
 type ResponsesInputAudio struct {
 	Data   string `json:"data"`
 	Format string `json:"format,omitempty"`
+}
+
+// ResponsesOutputAudio mirrors Chat Completions-compatible generated audio
+// metadata carried by a Responses message item.
+type ResponsesOutputAudio struct {
+	Data       string `json:"data,omitempty"`
+	ExpiresAt  int64  `json:"expires_at,omitempty"`
+	ID         string `json:"id,omitempty"`
+	Transcript string `json:"transcript,omitempty"`
 }
 
 type ResponsesReasoningSummary struct {
@@ -464,27 +617,59 @@ type ResponsesAnnotation struct {
 }
 
 type ResponsesTool struct {
-	Type              string         `json:"type,omitempty"`
-	Name              string         `json:"name,omitempty"`
-	Description       string         `json:"description,omitempty"`
-	Parameters        map[string]any `json:"parameters,omitempty"`
-	Strict            *bool          `json:"strict,omitempty"`
-	Background        string         `json:"background,omitempty"`
-	OutputFormat      string         `json:"output_format,omitempty"`
-	Quality           string         `json:"quality,omitempty"`
-	Size              string         `json:"size,omitempty"`
-	OutputCompression *int64         `json:"output_compression,omitempty"`
+	Type              string                          `json:"type,omitempty"`
+	Name              string                          `json:"name,omitempty"`
+	Description       string                          `json:"description,omitempty"`
+	Parameters        map[string]any                  `json:"parameters,omitempty"`
+	Strict            *bool                           `json:"strict,omitempty"`
+	Tools             []ResponsesTool                 `json:"tools,omitempty"`
+	Format            *ResponsesCustomToolFormat      `json:"format,omitempty"`
+	Filters           *ResponsesWebSearchFilters      `json:"filters,omitempty"`
+	UserLocation      *ResponsesWebSearchUserLocation `json:"user_location,omitempty"`
+	Background        string                          `json:"background,omitempty"`
+	OutputFormat      string                          `json:"output_format,omitempty"`
+	Quality           string                          `json:"quality,omitempty"`
+	Size              string                          `json:"size,omitempty"`
+	OutputCompression *int64                          `json:"output_compression,omitempty"`
 }
 
 type ResponsesToolChoice struct {
-	Mode *string `json:"mode,omitempty"`
-	Type *string `json:"type,omitempty"`
-	Name *string `json:"name,omitempty"`
+	Mode  *string                     `json:"mode,omitempty"`
+	Type  *string                     `json:"type,omitempty"`
+	Name  *string                     `json:"name,omitempty"`
+	Tools []ResponsesToolChoiceOption `json:"tools,omitempty"`
+}
+
+// ResponsesToolChoiceOption identifies one tool in the Responses API's
+// multi-tool choice form. Keep this local wire type aligned with the inbound
+// model and AxonHub's ToolOption so raw/structured tool choices round-trip
+// without narrowing the payload at the protocol boundary.
+type ResponsesToolChoiceOption struct {
+	Type string `json:"type"`
+	Name string `json:"name"`
+}
+
+type ResponsesWebSearchFilters struct {
+	AllowedDomains []string `json:"allowed_domains,omitempty"`
+}
+
+type ResponsesWebSearchUserLocation struct {
+	Type     string `json:"type,omitempty"`
+	City     string `json:"city,omitempty"`
+	Country  string `json:"country,omitempty"`
+	Region   string `json:"region,omitempty"`
+	Timezone string `json:"timezone,omitempty"`
+}
+
+type ResponsesCustomToolFormat struct {
+	Type       string `json:"type"`
+	Syntax     string `json:"syntax,omitempty"`
+	Definition string `json:"definition,omitempty"`
 }
 
 func (t ResponsesToolChoice) MarshalJSON() ([]byte, error) {
 	// If only Mode is set and it's a simple mode like "auto", "none", "required"
-	if t.Mode != nil && t.Type == nil && t.Name == nil {
+	if t.Mode != nil && t.Type == nil && t.Name == nil && len(t.Tools) == 0 {
 		return json.Marshal(*t.Mode)
 	}
 	// Otherwise, serialize as an object
@@ -498,12 +683,15 @@ type ResponsesTextOptions struct {
 }
 
 type ResponsesTextFormat struct {
-	Type   string          `json:"type,omitempty"`
-	Name   string          `json:"name,omitempty"`
-	Schema json.RawMessage `json:"schema,omitempty"`
+	Type        string          `json:"type,omitempty"`
+	Name        string          `json:"name,omitempty"`
+	Description string          `json:"description,omitempty"`
+	Strict      *bool           `json:"strict,omitempty"`
+	Schema      json.RawMessage `json:"schema,omitempty"`
 }
 
 type ResponsesReasoning struct {
+	Context         string  `json:"context,omitempty"`
 	Effort          string  `json:"effort,omitempty"`
 	MaxTokens       *int64  `json:"max_tokens,omitempty"`
 	Summary         *string `json:"summary,omitempty"`
@@ -512,14 +700,16 @@ type ResponsesReasoning struct {
 
 // ResponsesResponse represents the OpenAI Responses API response format.
 type ResponsesResponse struct {
-	Object    string          `json:"object"`
-	ID        string          `json:"id"`
-	Model     string          `json:"model"`
-	CreatedAt int64           `json:"created_at"`
-	Output    []ResponsesItem `json:"output"`
-	Status    *string         `json:"status,omitempty"`
-	Usage     *ResponsesUsage `json:"usage,omitempty"`
-	Error     *ResponsesError `json:"error,omitempty"`
+	Object             string          `json:"object"`
+	ID                 string          `json:"id"`
+	Model              string          `json:"model"`
+	CreatedAt          int64           `json:"created_at"`
+	PreviousResponseID *string         `json:"previous_response_id,omitempty"`
+	Output             []ResponsesItem `json:"output"`
+	Status             *string         `json:"status,omitempty"`
+	Truncation         *string         `json:"truncation,omitempty"`
+	Usage              *ResponsesUsage `json:"usage,omitempty"`
+	Error              *ResponsesError `json:"error,omitempty"`
 }
 
 type ResponsesUsage struct {
@@ -551,6 +741,7 @@ type ResponsesStreamEvent struct {
 	Text           string             `json:"text,omitempty"`
 	Name           string             `json:"name,omitempty"`
 	CallID         string             `json:"call_id,omitempty"`
+	Namespace      string             `json:"namespace,omitempty"`
 	Arguments      string             `json:"arguments,omitempty"`
 	SummaryIndex   *int               `json:"summary_index,omitempty"`
 	Code           string             `json:"code,omitempty"`
@@ -906,8 +1097,10 @@ func ConvertToResponsesRequest(req *model.InternalLLMRequest) *ResponsesRequest 
 	// Convert text options
 	if req.ResponseFormat != nil {
 		format := &ResponsesTextFormat{
-			Type: req.ResponseFormat.Type,
-			Name: req.ResponseFormat.Name,
+			Type:        req.ResponseFormat.Type,
+			Name:        req.ResponseFormat.Name,
+			Description: req.ResponseFormat.Description,
+			Strict:      req.ResponseFormat.Strict,
 		}
 		// Prefer the parsed Schema so nested fields survive round-trips;
 		// fall back to RawSchema (passthrough) then the legacy JSONSchema
@@ -937,8 +1130,9 @@ func ConvertToResponsesRequest(req *model.InternalLLMRequest) *ResponsesRequest 
 	}
 
 	// Convert reasoning
-	if req.ReasoningEffort != "" || req.ReasoningBudget != nil || responsesOptions.ReasoningSummary != nil || responsesOptions.ReasoningGenerateSummary != nil {
+	if responsesOptions.ReasoningContext != "" || req.ReasoningEffort != "" || req.ReasoningBudget != nil || responsesOptions.ReasoningSummary != nil || responsesOptions.ReasoningGenerateSummary != nil {
 		result.Reasoning = &ResponsesReasoning{
+			Context:         responsesOptions.ReasoningContext,
 			Effort:          req.ReasoningEffort,
 			MaxTokens:       req.ReasoningBudget,
 			Summary:         responsesOptions.ReasoningSummary,
@@ -1044,6 +1238,7 @@ func convertInputFromMessages(msgs []model.Message, transformOptions model.Trans
 
 	// Build call_id -> item_id mapping for function_call_output reference
 	callIDToItemID := make(map[string]string)
+	callIDToItemType := make(map[string]string)
 	var items []ResponsesItem
 	for _, msg := range msgs {
 		switch msg.Role {
@@ -1054,13 +1249,16 @@ func convertInputFromMessages(msgs []model.Message, transformOptions model.Trans
 		case "assistant":
 			assistantItems := convertAssistantMessageToResponses(msg)
 			for _, item := range assistantItems {
-				if item.Type == "function_call" && item.ID != "" && item.CallID != "" {
+				if (item.Type == "function_call" || item.Type == "custom_tool_call") && item.ID != "" && item.CallID != "" {
 					callIDToItemID[item.CallID] = item.ID
+				}
+				if item.CallID != "" {
+					callIDToItemType[item.CallID] = item.Type
 				}
 			}
 			items = append(items, assistantItems...)
 		case "tool":
-			items = append(items, convertToolMessageToResponses(msg, callIDToItemID))
+			items = append(items, convertToolMessageToResponses(msg, callIDToItemID, callIDToItemType))
 		}
 	}
 
@@ -1129,6 +1327,10 @@ func convertUserMessageToResponses(msg model.Message) ResponsesItem {
 						Format: p.Audio.Format,
 					},
 				})
+			case "compaction", "compaction_summary":
+				if p.Compact != nil {
+					contentItems = append(contentItems, compactionItemFromPart(p))
+				}
 			}
 		}
 	}
@@ -1142,28 +1344,56 @@ func convertUserMessageToResponses(msg model.Message) ResponsesItem {
 func convertAssistantMessageToResponses(msg model.Message) []ResponsesItem {
 	var items []ResponsesItem
 
-	// Handle reasoning content
-	if msg.ReasoningContent != nil && *msg.ReasoningContent != "" {
-		reasoningItem := ResponsesItem{
+	// Handle reasoning items first. Responses keeps each encrypted reasoning
+	// item separate; collapsing them into one scalar loses the signature
+	// binding required for multi-turn replay.
+	reasoningItems := msg.ReasoningItems
+	if len(reasoningItems) == 0 && (msg.ReasoningContent != nil || msg.ReasoningSignature != nil) {
+		item := model.ReasoningItem{}
+		if msg.ReasoningContent != nil {
+			item.Content = *msg.ReasoningContent
+		}
+		if msg.ReasoningSignature != nil {
+			item.Signature = *msg.ReasoningSignature
+		}
+		reasoningItems = []model.ReasoningItem{item}
+	}
+	for _, reasoning := range reasoningItems {
+		if reasoning.Content == "" && reasoning.Signature == "" && reasoning.ID == "" {
+			continue
+		}
+		item := ResponsesItem{
+			ID:   reasoning.ID,
 			Type: "reasoning",
 			Summary: []ResponsesReasoningSummary{{
 				Type: "summary_text",
-				Text: *msg.ReasoningContent,
+				Text: reasoning.Content,
 			}},
 		}
-		if msg.ReasoningSignature != nil && *msg.ReasoningSignature != "" {
-			reasoningItem.EncryptedContent = msg.ReasoningSignature
+		if reasoning.Signature != "" {
+			item.EncryptedContent = lo.ToPtr(reasoning.Signature)
 		}
-		items = append(items, reasoningItem)
+		items = append(items, item)
 	}
 
 	// Handle tool calls
 	for _, tc := range msg.ToolCalls {
+		if tc.ResponseCustomToolCall != nil {
+			items = append(items, ResponsesItem{
+				ID:     generateResponsesItemID(),
+				Type:   "custom_tool_call",
+				CallID: tc.ResponseCustomToolCall.CallID,
+				Name:   tc.ResponseCustomToolCall.Name,
+				Input:  lo.ToPtr(tc.ResponseCustomToolCall.Input),
+			})
+			continue
+		}
 		items = append(items, ResponsesItem{
 			ID:        generateResponsesItemID(),
 			Type:      "function_call",
 			CallID:    tc.ID,
 			Name:      tc.Function.Name,
+			Namespace: tc.Function.Namespace,
 			Arguments: tc.Function.Arguments,
 		})
 	}
@@ -1177,11 +1407,19 @@ func convertAssistantMessageToResponses(msg model.Message) []ResponsesItem {
 		})
 	} else {
 		for _, p := range msg.Content.MultipleContent {
-			if p.Type == "text" && p.Text != nil {
-				contentItems = append(contentItems, ResponsesItem{
-					Type: "output_text",
-					Text: p.Text,
-				})
+			switch p.Type {
+			case "text":
+				if p.Text != nil {
+					contentItems = append(contentItems, ResponsesItem{Type: "output_text", Text: p.Text})
+				}
+			case "compaction", "compaction_summary":
+				if p.Compact != nil {
+					if len(contentItems) > 0 {
+						items = append(items, ResponsesItem{Type: "message", Role: msg.Role, Status: lo.ToPtr("completed"), Content: &ResponsesInput{Items: contentItems}})
+						contentItems = nil
+					}
+					items = append(items, compactionItemFromPart(p))
+				}
 			}
 		}
 	}
@@ -1198,7 +1436,7 @@ func convertAssistantMessageToResponses(msg model.Message) []ResponsesItem {
 	return sanitizeResponsesItems(items)
 }
 
-func convertToolMessageToResponses(msg model.Message, callIDToItemID map[string]string) ResponsesItem {
+func convertToolMessageToResponses(msg model.Message, callIDToItemID map[string]string, callIDToItemType map[string]string) ResponsesItem {
 	var output ResponsesInput
 
 	if msg.Content.Content != nil {
@@ -1218,8 +1456,12 @@ func convertToolMessageToResponses(msg model.Message, callIDToItemID map[string]
 		output.Text = lo.ToPtr("")
 	}
 
+	itemType := "function_call_output"
+	if msg.ToolCallID != nil && callIDToItemType[*msg.ToolCallID] == "custom_tool_call" {
+		itemType = "custom_tool_call_output"
+	}
 	item := ResponsesItem{
-		Type:   "function_call_output",
+		Type:   itemType,
 		CallID: lo.FromPtr(msg.ToolCallID),
 		Output: &output,
 	}
@@ -1231,6 +1473,17 @@ func convertToolMessageToResponses(msg model.Message, callIDToItemID map[string]
 		}
 	}
 
+	return item
+}
+
+func compactionItemFromPart(part model.MessageContentPart) ResponsesItem {
+	item := ResponsesItem{Type: part.Type}
+	if part.Compact == nil {
+		return item
+	}
+	item.ID = part.Compact.ID
+	item.EncryptedContent = lo.ToPtr(part.Compact.EncryptedContent)
+	item.CreatedBy = part.Compact.CreatedBy
 	return item
 }
 
@@ -1264,6 +1517,38 @@ func convertToolsToResponses(tools []model.Tool) []ResponsesTool {
 				rt.OutputCompression = tool.ImageGeneration.OutputCompression
 			}
 			result = append(result, rt)
+		case "web_search":
+			rt := ResponsesTool{Type: "web_search"}
+			if tool.WebSearch != nil {
+				if len(tool.WebSearch.AllowedDomains) > 0 {
+					rt.Filters = &ResponsesWebSearchFilters{AllowedDomains: append([]string(nil), tool.WebSearch.AllowedDomains...)}
+				}
+				location := tool.WebSearch.UserLocation
+				if location.Type != "" || location.City != "" || location.Country != "" || location.Region != "" || location.Timezone != "" {
+					if location.Type == "" {
+						location.Type = "approximate"
+					}
+					rt.UserLocation = &ResponsesWebSearchUserLocation{
+						Type: location.Type, City: location.City, Country: location.Country,
+						Region: location.Region, Timezone: location.Timezone,
+					}
+				}
+			}
+			result = append(result, rt)
+		case "responses_custom_tool":
+			rt := ResponsesTool{Type: "custom"}
+			if tool.ResponseCustomTool != nil {
+				rt.Name = tool.ResponseCustomTool.Name
+				rt.Description = tool.ResponseCustomTool.Description
+				if tool.ResponseCustomTool.Format != nil {
+					rt.Format = &ResponsesCustomToolFormat{
+						Type:       tool.ResponseCustomTool.Format.Type,
+						Syntax:     tool.ResponseCustomTool.Format.Syntax,
+						Definition: tool.ResponseCustomTool.Format.Definition,
+					}
+				}
+			}
+			result = append(result, rt)
 		}
 	}
 	return result
@@ -1295,10 +1580,11 @@ func convertToLLMResponseFromResponses(resp *ResponsesResponse) *model.InternalL
 	}
 
 	result := &model.InternalLLMResponse{
-		ID:      resp.ID,
-		Object:  "chat.completion",
-		Model:   resp.Model,
-		Created: resp.CreatedAt,
+		ID:                 resp.ID,
+		PreviousResponseID: cloneResponsesStringPtr(resp.PreviousResponseID),
+		Object:             "chat.completion",
+		Model:              resp.Model,
+		Created:            resp.CreatedAt,
 	}
 	if len(resp.Output) > 0 {
 		if rawOutput, err := json.Marshal(sanitizeResponsesItems(resp.Output)); err == nil {
@@ -1307,22 +1593,46 @@ func convertToLLMResponseFromResponses(resp *ResponsesResponse) *model.InternalL
 	}
 
 	var (
-		contentParts     []model.MessageContentPart
-		textContent      strings.Builder
-		refusalContent   strings.Builder
-		reasoningContent strings.Builder
-		toolCalls        []model.ToolCall
+		contentParts       []model.MessageContentPart
+		textContent        strings.Builder
+		refusalContent     strings.Builder
+		reasoningContent   strings.Builder
+		reasoningSignature *string
+		reasoningItems     []model.ReasoningItem
+		toolCalls          []model.ToolCall
+		inlineToolResults  []model.InlineToolResult
+		annotations        []model.Annotation
+		messageID          string
+		visibleTextRunes   int64
 	)
+
+	flushText := func() {
+		if textContent.Len() == 0 {
+			return
+		}
+		text := textContent.String()
+		contentParts = append(contentParts, model.MessageContentPart{
+			Type: "text",
+			Text: &text,
+		})
+		textContent.Reset()
+	}
 
 	for _, outputItem := range resp.Output {
 		switch outputItem.Type {
 		case "message":
+			if messageID == "" {
+				messageID = outputItem.ID
+			}
+			messageTextOffset := visibleTextRunes
 			if outputItem.Content != nil {
 				for _, item := range outputItem.Content.Items {
 					switch item.Type {
 					case "output_text":
 						if item.Text != nil {
 							textContent.WriteString(*item.Text)
+							annotations = appendResponsesAnnotations(annotations, item.Annotations, visibleTextRunes)
+							visibleTextRunes += int64(utf8.RuneCountInString(*item.Text))
 						}
 					case "refusal":
 						if item.Refusal != nil {
@@ -1333,9 +1643,12 @@ func convertToLLMResponseFromResponses(resp *ResponsesResponse) *model.InternalL
 					}
 				}
 			}
+			annotations = appendResponsesAnnotations(annotations, outputItem.Annotations, messageTextOffset)
 		case "output_text":
 			if outputItem.Text != nil {
 				textContent.WriteString(*outputItem.Text)
+				annotations = appendResponsesAnnotations(annotations, outputItem.Annotations, visibleTextRunes)
+				visibleTextRunes += int64(utf8.RuneCountInString(*outputItem.Text))
 			}
 		case "function_call":
 			toolCalls = append(toolCalls, model.ToolCall{
@@ -1343,15 +1656,55 @@ func convertToLLMResponseFromResponses(resp *ResponsesResponse) *model.InternalL
 				Type: "function",
 				Function: model.FunctionCall{
 					Name:      outputItem.Name,
+					Namespace: outputItem.Namespace,
 					Arguments: outputItem.Arguments,
 				},
 			})
+		case "custom_tool_call":
+			input := ""
+			if outputItem.Input != nil {
+				input = *outputItem.Input
+			}
+			toolCalls = append(toolCalls, model.ToolCall{
+				ID:   outputItem.CallID,
+				Type: "responses_custom_tool",
+				ResponseCustomToolCall: &model.ResponseCustomToolCall{
+					CallID: outputItem.CallID,
+					Name:   outputItem.Name,
+					Input:  input,
+				},
+			})
+		case "function_call_output", "custom_tool_call_output":
+			metadata := map[string]any{"responses_type": outputItem.Type}
+			inlineToolResults = append(inlineToolResults, model.InlineToolResult{
+				ToolCallID:          outputItem.CallID,
+				Output:              responsesInputOutputText(outputItem.Output),
+				TransformerMetadata: metadata,
+			})
 		case "reasoning":
+			var itemReasoning strings.Builder
 			for _, summary := range outputItem.Summary {
 				reasoningContent.WriteString(summary.Text)
+				itemReasoning.WriteString(summary.Text)
+			}
+			itemSignature := ""
+			if outputItem.EncryptedContent != nil {
+				itemSignature = *outputItem.EncryptedContent
+				if itemSignature != "" {
+					signature := itemSignature
+					reasoningSignature = &signature
+				}
+			}
+			if itemReasoning.Len() > 0 || itemSignature != "" {
+				reasoningItems = append(reasoningItems, model.ReasoningItem{
+					ID:        outputItem.ID,
+					Content:   itemReasoning.String(),
+					Signature: itemSignature,
+				})
 			}
 		case "image_generation_call":
 			if outputItem.Result != nil && *outputItem.Result != "" {
+				flushText()
 				outputFormat := "png"
 				if outputItem.OutputFormat != nil {
 					outputFormat = *outputItem.OutputFormat
@@ -1363,41 +1716,79 @@ func convertToLLMResponseFromResponses(resp *ResponsesResponse) *model.InternalL
 					},
 				})
 			}
+		case "input_image":
+			if outputItem.ImageURL != nil && *outputItem.ImageURL != "" {
+				flushText()
+				contentParts = append(contentParts, model.MessageContentPart{
+					Type: "image_url",
+					ImageURL: &model.ImageURL{
+						URL:    *outputItem.ImageURL,
+						Detail: outputItem.Detail,
+					},
+				})
+			}
+		case "compaction", "compaction_summary":
+			flushText()
+			contentParts = append(contentParts, model.MessageContentPart{
+				Type: outputItem.Type,
+				Compact: &model.CompactContent{
+					ID:               outputItem.ID,
+					EncryptedContent: valueOrEmpty(outputItem.EncryptedContent),
+					CreatedBy:        outputItem.CreatedBy,
+				},
+			})
 		}
 	}
+	flushText()
 
 	choice := model.Choice{
 		Index: 0,
 		Message: &model.Message{
-			Role:      "assistant",
-			ToolCalls: toolCalls,
+			ID:                messageID,
+			Role:              "assistant",
+			ToolCalls:         toolCalls,
+			Annotations:       annotations,
+			InlineToolResults: inlineToolResults,
 		},
 	}
 
-	// Set reasoning content if present
+	// Set reasoning content and item-scoped signatures independently. The
+	// scalar fields remain compatibility mirrors; the ordered item slice is
+	// what preserves multiple Responses reasoning items.
 	if reasoningContent.Len() > 0 {
 		choice.Message.ReasoningContent = lo.ToPtr(reasoningContent.String())
+	}
+	if reasoningSignature != nil {
+		choice.Message.ReasoningSignature = reasoningSignature
+	}
+	if len(reasoningItems) > 0 {
+		choice.Message.ReasoningItems = reasoningItems
 	}
 	if refusalContent.Len() > 0 {
 		choice.Message.Refusal = refusalContent.String()
 	}
 
-	// Set message content
-	if textContent.Len() > 0 {
-		if len(contentParts) > 0 {
-			textPart := model.MessageContentPart{
-				Type: "text",
-				Text: lo.ToPtr(textContent.String()),
-			}
-			contentParts = append([]model.MessageContentPart{textPart}, contentParts...)
-			choice.Message.Content = model.MessageContent{
-				MultipleContent: contentParts,
-			}
-		} else {
-			choice.Message.Content = model.MessageContent{
-				Content: lo.ToPtr(textContent.String()),
-			}
+	for _, outputItem := range resp.Output {
+		if outputItem.Type != "message" || outputItem.Audio == nil {
+			continue
 		}
+		choice.Message.Audio = &struct {
+			Data       string `json:"data,omitempty"`
+			ExpiresAt  int64  `json:"expires_at,omitempty"`
+			ID         string `json:"id,omitempty"`
+			Transcript string `json:"transcript,omitempty"`
+		}{
+			ID:         outputItem.Audio.ID,
+			Data:       outputItem.Audio.Data,
+			ExpiresAt:  outputItem.Audio.ExpiresAt,
+			Transcript: outputItem.Audio.Transcript,
+		}
+		break
+	}
+
+	// Set message content
+	if len(contentParts) == 1 && contentParts[0].Type == "text" && len(toolCalls) == 0 {
+		choice.Message.Content = model.MessageContent{Content: contentParts[0].Text}
 	} else if len(contentParts) > 0 {
 		choice.Message.Content = model.MessageContent{
 			MultipleContent: contentParts,
@@ -1419,6 +1810,71 @@ func convertToLLMResponseFromResponses(resp *ResponsesResponse) *model.InternalL
 	result.Usage = convertResponsesUsage(resp.Usage)
 
 	return result
+}
+
+func appendResponsesAnnotations(dst []model.Annotation, annotations []ResponsesAnnotation, textRuneOffset int64) []model.Annotation {
+	for _, annotation := range annotations {
+		converted := model.Annotation{Type: annotation.Type}
+		if annotation.StartIndex != nil {
+			start := int64(*annotation.StartIndex) + textRuneOffset
+			converted.StartIndex = &start
+		}
+		if annotation.EndIndex != nil {
+			end := int64(*annotation.EndIndex) + textRuneOffset
+			converted.EndIndex = &end
+		}
+		if annotation.URL != nil || annotation.Title != nil {
+			converted.URLCitation = &model.URLCitation{}
+			if annotation.URL != nil {
+				converted.URLCitation.URL = *annotation.URL
+			}
+			if annotation.Title != nil {
+				converted.URLCitation.Title = *annotation.Title
+			}
+		}
+		dst = append(dst, converted)
+	}
+	return dst
+}
+
+func responsesInputOutputText(input *ResponsesInput) string {
+	if input == nil {
+		return ""
+	}
+	if input.Text != nil {
+		return *input.Text
+	}
+	var text strings.Builder
+	for _, item := range input.Items {
+		if item.Text != nil {
+			text.WriteString(*item.Text)
+		}
+		if item.Refusal != nil {
+			text.WriteString(*item.Refusal)
+		}
+	}
+	if text.Len() > 0 {
+		return text.String()
+	}
+	if len(input.Raw) > 0 {
+		return string(input.Raw)
+	}
+	return ""
+}
+
+func valueOrEmpty(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func cloneResponsesStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func (o *ResponseOutbound) ensureOutputItem(outputIndex int, itemType string) ResponsesItem {
@@ -1456,6 +1912,11 @@ func cloneResponsesItem(item ResponsesItem) ResponsesItem {
 	cloned.Content = cloneResponsesInput(item.Content)
 	cloned.Output = cloneResponsesInput(item.Output)
 	cloned.Summary = append([]ResponsesReasoningSummary(nil), item.Summary...)
+	cloned.Annotations = append([]ResponsesAnnotation(nil), item.Annotations...)
+	if item.Audio != nil {
+		audio := *item.Audio
+		cloned.Audio = &audio
+	}
 	return cloned
 }
 

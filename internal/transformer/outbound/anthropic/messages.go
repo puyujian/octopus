@@ -12,21 +12,64 @@ import (
 
 	"github.com/samber/lo"
 
+	"github.com/bestruirui/octopus/internal/transformer/bridge"
 	"github.com/bestruirui/octopus/internal/transformer/compat"
 	anthropicModel "github.com/bestruirui/octopus/internal/transformer/inbound/anthropic"
 	"github.com/bestruirui/octopus/internal/transformer/model"
 	"github.com/bestruirui/octopus/internal/utils/log"
 	"github.com/bestruirui/octopus/internal/utils/xurl"
+	"github.com/looplj/axonhub/llm/transformer"
+	axonAnthropic "github.com/looplj/axonhub/llm/transformer/anthropic"
 )
 
 type MessageOutbound struct {
 	// Stream state tracking
-	streamID    string
-	streamModel string
-	streamUsage *model.Usage
-	toolIndex   int
-	toolCalls   map[int]*model.ToolCall
-	initialized bool
+	streamID             string
+	streamModel          string
+	streamUsage          *model.Usage
+	toolIndex            int
+	toolCalls            map[int]*model.ToolCall
+	initialized          bool
+	streamMessageStarted map[int]bool
+
+	// inner is the AxonHub Anthropic outbound converter used for request,
+	// response and stream parsing. Raw provider extensions are overlaid locally
+	// after the common conversion.
+	inner   transformer.Outbound
+	streams *model.AxonStreamBridge
+}
+
+// ensureAxon lazily initializes the AxonHub Anthropic converter with the
+// actual channel endpoint and key.
+func (o *MessageOutbound) ensureAxon(baseURL, key string) (transformer.Outbound, error) {
+	if o.inner != nil {
+		return o.inner, nil
+	}
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = "https://api.anthropic.com"
+	}
+	if strings.TrimSpace(key) == "" {
+		key = "placeholder"
+	}
+	inner, err := axonAnthropic.NewOutboundTransformer(baseURL, key)
+	if err != nil {
+		return nil, err
+	}
+	o.inner = inner
+	return inner, nil
+}
+
+// anthropicFilterTypes mirrors the event-type whitelist of the axonhub
+// Anthropic outbound filter. Events outside this list would stall the
+// filtered stream (the filter waits for a matching event), so they are
+// short-circuited before being fed to the converter.
+var anthropicFilterTypes = map[string]bool{
+	"message_start":       true,
+	"content_block_start": true,
+	"content_block_delta": true,
+	"message_delta":       true,
+	"message_stop":        true,
+	"error":               true,
 }
 
 // DefaultAnthropicPassthroughBeta 是 Anthropic→Anthropic 直通路径在未从客户端收到
@@ -43,46 +86,60 @@ func (o *MessageOutbound) TransformRequest(ctx context.Context, request *model.I
 	request.EnforceMessageAlternation(model.AlternationProviderAnthropic)
 	compat.PatchAnthropicRequest(request)
 
-	// Convert to Anthropic request format
 	anthropicReq := convertToAnthropicRequest(request)
-
-	body, err := json.Marshal(anthropicReq)
+	overlay, err := json.Marshal(anthropicReq)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal anthropic request: %w", err)
+		return nil, fmt.Errorf("failed to marshal anthropic extensions: %w", err)
+	}
+	inner, err := o.ensureAxon(baseUrl, key)
+	if err != nil {
+		return nil, err
+	}
+	req, axonRequest, err := model.BuildAxonHTTPRequest(ctx, inner, request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to transform Anthropic request with AxonHub: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+	// AxonHub owns the common message/tool/thinking/cache conversion. MCP,
+	// container and Anthropic server-tool definitions are raw protocol fields
+	// that are not part of AxonHub's common request model yet. TopK, service_tier
+	// and top-level cache_control also need the local overlay because AxonHub's
+	// common request model does not expose all three on llm.Request.
+	fields := []string{"mcp_servers", "container", "top_k", "service_tier", "cache_control"}
+	for _, tool := range request.Tools {
+		if len(tool.AnthropicServerSpec) > 0 || strings.Contains(tool.Type, "web_search") || strings.Contains(tool.Type, "code_execution") || strings.Contains(tool.Type, "computer") {
+			fields = append(fields, "tools")
+			break
+		}
 	}
-
-	// Set headers
+	axonRequest.Body, err = model.MergeJSONFields(axonRequest.Body, overlay, fields...)
+	if err != nil {
+		return nil, err
+	}
+	axonRequest.JSONBody = append([]byte(nil), axonRequest.Body...)
+	req, err = bridge.BuildHTTPRequest(ctx, axonRequest)
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("Content-Type", "application/json")
-	// For streaming requests, Anthropic returns Server-Sent Events.
 	if request.Stream != nil && *request.Stream {
 		req.Header.Set("Accept", "text/event-stream")
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
 	req.Header.Set("Anthropic-Version", "2023-06-01")
-	req.Header.Set("X-API-Key", key)
+	if key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
 	if betas := collectAnthropicBetaHeaders(anthropicReq, request); len(betas) > 0 {
 		req.Header.Set("anthropic-beta", strings.Join(betas, ","))
 	}
-
-	// Parse and set URL
-	parsedUrl, err := url.Parse(strings.TrimSuffix(baseUrl, "/"))
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse base url: %w", err)
+	if request.Stream != nil && *request.Stream {
+		if o.streams == nil {
+			o.streams = model.NewAxonStreamBridge(inner)
+		}
+		o.streams.SetRequest(axonRequest)
 	}
-
-	parsedUrl.Path = parsedUrl.Path + "/messages"
-	// Pass through the original query parameters exactly as-is
-	if request.Query != nil {
-		parsedUrl.RawQuery = request.Query.Encode()
-	}
-	req.URL = parsedUrl
-
 	return req, nil
 }
 
@@ -261,53 +318,14 @@ func findPrecedingStringStart(raw []byte, closingQuoteIdx int) int {
 }
 
 func (o *MessageOutbound) TransformResponse(ctx context.Context, response *http.Response) (*model.InternalLLMResponse, error) {
-	if response == nil {
-		return nil, fmt.Errorf("response is nil")
-	}
-
-	body, err := io.ReadAll(response.Body)
+	inner, err := o.ensureAxon("", "")
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, err
 	}
-
-	if len(body) == 0 {
-		return nil, fmt.Errorf("response body is empty")
-	}
-
-	// Check for error response
-	if response.StatusCode >= 400 {
-		var errResp anthropicModel.AnthropicError
-		if err := json.Unmarshal(body, &errResp); err == nil && errResp.Error.Message != "" {
-			if strings.Contains(strings.ToLower(errResp.Error.Message), "signature") {
-				log.Warnw("transformer.reasoning.signature.passthrough",
-					"provider", "anthropic",
-					"direction", "error",
-					"status_code", response.StatusCode,
-					"error_type", errResp.Error.Type,
-					"error_message", truncateForAudit(errResp.Error.Message, 256),
-				)
-			}
-			return nil, &model.ResponseError{
-				StatusCode: response.StatusCode,
-				Detail: model.ErrorDetail{
-					Message: errResp.Error.Message,
-					Type:    errResp.Error.Type,
-				},
-			}
-		}
-		return nil, fmt.Errorf("HTTP error %d: %s", response.StatusCode, string(body))
-	}
-
-	var anthropicResp anthropicModel.Message
-	if err := json.Unmarshal(body, &anthropicResp); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal anthropic response: %w", err)
-	}
-
-	// Convert to internal response
-	return convertToLLMResponse(&anthropicResp), nil
+	return model.TransformResponse(ctx, inner, response)
 }
 
-func (o *MessageOutbound) TransformStreamEvent(ctx context.Context, eventData []byte) ([]model.StreamEvent, error) {
+func (o *MessageOutbound) transformStreamEventLocal(ctx context.Context, eventData []byte) ([]model.StreamEvent, error) {
 	if len(eventData) == 0 {
 		return nil, nil
 	}
@@ -337,9 +355,6 @@ func (o *MessageOutbound) TransformStreamEvent(ctx context.Context, eventData []
 		if streamEvent.Message != nil {
 			o.streamID = streamEvent.Message.ID
 			o.streamModel = streamEvent.Message.Model
-			// 上游只要返回了 usage 对象就采纳（即便全为 0），以便 message_delta
-			// 能继承 PromptTokens。部分第三方兼容商在 message_start 返回全零 usage，
-			// 之前的 >0 过滤会整体丢弃，导致后续 input 计为 0。
 			if streamEvent.Message.Usage != nil {
 				o.streamUsage = convertAnthropicUsage(streamEvent.Message.Usage)
 			}
@@ -368,8 +383,10 @@ func (o *MessageOutbound) TransformStreamEvent(ctx context.Context, eventData []
 		case "text", "thinking":
 			events = append(events, model.StreamEvent{Kind: model.StreamEventKindContentBlockStart, ID: o.streamID, Model: o.streamModel, Index: idx, ContentBlock: &model.StreamContentBlock{Type: streamEvent.ContentBlock.Type}})
 		case "redacted_thinking":
-			events = append(events, model.StreamEvent{Kind: model.StreamEventKindContentBlockStart, ID: o.streamID, Model: o.streamModel, Index: idx, ContentBlock: &model.StreamContentBlock{Type: "redacted_thinking", Data: streamEvent.ContentBlock.Data}})
-			events = append(events, model.StreamEvent{Kind: model.StreamEventKindContentBlockStop, ID: o.streamID, Model: o.streamModel, Index: idx, ContentBlock: &model.StreamContentBlock{Type: "redacted_thinking"}})
+			events = append(events,
+				model.StreamEvent{Kind: model.StreamEventKindContentBlockStart, ID: o.streamID, Model: o.streamModel, Index: idx, ContentBlock: &model.StreamContentBlock{Type: "redacted_thinking", Data: streamEvent.ContentBlock.Data}},
+				model.StreamEvent{Kind: model.StreamEventKindContentBlockStop, ID: o.streamID, Model: o.streamModel, Index: idx, ContentBlock: &model.StreamContentBlock{Type: "redacted_thinking"}},
+			)
 		default:
 			return nil, nil
 		}
@@ -408,9 +425,6 @@ func (o *MessageOutbound) TransformStreamEvent(ctx context.Context, eventData []
 		if streamEvent.Usage != nil {
 			usage := convertAnthropicUsage(streamEvent.Usage)
 			if o.streamUsage != nil {
-				// message_delta 自身通常只带 output；input 来自 message_start。
-				// 仅当 delta 未携带 input 时才继承，避免上游把真实 input 放在
-				// message_delta 时被 message_start 的零值覆盖。
 				if usage.PromptTokens == 0 {
 					usage.PromptTokens = o.streamUsage.PromptTokens
 				}
@@ -435,28 +449,21 @@ func (o *MessageOutbound) TransformStreamEvent(ctx context.Context, eventData []
 			appendUsage(usage)
 		}
 		if streamEvent.Delta != nil && streamEvent.Delta.StopReason != nil {
-			finishReason := convertStopReason(streamEvent.Delta.StopReason)
-			if finishReason != nil {
+			if finishReason := convertStopReason(streamEvent.Delta.StopReason); finishReason != nil {
 				events = append(events, model.StreamEvent{Kind: model.StreamEventKindMessageStop, ID: o.streamID, Model: o.streamModel, StopReason: model.ParseFinishReason(*finishReason), StopSequence: streamEvent.Delta.StopSequence})
 			}
 		}
 
 	case "message_stop":
 		appendUsage(o.streamUsage)
-
 	case "content_block_stop":
-		idx := anthropicStreamIndex(streamEvent.Index)
-		events = append(events, model.StreamEvent{Kind: model.StreamEventKindContentBlockStop, ID: o.streamID, Model: o.streamModel, Index: idx})
-
+		events = append(events, model.StreamEvent{Kind: model.StreamEventKindContentBlockStop, ID: o.streamID, Model: o.streamModel, Index: anthropicStreamIndex(streamEvent.Index)})
 	case "ping":
 		return nil, nil
-
 	case "error":
-		if streamEvent.Error == nil {
-			return nil, nil
+		if streamEvent.Error != nil {
+			events = append(events, model.StreamEvent{Kind: model.StreamEventKindError, ID: o.streamID, Model: o.streamModel, Error: &model.ResponseError{StatusCode: mapAnthropicErrorTypeToStatus(streamEvent.Error.Type), Detail: model.ErrorDetail{Type: streamEvent.Error.Type, Message: streamEvent.Error.Message}}})
 		}
-		events = append(events, model.StreamEvent{Kind: model.StreamEventKindError, ID: o.streamID, Model: o.streamModel, Error: &model.ResponseError{StatusCode: mapAnthropicErrorTypeToStatus(streamEvent.Error.Type), Detail: model.ErrorDetail{Type: streamEvent.Error.Type, Message: streamEvent.Error.Message}}})
-
 	default:
 		return nil, nil
 	}
@@ -474,173 +481,91 @@ func anthropicStreamIndex(index *int64) int {
 	return int(*index)
 }
 
-func (o *MessageOutbound) TransformStream(ctx context.Context, eventData []byte) (*model.InternalLLMResponse, error) {
+func (o *MessageOutbound) transformStreamLocal(ctx context.Context, eventData []byte) (*model.InternalLLMResponse, error) {
 	if len(eventData) == 0 {
 		return nil, nil
 	}
-
-	// Handle [DONE] marker
 	if bytes.HasPrefix(eventData, []byte("[DONE]")) {
 		return &model.InternalLLMResponse{
 			Object: "[DONE]",
 		}, nil
 	}
-
-	// Initialize state if needed
 	if !o.initialized {
 		o.toolCalls = make(map[int]*model.ToolCall)
 		o.toolIndex = -1
 		o.initialized = true
 	}
 
-	// Parse the streaming event
 	var streamEvent anthropicModel.StreamEvent
 	if err := json.Unmarshal(eventData, &streamEvent); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal stream event: %w", err)
 	}
 
 	resp := &model.InternalLLMResponse{
-		ID:      o.streamID,
-		Model:   o.streamModel,
-		Object:  "chat.completion.chunk",
-		Created: 0,
+		ID: o.streamID, Model: o.streamModel, Object: "chat.completion.chunk",
 	}
-
 	switch streamEvent.Type {
 	case "message_start":
 		if streamEvent.Message != nil {
 			o.streamID = streamEvent.Message.ID
 			o.streamModel = streamEvent.Message.Model
-			resp.ID = o.streamID
-			resp.Model = o.streamModel
-
-			// 上游只要返回了 usage 对象就采纳（即便全为 0），避免后续 input 计为 0。
+			resp.ID, resp.Model = o.streamID, o.streamModel
 			if streamEvent.Message.Usage != nil {
 				o.streamUsage = convertAnthropicUsage(streamEvent.Message.Usage)
 				resp.Usage = o.streamUsage
 			}
 		}
-
-		resp.Choices = []model.Choice{
-			{
-				Index: 0,
-				Delta: &model.Message{
-					Role: "assistant",
-				},
-			},
-		}
-
+		resp.Choices = []model.Choice{{Index: 0, Delta: &model.Message{Role: "assistant"}}}
 	case "content_block_start":
-		if streamEvent.ContentBlock != nil {
-			switch streamEvent.ContentBlock.Type {
-			case "tool_use":
-				o.toolIndex++
-				toolCall := model.ToolCall{
-					Index: o.toolIndex,
-					ID:    streamEvent.ContentBlock.ID,
-					Type:  "function",
-					Function: model.FunctionCall{
-						Name:      lo.FromPtr(streamEvent.ContentBlock.Name),
-						Arguments: "",
-					},
-				}
-				o.toolCalls[o.toolIndex] = &toolCall
-
-				resp.Choices = []model.Choice{
-					{
-						Index: 0,
-						Delta: &model.Message{
-							Role:      "assistant",
-							ToolCalls: []model.ToolCall{toolCall},
-						},
-					},
-				}
-			case "text", "thinking":
-				// These are handled in content_block_delta
-				return nil, nil
-			case "redacted_thinking":
-				// Pass through as a complete block (no delta)
-				resp.Choices = []model.Choice{
-					{
-						Index: 0,
-						Delta: &model.Message{
-							Role:                   "assistant",
-							RedactedThinkingBlocks: []string{streamEvent.ContentBlock.Data},
-							ReasoningBlocks: []model.ReasoningBlock{{
-								Kind:     model.ReasoningBlockKindRedacted,
-								Index:    -1,
-								Data:     streamEvent.ContentBlock.Data,
-								Provider: "anthropic",
-							}},
-						},
-					},
-				}
-			default:
-				return nil, nil
-			}
+		if streamEvent.ContentBlock == nil {
+			return nil, nil
 		}
-
+		switch streamEvent.ContentBlock.Type {
+		case "tool_use":
+			o.toolIndex++
+			toolCall := model.ToolCall{Index: o.toolIndex, ID: streamEvent.ContentBlock.ID, Type: "function", Function: model.FunctionCall{Name: lo.FromPtr(streamEvent.ContentBlock.Name)}}
+			o.toolCalls[o.toolIndex] = &toolCall
+			resp.Choices = []model.Choice{{Index: 0, Delta: &model.Message{Role: "assistant", ToolCalls: []model.ToolCall{toolCall}}}}
+		case "redacted_thinking":
+			resp.Choices = []model.Choice{{Index: 0, Delta: &model.Message{Role: "assistant", RedactedThinkingBlocks: []string{streamEvent.ContentBlock.Data}, ReasoningBlocks: []model.ReasoningBlock{{Kind: model.ReasoningBlockKindRedacted, Index: -1, Data: streamEvent.ContentBlock.Data, Provider: "anthropic"}}}}}
+		default:
+			return nil, nil
+		}
 	case "content_block_delta":
-		if streamEvent.Delta != nil && streamEvent.Delta.Type != nil {
-			choice := model.Choice{
-				Index: 0,
-				Delta: &model.Message{
-					Role: "assistant",
-				},
-			}
-
-			switch *streamEvent.Delta.Type {
-			case "text_delta":
-				if streamEvent.Delta.Text != nil {
-					choice.Delta.Content = model.MessageContent{
-						Content: streamEvent.Delta.Text,
-					}
-				}
-			case "input_json_delta":
-				if streamEvent.Delta.PartialJSON != nil && o.toolIndex >= 0 {
-					choice.Delta.ToolCalls = []model.ToolCall{
-						{
-							Index: o.toolIndex,
-							ID:    o.toolCalls[o.toolIndex].ID,
-							Type:  "function",
-							Function: model.FunctionCall{
-								Arguments: *streamEvent.Delta.PartialJSON,
-							},
-						},
-					}
-				}
-			case "thinking_delta":
-				if streamEvent.Delta.Thinking != nil {
-					choice.Delta.ReasoningContent = streamEvent.Delta.Thinking
-				}
-			case "signature_delta":
-				if streamEvent.Delta.Signature != nil {
-					choice.Delta.ReasoningSignature = streamEvent.Delta.Signature
-					// Emit a standalone signature block so downstream aggregators can attach it
-					// to the correct thinking block even when multiple thinking blocks exist.
-					choice.Delta.ReasoningBlocks = []model.ReasoningBlock{{
-						Kind:      model.ReasoningBlockKindSignature,
-						Index:     -1,
-						Signature: *streamEvent.Delta.Signature,
-						Provider:  "anthropic",
-					}}
-				}
-			default:
-				return nil, nil
-			}
-
-			resp.Choices = []model.Choice{choice}
+		if streamEvent.Delta == nil || streamEvent.Delta.Type == nil {
+			return nil, nil
 		}
-
+		choice := model.Choice{Index: 0, Delta: &model.Message{Role: "assistant"}}
+		switch *streamEvent.Delta.Type {
+		case "text_delta":
+			if streamEvent.Delta.Text != nil {
+				choice.Delta.Content.Content = streamEvent.Delta.Text
+			}
+		case "input_json_delta":
+			if streamEvent.Delta.PartialJSON != nil && o.toolIndex >= 0 {
+				id := ""
+				if existing := o.toolCalls[o.toolIndex]; existing != nil {
+					id = existing.ID
+				}
+				choice.Delta.ToolCalls = []model.ToolCall{{Index: o.toolIndex, ID: id, Type: "function", Function: model.FunctionCall{Arguments: *streamEvent.Delta.PartialJSON}}}
+			}
+		case "thinking_delta":
+			if streamEvent.Delta.Thinking != nil {
+				choice.Delta.ReasoningContent = streamEvent.Delta.Thinking
+			}
+		case "signature_delta":
+			if streamEvent.Delta.Signature != nil {
+				choice.Delta.ReasoningSignature = streamEvent.Delta.Signature
+				choice.Delta.ReasoningBlocks = []model.ReasoningBlock{{Kind: model.ReasoningBlockKindSignature, Index: -1, Signature: *streamEvent.Delta.Signature, Provider: "anthropic"}}
+			}
+		default:
+			return nil, nil
+		}
+		resp.Choices = []model.Choice{choice}
 	case "message_delta":
 		if streamEvent.Usage != nil {
 			usage := convertAnthropicUsage(streamEvent.Usage)
 			if o.streamUsage != nil {
-				// message_delta.usage normally carries only the final output_tokens.
-				// Carry forward cache metadata captured at message_start so the
-				// aggregate reflects all four buckets (input / output / cache_read /
-				// cache_write) rather than collapsing to input+output.
-				// 仅当 delta 未自带 input 时才继承，避免真实 input 被零值覆盖。
 				if usage.PromptTokens == 0 {
 					usage.PromptTokens = o.streamUsage.PromptTokens
 				}
@@ -662,49 +587,135 @@ func (o *MessageOutbound) TransformStream(ctx context.Context, eventData []byte)
 			}
 			usage.TotalTokens = usage.EffectiveInputTokens() + usage.CompletionTokens
 			o.streamUsage = usage
+			resp.Usage = usage
 		}
-
 		if streamEvent.Delta != nil && streamEvent.Delta.StopReason != nil {
-			finishReason := convertStopReason(streamEvent.Delta.StopReason)
-			resp.Choices = []model.Choice{
-				{
-					Index:        0,
-					FinishReason: finishReason,
-					StopSequence: streamEvent.Delta.StopSequence,
-				},
-			}
+			resp.Choices = []model.Choice{{Index: 0, FinishReason: convertStopReason(streamEvent.Delta.StopReason), StopSequence: streamEvent.Delta.StopSequence}}
 		}
-
 	case "message_stop":
 		resp.Choices = []model.Choice{}
-		if o.streamUsage != nil {
-			resp.Usage = o.streamUsage
-		}
-
+		resp.Usage = o.streamUsage
 	case "content_block_stop", "ping":
 		return nil, nil
-
 	case "error":
 		if streamEvent.Error == nil {
 			return nil, nil
 		}
-		resp.Error = &model.ResponseError{
-			StatusCode: mapAnthropicErrorTypeToStatus(streamEvent.Error.Type),
-			Detail: model.ErrorDetail{
-				Type:    streamEvent.Error.Type,
-				Message: streamEvent.Error.Message,
-			},
-		}
-		resp.Choices = nil
-
+		resp.Error = &model.ResponseError{StatusCode: mapAnthropicErrorTypeToStatus(streamEvent.Error.Type), Detail: model.ErrorDetail{Type: streamEvent.Error.Type, Message: streamEvent.Error.Message}}
 	default:
 		return nil, nil
 	}
-
 	return resp, nil
 }
 
-// convertToAnthropicRequest converts internal LLM request to Anthropic format
+// TransformStreamEvent is backed by AxonHub's provider stream transformer so
+// response and stream conversion share exactly the same state machine.
+func (o *MessageOutbound) TransformStreamEvent(ctx context.Context, eventData []byte) ([]model.StreamEvent, error) {
+	// Keep the explicit local event projection here. AxonHub's unified response
+	// model represents an Anthropic tool block as a tool-call delta, while this
+	// interface must expose the protocol boundary (tool_call_start followed by
+	// argument deltas). The local projection also preserves the provider's
+	// content-block indexes verbatim.
+	events, err := o.transformStreamEventLocal(ctx, eventData)
+	if err != nil {
+		return nil, err
+	}
+	if o.streamMessageStarted == nil {
+		o.streamMessageStarted = make(map[int]bool)
+	}
+	return model.SuppressRepeatedMessageStarts(events, o.streamMessageStarted), nil
+}
+
+func (o *MessageOutbound) TransformStream(ctx context.Context, eventData []byte) (*model.InternalLLMResponse, error) {
+	inner, err := o.ensureAxon("", "")
+	if err != nil {
+		return nil, err
+	}
+	if o.streams == nil {
+		o.streams = model.NewAxonStreamBridge(inner)
+	}
+	response, err := o.streams.Feed(ctx, eventData)
+	if err != nil {
+		return nil, err
+	}
+	response = o.normalizeAxonStreamResponse(eventData, response)
+	model.RestoreAnthropicSignatures(response)
+	return response, nil
+}
+
+// normalizeAxonStreamResponse keeps the local Anthropic usage contract while
+// using AxonHub for the actual provider event state machine. AxonHub emits the
+// final usage on message_stop, but a number of clients consume usage from the
+// message_delta event, so retain that compatibility signal here.
+func (o *MessageOutbound) normalizeAxonStreamResponse(eventData []byte, response *model.InternalLLMResponse) *model.InternalLLMResponse {
+	var event anthropicModel.StreamEvent
+	if len(eventData) == 0 || bytes.HasPrefix(eventData, []byte("[DONE]")) || json.Unmarshal(eventData, &event) != nil {
+		return response
+	}
+	if response == nil && event.Type == "message_delta" && event.Usage != nil {
+		response = &model.InternalLLMResponse{ID: o.streamID, Model: o.streamModel, Object: "chat.completion.chunk"}
+	}
+	if response == nil {
+		return response
+	}
+
+	switch event.Type {
+	case "message_start":
+		if event.Message != nil {
+			o.streamID = event.Message.ID
+			o.streamModel = event.Message.Model
+			response.ID, response.Model = o.streamID, o.streamModel
+			if event.Message.Usage != nil {
+				o.streamUsage = convertAnthropicUsage(event.Message.Usage)
+				response.Usage = o.streamUsage
+			}
+		}
+	case "message_delta":
+		if event.Usage != nil {
+			usage := convertAnthropicUsage(event.Usage)
+			mergeAnthropicStreamUsage(usage, o.streamUsage)
+			o.streamUsage = usage
+			response.Usage = usage
+		} else if response.Usage == nil {
+			response.Usage = o.streamUsage
+		}
+	case "message_stop":
+		if o.streamUsage != nil {
+			response.Usage = o.streamUsage
+		}
+	case "error":
+		if response.Error != nil && response.Error.StatusCode == 0 {
+			response.Error.StatusCode = mapAnthropicErrorTypeToStatus(response.Error.Detail.Type)
+		}
+	}
+	return response
+}
+
+func mergeAnthropicStreamUsage(current, previous *model.Usage) {
+	if current == nil || previous == nil {
+		return
+	}
+	if current.PromptTokens == 0 {
+		current.PromptTokens = previous.PromptTokens
+	}
+	if current.CacheCreationInputTokens == 0 {
+		current.CacheCreationInputTokens = previous.CacheCreationInputTokens
+	}
+	if current.CacheReadInputTokens == 0 {
+		current.CacheReadInputTokens = previous.CacheReadInputTokens
+	}
+	if current.CacheCreation5mInputTokens == 0 {
+		current.CacheCreation5mInputTokens = previous.CacheCreation5mInputTokens
+	}
+	if current.CacheCreation1hInputTokens == 0 {
+		current.CacheCreation1hInputTokens = previous.CacheCreation1hInputTokens
+	}
+	if current.PromptTokensDetails == nil {
+		current.PromptTokensDetails = previous.PromptTokensDetails
+	}
+	current.TotalTokens = current.EffectiveInputTokens() + current.CompletionTokens
+}
+
 func convertToAnthropicRequest(req *model.InternalLLMRequest) *anthropicModel.MessageRequest {
 	result := &anthropicModel.MessageRequest{
 		Model:       req.Model,
@@ -734,6 +745,9 @@ func convertToAnthropicRequest(req *model.InternalLLMRequest) *anthropicModel.Me
 	}
 	if len(anthropicExt.Container) > 0 {
 		result.Container = append(result.Container[:0], anthropicExt.Container...)
+	}
+	if anthropicExt.CacheControl != nil {
+		result.CacheControl = convertCacheControl(anthropicExt.CacheControl)
 	}
 
 	// Convert messages

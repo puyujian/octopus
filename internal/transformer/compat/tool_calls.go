@@ -23,15 +23,22 @@ func FixOrphanedToolCalls(messages []model.Message) []model.Message {
 		return messages
 	}
 
+	// AxonHub groups an Anthropic tool_result with the following user content
+	// through MessageIndex. When we synthesize a missing result, associate it
+	// with the next user turn (if one exists) so the repair remains one
+	// provider-visible user message instead of creating consecutive user turns.
+	working := append([]model.Message(nil), messages...)
+	nextMessageIndex := nextSyntheticMessageIndex(working)
 	out := make([]model.Message, 0, len(messages))
-	for i := 0; i < len(messages); i++ {
-		msg := messages[i]
+	for i := 0; i < len(working); i++ {
+		msg := working[i]
 		out = append(out, msg)
 		if msg.Role != "assistant" || len(msg.ToolCalls) == 0 {
 			continue
 		}
 
-		answered := answeredToolCallIDsBeforeNextAssistant(messages, i+1)
+		answered := answeredToolCallIDsBeforeNextAssistant(working, i+1)
+		associationIndex := syntheticToolResultMessageIndex(working, i+1, &nextMessageIndex)
 		for _, toolCall := range msg.ToolCalls {
 			id := strings.TrimSpace(toolCall.ID)
 			if id == "" {
@@ -40,10 +47,43 @@ func FixOrphanedToolCalls(messages []model.Message) []model.Message {
 			if _, ok := answered[id]; ok {
 				continue
 			}
-			out = append(out, emptyToolResult(toolCall))
+			synthetic := emptyToolResult(toolCall)
+			if associationIndex != nil {
+				index := *associationIndex
+				synthetic.MessageIndex = &index
+			}
+			out = append(out, synthetic)
 		}
 	}
 	return out
+}
+
+func nextSyntheticMessageIndex(messages []model.Message) int {
+	next := 0
+	for _, msg := range messages {
+		if msg.MessageIndex != nil && *msg.MessageIndex >= next {
+			next = *msg.MessageIndex + 1
+		}
+	}
+	return next
+}
+
+func syntheticToolResultMessageIndex(messages []model.Message, start int, next *int) *int {
+	for i := start; i < len(messages); i++ {
+		if messages[i].Role == "assistant" {
+			return nil
+		}
+		if messages[i].Role != "user" {
+			continue
+		}
+		if messages[i].MessageIndex == nil {
+			index := *next
+			(*next)++
+			messages[i].MessageIndex = &index
+		}
+		return messages[i].MessageIndex
+	}
+	return nil
 }
 
 func answeredToolCallIDsBeforeNextAssistant(messages []model.Message, start int) map[string]struct{} {

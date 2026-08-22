@@ -16,11 +16,12 @@ const (
 )
 
 type ProviderExtensions struct {
-	Common     *CommonExtension     `json:"common,omitempty"`
-	Anthropic  *AnthropicExtension  `json:"anthropic,omitempty"`
-	Gemini     *GeminiExtension     `json:"gemini,omitempty"`
-	OpenAI     *OpenAIExtension     `json:"openai,omitempty"`
-	Volcengine *VolcengineExtension `json:"volcengine,omitempty"`
+	Common          *CommonExtension          `json:"common,omitempty"`
+	Anthropic       *AnthropicExtension       `json:"anthropic,omitempty"`
+	Gemini          *GeminiExtension          `json:"gemini,omitempty"`
+	OpenAI          *OpenAIExtension          `json:"openai,omitempty"`
+	OpenAIResponses *OpenAIResponsesExtension `json:"openai_responses,omitempty"`
+	Volcengine      *VolcengineExtension      `json:"volcengine,omitempty"`
 }
 
 type CommonExtension struct {
@@ -48,19 +49,47 @@ type OpenAIExtension struct {
 }
 
 type OpenAIResponsesOptions struct {
-	PreviousResponseID       *string         `json:"previous_response_id,omitempty"`
-	Background               *bool           `json:"background,omitempty"`
-	Prompt                   json.RawMessage `json:"prompt,omitempty"`
-	PromptCacheKey           *string         `json:"prompt_cache_key,omitempty"`
-	PromptCacheRetention     *string         `json:"prompt_cache_retention,omitempty"`
-	SafetyIdentifier         *string         `json:"safety_identifier,omitempty"`
-	MaxToolCalls             *int64          `json:"max_tool_calls,omitempty"`
-	Conversation             json.RawMessage `json:"conversation,omitempty"`
-	ContextManagement        json.RawMessage `json:"context_management,omitempty"`
-	StreamOptions            json.RawMessage `json:"stream_options,omitempty"`
-	ReasoningSummary         *string         `json:"reasoning_summary,omitempty"`
-	ReasoningGenerateSummary *string         `json:"reasoning_generate_summary,omitempty"`
-	RawInputItems            json.RawMessage `json:"raw_input_items,omitempty"`
+	PreviousResponseID       *string                      `json:"previous_response_id,omitempty"`
+	Background               *bool                        `json:"background,omitempty"`
+	Prompt                   json.RawMessage              `json:"prompt,omitempty"`
+	PromptCacheKey           *string                      `json:"prompt_cache_key,omitempty"`
+	PromptCacheRetention     *string                      `json:"prompt_cache_retention,omitempty"`
+	SafetyIdentifier         *string                      `json:"safety_identifier,omitempty"`
+	MaxToolCalls             *int64                       `json:"max_tool_calls,omitempty"`
+	Conversation             json.RawMessage              `json:"conversation,omitempty"`
+	ContextManagement        json.RawMessage              `json:"context_management,omitempty"`
+	StreamOptions            json.RawMessage              `json:"stream_options,omitempty"`
+	ReasoningSummary         *string                      `json:"reasoning_summary,omitempty"`
+	ReasoningGenerateSummary *string                      `json:"reasoning_generate_summary,omitempty"`
+	ReasoningContext         string                       `json:"reasoning_context,omitempty"`
+	RawTools                 []OpenAIResponsesRawFragment `json:"raw_tools,omitempty"`
+	ToolSignatures           []string                     `json:"tool_signatures,omitempty"`
+	RawToolChoice            json.RawMessage              `json:"raw_tool_choice,omitempty"`
+	// RawInputFragments contains only Responses input items which are not
+	// represented by the normalized Messages projection. RawInputItems remains
+	// the complete array used by websocket exact replay.
+	RawInputFragments []OpenAIResponsesRawFragment `json:"raw_input_fragments,omitempty"`
+	RawInputItems     json.RawMessage              `json:"raw_input_items,omitempty"`
+}
+
+// OpenAIResponsesExtension mirrors AxonHub's provider-scoped Responses
+// request extensions without making the local IR depend on AxonHub types.
+// Raw fragments are converted explicitly at the AxonHub boundary.
+type OpenAIResponsesExtension struct {
+	ReasoningContext  string                       `json:"reasoning_context,omitempty"`
+	RawTools          []OpenAIResponsesRawFragment `json:"raw_tools,omitempty"`
+	ToolSignatures    []string                     `json:"tool_signatures,omitempty"`
+	RawToolChoice     json.RawMessage              `json:"raw_tool_choice,omitempty"`
+	RawInputFragments []OpenAIResponsesRawFragment `json:"raw_input_fragments,omitempty"`
+}
+
+type OpenAIResponsesRawFragment struct {
+	Type                 string          `json:"type,omitempty"`
+	Name                 string          `json:"name,omitempty"`
+	CallID               string          `json:"call_id,omitempty"`
+	OriginalIndex        int             `json:"original_index,omitempty"`
+	RepresentedToolCount int             `json:"represented_tool_count,omitempty"`
+	Raw                  json.RawMessage `json:"raw,omitempty"`
 }
 
 type VolcengineExtension struct {
@@ -106,6 +135,18 @@ func cloneCacheControl(value *CacheControl) *CacheControl {
 	return &cloned
 }
 
+func cloneOpenAIResponsesRawFragments(src []OpenAIResponsesRawFragment) []OpenAIResponsesRawFragment {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]OpenAIResponsesRawFragment, len(src))
+	for i := range src {
+		out[i] = src[i]
+		out[i].Raw = cloneRawMessage(src[i].Raw)
+	}
+	return out
+}
+
 func CloneProviderExtensions(ext *ProviderExtensions) *ProviderExtensions {
 	if ext == nil {
 		return nil
@@ -135,6 +176,15 @@ func CloneProviderExtensions(ext *ProviderExtensions) *ProviderExtensions {
 			ResponsesPassthroughRequired: ext.OpenAI.ResponsesPassthroughRequired,
 			ResponsesPassthroughReason:   ext.OpenAI.ResponsesPassthroughReason,
 			RawResponseItems:             cloneRawMessage(ext.OpenAI.RawResponseItems),
+		}
+	}
+	if ext.OpenAIResponses != nil {
+		cloned.OpenAIResponses = &OpenAIResponsesExtension{
+			ReasoningContext:  ext.OpenAIResponses.ReasoningContext,
+			RawTools:          cloneOpenAIResponsesRawFragments(ext.OpenAIResponses.RawTools),
+			ToolSignatures:    append([]string(nil), ext.OpenAIResponses.ToolSignatures...),
+			RawToolChoice:     cloneRawMessage(ext.OpenAIResponses.RawToolChoice),
+			RawInputFragments: cloneOpenAIResponsesRawFragments(ext.OpenAIResponses.RawInputFragments),
 		}
 	}
 	if ext.Volcengine != nil {
@@ -243,6 +293,14 @@ func (r *InternalLLMRequest) SetOpenAIResponsesOptions(options OpenAIResponsesOp
 	r.ResponsesStreamOptions = cloneRawMessage(options.StreamOptions)
 	r.ReasoningSummary = cloneStringPtr(options.ReasoningSummary)
 	r.ReasoningGenerateSummary = cloneStringPtr(options.ReasoningGenerateSummary)
+	providerExtensions := r.ensureProviderExtensions()
+	providerExtensions.OpenAIResponses = &OpenAIResponsesExtension{
+		ReasoningContext:  options.ReasoningContext,
+		RawTools:          cloneOpenAIResponsesRawFragments(options.RawTools),
+		ToolSignatures:    append([]string(nil), options.ToolSignatures...),
+		RawToolChoice:     cloneRawMessage(options.RawToolChoice),
+		RawInputFragments: cloneOpenAIResponsesRawFragments(options.RawInputFragments),
+	}
 	r.SetOpenAIRawInputItems(options.RawInputItems)
 }
 
@@ -250,7 +308,7 @@ func (r *InternalLLMRequest) GetOpenAIResponsesOptions() OpenAIResponsesOptions 
 	if r == nil {
 		return OpenAIResponsesOptions{}
 	}
-	return OpenAIResponsesOptions{
+	options := OpenAIResponsesOptions{
 		PreviousResponseID:       cloneStringPtr(r.PreviousResponseID),
 		Background:               cloneBoolPtr(r.Background),
 		Prompt:                   cloneRawMessage(r.Prompt),
@@ -265,6 +323,15 @@ func (r *InternalLLMRequest) GetOpenAIResponsesOptions() OpenAIResponsesOptions 
 		ReasoningGenerateSummary: cloneStringPtr(r.ReasoningGenerateSummary),
 		RawInputItems:            cloneRawMessage(r.RawInputItems),
 	}
+	if r.ProviderExtensions != nil && r.ProviderExtensions.OpenAIResponses != nil {
+		ext := r.ProviderExtensions.OpenAIResponses
+		options.ReasoningContext = ext.ReasoningContext
+		options.RawTools = cloneOpenAIResponsesRawFragments(ext.RawTools)
+		options.ToolSignatures = append([]string(nil), ext.ToolSignatures...)
+		options.RawToolChoice = cloneRawMessage(ext.RawToolChoice)
+		options.RawInputFragments = cloneOpenAIResponsesRawFragments(ext.RawInputFragments)
+	}
+	return options
 }
 
 func (r *InternalLLMRequest) OpenAIRawInputItems() json.RawMessage {

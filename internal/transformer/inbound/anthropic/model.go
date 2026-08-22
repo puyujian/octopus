@@ -88,6 +88,11 @@ type MessageRequest struct {
 	// Stream is an optional flag to enable streaming.
 	Stream *bool `json:"stream,omitempty"`
 
+	// CacheControl enables Anthropic's automatic prompt caching. Preserve it
+	// across the provider-neutral IR hop so the AxonHub Anthropic converter can
+	// restore it on the upstream request.
+	CacheControl *CacheControl `json:"cache_control,omitempty"`
+
 	// MCPServers carries the Anthropic MCP connector payload
 	// (mcp-client-2025-11-20 beta). Each entry is an object with
 	// type/url/name/authorization_token/tool_configuration. Preserved as

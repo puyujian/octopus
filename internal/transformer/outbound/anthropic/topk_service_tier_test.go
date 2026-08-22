@@ -1,6 +1,9 @@
 package anthropic
 
 import (
+	"context"
+	"encoding/json"
+	"io"
 	"testing"
 
 	"github.com/samber/lo"
@@ -32,6 +35,48 @@ func TestConvertToAnthropicRequestForwardsTopKAndServiceTier(t *testing.T) {
 	}
 	if out.ServiceTier != "priority" {
 		t.Fatalf("expected service_tier forwarded, got %q", out.ServiceTier)
+	}
+}
+
+func TestTransformRequestWritesAnthropicOverlayFieldsToHTTPBody(t *testing.T) {
+	tier := "priority"
+	stream := false
+	req := &model.InternalLLMRequest{
+		Model:       "claude-3-5-sonnet",
+		MaxTokens:   lo.ToPtr[int64](32),
+		TopK:        lo.ToPtr[int64](40),
+		ServiceTier: &tier,
+		Stream:      &stream,
+		ProviderExtensions: &model.ProviderExtensions{Anthropic: &model.AnthropicExtension{
+			CacheControl: &model.CacheControl{Type: model.CacheControlTypeEphemeral, TTL: model.CacheTTL1h},
+		}},
+		Messages: []model.Message{{Role: "user", Content: model.MessageContent{Content: stringPtr("hi")}}},
+	}
+
+	httpReq, err := (&MessageOutbound{}).TransformRequest(context.Background(), req, "https://api.anthropic.com", "sk-test")
+	if err != nil {
+		t.Fatalf("TransformRequest: %v", err)
+	}
+	body, err := io.ReadAll(httpReq.Body)
+	if err != nil {
+		t.Fatalf("read request body: %v", err)
+	}
+	var payload struct {
+		TopK         *int64                       `json:"top_k"`
+		ServiceTier  string                       `json:"service_tier"`
+		CacheControl *anthropicModel.CacheControl `json:"cache_control"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode request body: %v\n%s", err, body)
+	}
+	if payload.TopK == nil || *payload.TopK != 40 {
+		t.Fatalf("expected top_k=40 in HTTP body, got %+v\n%s", payload.TopK, body)
+	}
+	if payload.ServiceTier != tier {
+		t.Fatalf("expected service_tier=%q in HTTP body, got %q\n%s", tier, payload.ServiceTier, body)
+	}
+	if payload.CacheControl == nil || payload.CacheControl.Type != model.CacheControlTypeEphemeral || payload.CacheControl.TTL != model.CacheTTL1h {
+		t.Fatalf("expected top-level cache_control in HTTP body, got %+v\n%s", payload.CacheControl, body)
 	}
 }
 

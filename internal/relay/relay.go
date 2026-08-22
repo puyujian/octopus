@@ -491,6 +491,9 @@ func parseRequest(inboundType inbound.InboundType, c *gin.Context) ([]byte, *mod
 
 	// Pass through the original query parameters
 	internalRequest.Query = c.Request.URL.Query()
+	internalRequest.RawHeaders = c.Request.Header.Clone()
+	internalRequest.RawPath = c.Request.URL.Path
+	internalRequest.RawHTTPRequest = c.Request
 
 	if err := internalRequest.Validate(); err != nil {
 		resp.Error(c, http.StatusBadRequest, err.Error())

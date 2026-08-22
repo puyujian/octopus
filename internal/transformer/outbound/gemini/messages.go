@@ -15,9 +15,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bestruirui/octopus/internal/transformer/bridge"
 	"github.com/bestruirui/octopus/internal/transformer/model"
 	"github.com/bestruirui/octopus/internal/utils/log"
 	"github.com/bestruirui/octopus/internal/utils/xurl"
+	"github.com/looplj/axonhub/llm/auth"
+	"github.com/looplj/axonhub/llm/transformer"
+	axonGemini "github.com/looplj/axonhub/llm/transformer/gemini"
 	"github.com/samber/lo"
 )
 
@@ -29,6 +33,84 @@ type MessagesOutbound struct {
 	// thinking block. See G-C4.
 	streamReasoningIndex map[int]int
 	streamToolCallIndex  int
+
+	// inner is the AxonHub Gemini outbound converter used for request, response
+	// and stream parsing. Provider-only generation fields are overlaid locally.
+	inner                transformer.Outbound
+	axonAPIVersion       string
+	streams              *model.AxonStreamBridge
+	streamMessageStarted map[int]bool
+}
+
+// ensureAxon lazily initializes the AxonHub Gemini converter with the actual
+// channel endpoint and key.
+func (o *MessagesOutbound) ensureAxon(baseURL, key string) (transformer.Outbound, error) {
+	return o.ensureAxonWithVersion(baseURL, key, "")
+}
+
+func (o *MessagesOutbound) ensureAxonWithVersion(baseURL, key, requestVersion string) (transformer.Outbound, error) {
+	if o.inner != nil && (requestVersion == "" || o.axonAPIVersion == requestVersion) {
+		return o.inner, nil
+	}
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = "https://generativelanguage.googleapis.com"
+	}
+	baseURL, apiVersion := normalizeGeminiAxonBaseURL(baseURL)
+	if requestVersion != "" {
+		apiVersion = requestVersion
+	}
+	inner, err := axonGemini.NewOutboundTransformerWithConfig(axonGemini.Config{
+		BaseURL:        baseURL,
+		APIVersion:     apiVersion,
+		APIKeyProvider: auth.NewStaticKeyProvider(key),
+	})
+	if err != nil {
+		return nil, err
+	}
+	o.inner = inner
+	o.axonAPIVersion = apiVersion
+	return inner, nil
+}
+
+// normalizeGeminiAxonBaseURL works around older AxonHub config normalisation
+// which only recognised /v1 and /v1beta suffixes. Keep every explicit Gemini
+// version (including /v1alpha) while passing AxonHub a version-free base URL,
+// so it cannot duplicate the path or silently downgrade the version.
+func normalizeGeminiAxonBaseURL(raw string) (string, string) {
+	trimmed := strings.TrimSuffix(strings.TrimSpace(raw), "/")
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return raw, ""
+	}
+	path := strings.Trim(parsed.Path, "/")
+	if path == "" {
+		return trimmed, ""
+	}
+	segments := strings.Split(path, "/")
+	if !isGeminiVersionSegment(segments[0]) {
+		return trimmed, ""
+	}
+	version := segments[0]
+	if len(segments) == 1 {
+		parsed.Path = ""
+	} else {
+		parsed.Path = "/" + strings.Join(segments[1:], "/")
+	}
+	parsed.RawPath = ""
+	return strings.TrimSuffix(parsed.String(), "/"), version
+}
+
+func isGeminiVersionSegment(segment string) bool {
+	return len(segment) >= 2 && segment[0] == 'v' && segment[1] >= '0' && segment[1] <= '9'
+}
+
+func firstGeminiVersionSegment(path string) string {
+	for _, segment := range strings.Split(strings.Trim(path, "/"), "/") {
+		if isGeminiVersionSegment(segment) {
+			return segment
+		}
+	}
+	return ""
 }
 
 func (o *MessagesOutbound) nextReasoningIndex(candidateIndex int) int {
@@ -54,167 +136,101 @@ func (o *MessagesOutbound) TransformRequest(ctx context.Context, request *model.
 	request.NormalizeMessages()
 	request.EnforceMessageAlternation(model.AlternationProviderGemini)
 
-	// Convert internal request to Gemini format
-	geminiReq := convertLLMToGeminiRequest(request)
-
-	body, err := json.Marshal(geminiReq)
+	_, requestVersion := normalizeGeminiAxonBaseURL(baseUrl)
+	if requestVersion == "" {
+		requestVersion = firstGeminiVersionSegment(request.RawPath)
+	}
+	inner, err := o.ensureAxonWithVersion(baseUrl, key, requestVersion)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal gemini request: %w", err)
+		return nil, err
 	}
-
-	// Build URL
-	parsedUrl, err := url.Parse(strings.TrimSuffix(baseUrl, "/"))
+	req, axonRequest, err := model.BuildAxonHTTPRequest(ctx, inner, request)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse base url: %w", err)
+		return nil, fmt.Errorf("failed to transform Gemini request with AxonHub: %w", err)
 	}
 
-	// G-H5: When the channel BaseURL omits the API version segment
-	// (`https://generativelanguage.googleapis.com`), the downstream request
-	// would land on `/models/...` which 404s. Fall back to `/v1beta` when
-	// no version prefix is configured; leave explicit `/v1` or `/v1beta`
-	// paths alone.
-	if !pathHasGeminiVersion(parsedUrl.Path) {
-		parsedUrl.Path = strings.TrimRight(parsedUrl.Path, "/") + "/v1beta"
-	}
-
-	// Determine if streaming
-	isStream := request.Stream != nil && *request.Stream
-	method := "generateContent"
-	if isStream {
-		method = "streamGenerateContent"
-	}
-
-	// Build path: /models/{model}:{method}
-	modelName := request.Model
-	if !strings.Contains(modelName, "/") {
-		modelName = "models/" + modelName
-	}
-	parsedUrl.Path = fmt.Sprintf("%s/%s:%s", parsedUrl.Path, modelName, method)
-
-	// G-H6: Carry the API key in `x-goog-api-key` — the query-string form
-	// still works but leaks the secret into proxy access logs and is
-	// discouraged by Google's current docs.
-	if isStream {
-		q := parsedUrl.Query()
-		q.Set("alt", "sse")
-		parsedUrl.RawQuery = q.Encode()
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, parsedUrl.String(), bytes.NewReader(body))
+	// AxonHub owns the message/tool conversion. Gemini's rapidly evolving
+	// generation extensions (topK, candidateCount, media resolution, speech
+	// config, safety settings and cached content) are merged from the local
+	// provider model so they are not silently discarded.
+	overlay, err := json.Marshal(convertLLMToGeminiRequest(request))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to marshal Gemini extensions: %w", err)
 	}
-
+	axonRequest.Body, err = model.MergeJSONFields(axonRequest.Body, overlay, "cachedContent", "safetySettings")
+	if err != nil {
+		return nil, err
+	}
+	axonRequest.Body, err = model.MergeJSONObjects(axonRequest.Body, overlay, "generationConfig")
+	if err != nil {
+		return nil, err
+	}
+	if hasGeminiFilesAPIOverride(request) {
+		axonRequest.Body, err = model.MergeJSONFields(axonRequest.Body, overlay, "contents")
+		if err != nil {
+			return nil, err
+		}
+	} else if hasGeminiReasoningBlocks(request) {
+		// AxonHub's shared Gemini model currently exposes one scalar
+		// ReasoningContent field.  A Gemini 3 turn can contain several thought
+		// parts, however, and flattening them changes the order/signature
+		// relationship required by the provider.  Keep AxonHub's canonical
+		// conversion for ordinary turns and replace only the parts of matching
+		// assistant contents with the local provider projection when provenance
+		// blocks are present.
+		axonRequest.Body, err = mergeGeminiReasoningContents(axonRequest.Body, overlay)
+		if err != nil {
+			return nil, err
+		}
+	}
+	axonRequest.JSONBody = append([]byte(nil), axonRequest.Body...)
+	req, err = bridge.BuildHTTPRequest(ctx, axonRequest)
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	if key != "" {
-		req.Header.Set("x-goog-api-key", key)
+	if request.Stream != nil && *request.Stream {
+		q := req.URL.Query()
+		q.Set("alt", "sse")
+		req.URL.RawQuery = q.Encode()
+		if o.streams == nil {
+			o.streams = model.NewAxonStreamBridge(inner)
+		}
+		o.streams.SetRequest(axonRequest)
 	}
-
 	return req, nil
 }
 
 func (o *MessagesOutbound) TransformResponse(ctx context.Context, response *http.Response) (*model.InternalLLMResponse, error) {
+	if response == nil || response.Body == nil {
+		return nil, fmt.Errorf("response body is nil")
+	}
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, fmt.Errorf("failed to read Gemini response body: %w", err)
 	}
-
-	if len(body) == 0 {
-		return nil, fmt.Errorf("response body is empty")
+	// model.TransformResponse owns the shared AxonHub conversion and expects to
+	// read the body itself. Restore the bytes so the local Gemini projection can
+	// be merged without issuing a second request or losing provider metadata.
+	response.Body = io.NopCloser(bytes.NewReader(body))
+	inner, err := o.ensureAxon("", "")
+	if err != nil {
+		return nil, err
 	}
-
-	var geminiResp model.GeminiGenerateContentResponse
-	if err := json.Unmarshal(body, &geminiResp); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal gemini response: %w", err)
+	axonResponse, err := model.TransformResponse(ctx, inner, response)
+	if err != nil {
+		return nil, err
 	}
-
-	// Convert Gemini response to internal format
-	return convertGeminiToLLMResponse(&geminiResp, false, nil), nil
-}
-
-func (o *MessagesOutbound) TransformStreamEvent(ctx context.Context, eventData []byte) ([]model.StreamEvent, error) {
-	if bytes.HasPrefix(eventData, []byte("[DONE]")) || len(eventData) == 0 {
-		return []model.StreamEvent{{Kind: model.StreamEventKindDone}}, nil
+	var geminiResponse model.GeminiGenerateContentResponse
+	if err := json.Unmarshal(body, &geminiResponse); err != nil {
+		// AxonHub already accepted the payload. A future Gemini field that this
+		// local compatibility model does not know yet must not turn a valid
+		// response into a 500; only the local metadata projection is skipped.
+		return axonResponse, nil
 	}
-
-	var geminiResp model.GeminiGenerateContentResponse
-	if err := json.Unmarshal(eventData, &geminiResp); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal gemini stream chunk: %w", err)
-	}
-
-	events := make([]model.StreamEvent, 0, len(geminiResp.Candidates)*4+1)
-	for _, candidate := range geminiResp.Candidates {
-		if candidate == nil {
-			continue
-		}
-		base := model.StreamEvent{ID: geminiResp.ResponseId, Model: geminiResp.ModelVersion, Index: candidate.Index}
-		if candidate.Content != nil {
-			role := candidate.Content.Role
-			if role == "model" || role == "" {
-				role = "assistant"
-			}
-			events = append(events, model.StreamEvent{Kind: model.StreamEventKindMessageStart, ID: base.ID, Model: base.Model, Index: base.Index, Role: role})
-			for _, part := range candidate.Content.Parts {
-				if part == nil {
-					continue
-				}
-				if part.Thought {
-					if part.Text != "" || part.ThoughtSignature != "" {
-						o.nextReasoningIndex(candidate.Index)
-						events = append(events, model.StreamEvent{Kind: model.StreamEventKindThinkingDelta, ID: base.ID, Model: base.Model, Index: base.Index, Delta: &model.StreamDelta{Thinking: part.Text, Signature: part.ThoughtSignature, ProviderExtensions: geminiThoughtSignatureProviderExtension(part.ThoughtSignature)}})
-					}
-					continue
-				}
-				if part.Text != "" {
-					events = append(events, model.StreamEvent{Kind: model.StreamEventKindTextDelta, ID: base.ID, Model: base.Model, Index: base.Index, Delta: &model.StreamDelta{Text: part.Text}})
-					if part.ThoughtSignature != "" {
-						o.nextReasoningIndex(candidate.Index)
-						events = append(events, model.StreamEvent{Kind: model.StreamEventKindSignatureDelta, ID: base.ID, Model: base.Model, Index: base.Index, Delta: &model.StreamDelta{Signature: part.ThoughtSignature, ProviderExtensions: geminiThoughtSignatureProviderExtension(part.ThoughtSignature)}})
-					}
-				}
-				if part.FunctionCall != nil {
-					toolIndex := o.nextToolCallIndex()
-					argsJSON, _ := json.Marshal(part.FunctionCall.Args)
-					toolCall := model.ToolCall{
-						Index: toolIndex,
-						ID:    geminiFunctionCallID(part.FunctionCall, toolIndex),
-						Type:  "function",
-						Function: model.FunctionCall{
-							Name: part.FunctionCall.Name,
-						},
-						ThoughtSignature:   part.ThoughtSignature,
-						ProviderExtensions: geminiThoughtSignatureProviderExtension(part.ThoughtSignature),
-					}
-					if part.ThoughtSignature != "" {
-						o.nextReasoningIndex(candidate.Index)
-						events = append(events, model.StreamEvent{Kind: model.StreamEventKindSignatureDelta, ID: base.ID, Model: base.Model, Index: base.Index, Delta: &model.StreamDelta{Signature: part.ThoughtSignature, ProviderExtensions: geminiThoughtSignatureProviderExtension(part.ThoughtSignature)}})
-					}
-					events = append(events, model.StreamEvent{Kind: model.StreamEventKindToolCallStart, ID: base.ID, Model: base.Model, Index: toolCall.Index, ToolCall: &toolCall})
-					toolDelta := toolCall
-					toolDelta.Function.Arguments = string(argsJSON)
-					events = append(events, model.StreamEvent{Kind: model.StreamEventKindToolCallDelta, ID: base.ID, Model: base.Model, Index: toolDelta.Index, ToolCall: &toolDelta, Delta: &model.StreamDelta{Arguments: string(argsJSON), ProviderExtensions: geminiThoughtSignatureProviderExtension(part.ThoughtSignature)}})
-					events = append(events, model.StreamEvent{Kind: model.StreamEventKindToolCallStop, ID: base.ID, Model: base.Model, Index: toolCall.Index, ToolCall: &toolCall})
-				}
-			}
-		}
-		if candidate.FinishReason != nil {
-			reason := convertGeminiFinishReason(*candidate.FinishReason)
-			events = append(events, model.StreamEvent{Kind: model.StreamEventKindMessageStop, ID: base.ID, Model: base.Model, Index: base.Index, StopReason: model.ParseFinishReason(reason)})
-		}
-	}
-	if usage := convertGeminiUsageMetadata(geminiResp.UsageMetadata); usage != nil {
-		events = append(events, model.StreamEvent{Kind: model.StreamEventKindUsageDelta, ID: geminiResp.ResponseId, Model: geminiResp.ModelVersion, Usage: usage})
-	}
-	if len(geminiResp.Candidates) == 0 && geminiResp.PromptFeedback != nil && geminiResp.PromptFeedback.BlockReason != "" {
-		reason := model.FinishReasonFromGemini(geminiResp.PromptFeedback.BlockReason)
-		if reason == "" {
-			reason = model.FinishReasonContentFilter
-		}
-		events = append(events, model.StreamEvent{Kind: model.StreamEventKindMessageStart, ID: geminiResp.ResponseId, Model: geminiResp.ModelVersion, Role: "assistant"})
-		events = append(events, model.StreamEvent{Kind: model.StreamEventKindMessageStop, ID: geminiResp.ResponseId, Model: geminiResp.ModelVersion, StopReason: reason})
-	}
-	return events, nil
+	mergeGeminiResponseMetadata(axonResponse, convertGeminiToLLMResponse(&geminiResponse, false, nil))
+	return axonResponse, nil
 }
 
 func geminiThoughtSignatureProviderExtension(signature string) *model.ProviderExtensions {
@@ -261,7 +277,85 @@ func anthropicSafeFallbackToolCallID(functionName string, index int) string {
 	return strings.TrimRight(id[:prefixLen], "_-") + "_" + suffix
 }
 
-func (o *MessagesOutbound) TransformStream(ctx context.Context, eventData []byte) (*model.InternalLLMResponse, error) {
+func (o *MessagesOutbound) transformStreamEventLocal(ctx context.Context, eventData []byte) ([]model.StreamEvent, error) {
+	if len(eventData) == 0 {
+		return []model.StreamEvent{{Kind: model.StreamEventKindDone}}, nil
+	}
+	if bytes.HasPrefix(eventData, []byte("[DONE]")) {
+		return []model.StreamEvent{{Kind: model.StreamEventKindDone}}, nil
+	}
+	var geminiResp model.GeminiGenerateContentResponse
+	if err := json.Unmarshal(eventData, &geminiResp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal gemini stream chunk: %w", err)
+	}
+
+	events := make([]model.StreamEvent, 0, len(geminiResp.Candidates)*4+1)
+	for _, candidate := range geminiResp.Candidates {
+		if candidate == nil {
+			continue
+		}
+		base := model.StreamEvent{ID: geminiResp.ResponseId, Model: geminiResp.ModelVersion, Index: candidate.Index}
+		if candidate.Content != nil {
+			role := candidate.Content.Role
+			if role == "model" || role == "" {
+				role = "assistant"
+			}
+			events = append(events, model.StreamEvent{Kind: model.StreamEventKindMessageStart, ID: base.ID, Model: base.Model, Index: base.Index, Role: role})
+			for _, part := range candidate.Content.Parts {
+				if part == nil {
+					continue
+				}
+				if part.Thought {
+					if part.Text != "" || part.ThoughtSignature != "" {
+						o.nextReasoningIndex(candidate.Index)
+						events = append(events, model.StreamEvent{Kind: model.StreamEventKindThinkingDelta, ID: base.ID, Model: base.Model, Index: base.Index, Delta: &model.StreamDelta{Thinking: part.Text, Signature: part.ThoughtSignature, ProviderExtensions: geminiThoughtSignatureProviderExtension(part.ThoughtSignature)}})
+					}
+					continue
+				}
+				if part.Text != "" {
+					events = append(events, model.StreamEvent{Kind: model.StreamEventKindTextDelta, ID: base.ID, Model: base.Model, Index: base.Index, Delta: &model.StreamDelta{Text: part.Text}})
+					if part.ThoughtSignature != "" {
+						o.nextReasoningIndex(candidate.Index)
+						events = append(events, model.StreamEvent{Kind: model.StreamEventKindSignatureDelta, ID: base.ID, Model: base.Model, Index: base.Index, Delta: &model.StreamDelta{Signature: part.ThoughtSignature, ProviderExtensions: geminiThoughtSignatureProviderExtension(part.ThoughtSignature)}})
+					}
+				}
+				if part.FunctionCall != nil {
+					toolIndex := o.nextToolCallIndex()
+					argsJSON, _ := json.Marshal(part.FunctionCall.Args)
+					toolCall := model.ToolCall{Index: toolIndex, ID: geminiFunctionCallID(part.FunctionCall, toolIndex), Type: "function", Function: model.FunctionCall{Name: part.FunctionCall.Name}, ThoughtSignature: part.ThoughtSignature, ProviderExtensions: geminiThoughtSignatureProviderExtension(part.ThoughtSignature)}
+					if part.ThoughtSignature != "" {
+						o.nextReasoningIndex(candidate.Index)
+						events = append(events, model.StreamEvent{Kind: model.StreamEventKindSignatureDelta, ID: base.ID, Model: base.Model, Index: base.Index, Delta: &model.StreamDelta{Signature: part.ThoughtSignature, ProviderExtensions: geminiThoughtSignatureProviderExtension(part.ThoughtSignature)}})
+					}
+					events = append(events, model.StreamEvent{Kind: model.StreamEventKindToolCallStart, ID: base.ID, Model: base.Model, Index: toolCall.Index, ToolCall: &toolCall})
+					toolDelta := toolCall
+					toolDelta.Function.Arguments = string(argsJSON)
+					events = append(events, model.StreamEvent{Kind: model.StreamEventKindToolCallDelta, ID: base.ID, Model: base.Model, Index: toolDelta.Index, ToolCall: &toolDelta, Delta: &model.StreamDelta{Arguments: string(argsJSON), ProviderExtensions: geminiThoughtSignatureProviderExtension(part.ThoughtSignature)}})
+					events = append(events, model.StreamEvent{Kind: model.StreamEventKindToolCallStop, ID: base.ID, Model: base.Model, Index: toolCall.Index, ToolCall: &toolCall})
+				}
+			}
+		}
+		if candidate.FinishReason != nil {
+			events = append(events, model.StreamEvent{Kind: model.StreamEventKindMessageStop, ID: base.ID, Model: base.Model, Index: base.Index, StopReason: model.ParseFinishReason(convertGeminiFinishReason(*candidate.FinishReason))})
+		}
+	}
+	if usage := convertGeminiUsageMetadata(geminiResp.UsageMetadata); usage != nil {
+		events = append(events, model.StreamEvent{Kind: model.StreamEventKindUsageDelta, ID: geminiResp.ResponseId, Model: geminiResp.ModelVersion, Usage: usage})
+	}
+	if len(geminiResp.Candidates) == 0 && geminiResp.PromptFeedback != nil && geminiResp.PromptFeedback.BlockReason != "" {
+		reason := model.FinishReasonFromGemini(geminiResp.PromptFeedback.BlockReason)
+		if reason.IsZero() {
+			reason = model.FinishReasonContentFilter
+		}
+		events = append(events,
+			model.StreamEvent{Kind: model.StreamEventKindMessageStart, ID: geminiResp.ResponseId, Model: geminiResp.ModelVersion, Role: "assistant"},
+			model.StreamEvent{Kind: model.StreamEventKindMessageStop, ID: geminiResp.ResponseId, Model: geminiResp.ModelVersion, StopReason: reason},
+		)
+	}
+	return events, nil
+}
+
+func (o *MessagesOutbound) transformStreamLocal(ctx context.Context, eventData []byte) (*model.InternalLLMResponse, error) {
 	// Handle [DONE] marker
 	if bytes.HasPrefix(eventData, []byte("[DONE]")) || len(eventData) == 0 {
 		return &model.InternalLLMResponse{
@@ -269,16 +363,175 @@ func (o *MessagesOutbound) TransformStream(ctx context.Context, eventData []byte
 		}, nil
 	}
 
-	// Parse Gemini streaming response
 	var geminiResp model.GeminiGenerateContentResponse
 	if err := json.Unmarshal(eventData, &geminiResp); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal gemini stream chunk: %w", err)
 	}
-
-	// Convert to internal format, handing in a per-candidate global index
-	// counter so ReasoningBlock.Index stays monotonically increasing across
-	// stream chunks (G-C4).
 	return convertGeminiToLLMResponse(&geminiResp, true, o.nextReasoningIndex), nil
+}
+
+// TransformStreamEvent uses AxonHub's Gemini stream state machine. In
+// particular this preserves response IDs and tool-call indexes across chunks,
+// which cannot be done by parsing each chunk independently.
+func (o *MessagesOutbound) TransformStreamEvent(ctx context.Context, eventData []byte) ([]model.StreamEvent, error) {
+	if len(eventData) == 0 || bytes.HasPrefix(bytes.TrimSpace(eventData), []byte("[DONE]")) {
+		return []model.StreamEvent{{Kind: model.StreamEventKindDone}}, nil
+	}
+	// Keep the explicit local event projection for Gemini. AxonHub's unified
+	// response intentionally collapses provider metadata (reasoning block
+	// indexes and tool-call start boundaries) that this interface promises to
+	// expose. TransformStream below remains AxonHub-backed for the response IR.
+	events, err := o.transformStreamEventLocal(ctx, eventData)
+	if err != nil {
+		return nil, err
+	}
+	if o.streamMessageStarted == nil {
+		o.streamMessageStarted = make(map[int]bool)
+	}
+	return model.SuppressRepeatedMessageStarts(events, o.streamMessageStarted), nil
+}
+
+func (o *MessagesOutbound) TransformStream(ctx context.Context, eventData []byte) (*model.InternalLLMResponse, error) {
+	inner, err := o.ensureAxon("", "")
+	if err != nil {
+		return nil, err
+	}
+	if o.streams == nil {
+		o.streams = model.NewAxonStreamBridge(inner)
+	}
+	axonResponse, axonErr := o.streams.Feed(ctx, eventData)
+	localResponse, localErr := o.transformStreamLocal(ctx, eventData)
+	if axonErr != nil && localErr != nil {
+		return nil, axonErr
+	}
+	if localErr != nil {
+		return axonResponse, nil
+	}
+	if axonErr != nil || axonResponse == nil {
+		return localResponse, nil
+	}
+	mergeGeminiResponseMetadata(axonResponse, localResponse)
+	return axonResponse, nil
+}
+
+// mergeGeminiResponseMetadata keeps AxonHub as the canonical response
+// conversion while restoring Gemini-specific details that the shared AxonHub
+// model cannot represent yet (reasoning block indexes and per-tool signatures).
+func mergeGeminiResponseMetadata(dst, local *model.InternalLLMResponse) {
+	if dst == nil || local == nil {
+		return
+	}
+	if dst.ID == "" {
+		dst.ID = local.ID
+	}
+	if dst.Model == "" {
+		dst.Model = local.Model
+	}
+	if dst.Created == 0 {
+		dst.Created = local.Created
+	}
+	for i := range local.Choices {
+		localChoice := &local.Choices[i]
+		var dstChoice *model.Choice
+		for j := range dst.Choices {
+			if dst.Choices[j].Index == localChoice.Index {
+				dstChoice = &dst.Choices[j]
+				break
+			}
+		}
+		if dstChoice == nil {
+			dst.Choices = append(dst.Choices, *localChoice)
+			continue
+		}
+		if dstChoice.Delta == nil && localChoice.Delta != nil {
+			dstChoice.Delta = localChoice.Delta
+		}
+		if dstChoice.Message == nil && localChoice.Message != nil {
+			dstChoice.Message = localChoice.Message
+		}
+		mergeGeminiMessageMetadata(dstChoice.Delta, localChoice.Delta)
+		mergeGeminiMessageMetadata(dstChoice.Message, localChoice.Message)
+		if dstChoice.FinishReason == nil {
+			dstChoice.FinishReason = localChoice.FinishReason
+		}
+		if localChoice.Grounding != nil {
+			dstChoice.Grounding = localChoice.Grounding
+		}
+		if len(localChoice.Citations) > 0 {
+			dstChoice.Citations = append([]model.Citation(nil), localChoice.Citations...)
+		}
+		if localChoice.URLContext != nil {
+			dstChoice.URLContext = localChoice.URLContext
+		}
+		if len(localChoice.SafetyRatings) > 0 {
+			dstChoice.SafetyRatings = append([]model.SafetyRating(nil), localChoice.SafetyRatings...)
+		}
+	}
+}
+
+func mergeGeminiMessageMetadata(dst, local *model.Message) {
+	if dst == nil || local == nil {
+		return
+	}
+	if len(local.ReasoningBlocks) > 0 {
+		dst.ReasoningBlocks = append([]model.ReasoningBlock(nil), local.ReasoningBlocks...)
+	}
+	if dst.ReasoningContent == nil && local.ReasoningContent != nil {
+		value := *local.ReasoningContent
+		dst.ReasoningContent = &value
+	}
+	if dst.ReasoningSignature == nil && local.ReasoningSignature != nil {
+		value := *local.ReasoningSignature
+		dst.ReasoningSignature = &value
+	}
+	if len(local.ReasoningItems) > 0 {
+		dst.ReasoningItems = append([]model.ReasoningItem(nil), local.ReasoningItems...)
+	}
+	if len(local.RedactedThinkingBlocks) > 0 {
+		dst.RedactedThinkingBlocks = append([]string(nil), local.RedactedThinkingBlocks...)
+	}
+	if len(local.Annotations) > 0 {
+		dst.Annotations = append([]model.Annotation(nil), local.Annotations...)
+	}
+	for i := range local.ToolCalls {
+		localTool := &local.ToolCalls[i]
+		dstTool := findGeminiToolCall(dst.ToolCalls, localTool, i)
+		if dstTool == nil {
+			continue
+		}
+		if dstTool.ThoughtSignature == "" {
+			dstTool.ThoughtSignature = localTool.ThoughtSignature
+		}
+		if localTool.ProviderExtensions != nil {
+			if dstTool.ProviderExtensions == nil {
+				dstTool.ProviderExtensions = model.CloneProviderExtensions(localTool.ProviderExtensions)
+			} else if dstTool.ProviderExtensions.Gemini == nil && localTool.ProviderExtensions.Gemini != nil {
+				dstTool.ProviderExtensions.Gemini = model.CloneProviderExtensions(localTool.ProviderExtensions).Gemini
+			}
+		}
+	}
+}
+
+func findGeminiToolCall(calls []model.ToolCall, target *model.ToolCall, fallbackIndex int) *model.ToolCall {
+	if target == nil {
+		return nil
+	}
+	if target.ID != "" {
+		for i := range calls {
+			if calls[i].ID == target.ID {
+				return &calls[i]
+			}
+		}
+	}
+	for i := range calls {
+		if calls[i].Index == target.Index && calls[i].Function.Name == target.Function.Name {
+			return &calls[i]
+		}
+	}
+	if fallbackIndex >= 0 && fallbackIndex < len(calls) {
+		return &calls[fallbackIndex]
+	}
+	return nil
 }
 
 // Helper functions
@@ -436,6 +689,118 @@ func lookupGeminiFilesAPIURI(req *model.InternalLLMRequest, mediaType string) st
 	return req.TransformerMetadataValue(model.TransformerMetadataGeminiFilesAPIURI)
 }
 
+// hasGeminiFilesAPIOverride reports whether the local Gemini projection must
+// replace AxonHub's generated contents.  AxonHub already handles ordinary
+// inline data and FileData references; the local projection is needed only
+// when an oversized Anthropic document has an explicit Files API URI.  Keep
+// this narrow so a normal request does not lose AxonHub's message ordering or
+// provider-specific content conversion.
+func hasGeminiFilesAPIOverride(req *model.InternalLLMRequest) bool {
+	if req == nil {
+		return false
+	}
+	for _, msg := range req.Messages {
+		for _, part := range msg.Content.MultipleContent {
+			doc := part.Document
+			if doc == nil || doc.Type != "base64" || doc.Data == "" {
+				continue
+			}
+			mime := doc.MediaType
+			if mime == "" {
+				mime = "application/pdf"
+			}
+			decoded := (len(doc.Data) * 3) / 4
+			if decoded > geminiInlineDataMaxBytes && lookupGeminiFilesAPIURI(req, mime) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasGeminiReasoningBlocks(req *model.InternalLLMRequest) bool {
+	if req == nil {
+		return false
+	}
+	for i := range req.Messages {
+		for _, block := range req.Messages[i].ReasoningBlocksByProvider("gemini") {
+			if block.Text != "" || block.Signature != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// mergeGeminiReasoningContents replaces only the parts of matching model
+// turns. This retains AxonHub's handling for user/tool multimodal content and
+// any future request fields while allowing the local Gemini projection to
+// carry more than one thought/signature block.
+func mergeGeminiReasoningContents(base, overlay []byte) ([]byte, error) {
+	if len(base) == 0 || len(overlay) == 0 {
+		return append([]byte(nil), base...), nil
+	}
+	var baseObject map[string]json.RawMessage
+	if err := json.Unmarshal(base, &baseObject); err != nil {
+		return nil, fmt.Errorf("decode base Gemini request JSON: %w", err)
+	}
+	var overlayObject map[string]json.RawMessage
+	if err := json.Unmarshal(overlay, &overlayObject); err != nil {
+		return nil, fmt.Errorf("decode local Gemini request JSON: %w", err)
+	}
+	var baseContents []json.RawMessage
+	if raw := baseObject["contents"]; len(raw) == 0 || json.Unmarshal(raw, &baseContents) != nil {
+		return append([]byte(nil), base...), nil
+	}
+	var localContents []json.RawMessage
+	if raw := overlayObject["contents"]; len(raw) == 0 || json.Unmarshal(raw, &localContents) != nil {
+		return append([]byte(nil), base...), nil
+	}
+
+	localModelContents := make([]map[string]json.RawMessage, 0)
+	for _, raw := range localContents {
+		var content map[string]json.RawMessage
+		if json.Unmarshal(raw, &content) != nil || string(content["role"]) != `"model"` {
+			continue
+		}
+		localModelContents = append(localModelContents, content)
+	}
+	if len(localModelContents) == 0 {
+		return append([]byte(nil), base...), nil
+	}
+
+	localIndex := 0
+	for i, raw := range baseContents {
+		if localIndex >= len(localModelContents) {
+			break
+		}
+		var content map[string]json.RawMessage
+		if json.Unmarshal(raw, &content) != nil || string(content["role"]) != `"model"` {
+			continue
+		}
+		parts, ok := localModelContents[localIndex]["parts"]
+		if !ok {
+			continue
+		}
+		content["parts"] = append(json.RawMessage(nil), parts...)
+		encoded, err := json.Marshal(content)
+		if err != nil {
+			return nil, fmt.Errorf("encode merged Gemini model content: %w", err)
+		}
+		baseContents[i] = encoded
+		localIndex++
+	}
+	if localIndex == 0 {
+		return append([]byte(nil), base...), nil
+	}
+	encodedContents, err := json.Marshal(baseContents)
+	if err != nil {
+		return nil, fmt.Errorf("encode merged Gemini contents: %w", err)
+	}
+	baseObject["contents"] = encodedContents
+	return json.Marshal(baseObject)
+}
+
 // buildDocumentTextHint joins title / context / body into a single
 // whitespace-separated block. Used as a fallback when Gemini (or any other
 // non-Anthropic provider) cannot embed a native document.
@@ -565,6 +930,22 @@ func buildGeminiThoughtParts(blocks []model.ReasoningBlock) []*model.GeminiPart 
 		parts = append(parts, part)
 	}
 	return parts
+}
+
+func attachGeminiLooseSignatures(content *model.GeminiContent, signatures []string, cursor *int) {
+	if content == nil || cursor == nil || *cursor >= len(signatures) || len(content.Parts) == 0 {
+		return
+	}
+	// A standalone Gemini signature belongs to the last part of the model
+	// turn when there is no function-call anchor. This mirrors AxonHub's
+	// fallback behavior and keeps a signature-only shim from disappearing on
+	// the next request.
+	content.Parts[len(content.Parts)-1].ThoughtSignature = signatures[*cursor]
+	*cursor++
+	for *cursor < len(signatures) {
+		content.Parts = append(content.Parts, &model.GeminiPart{ThoughtSignature: signatures[*cursor]})
+		*cursor++
+	}
 }
 
 // nextGeminiSignature pops the next signature string, advancing the caller-managed cursor.
@@ -769,6 +1150,7 @@ func convertLLMToGeminiRequest(request *model.InternalLLMRequest) *model.GeminiG
 					content.Parts = append(content.Parts, part)
 				}
 			}
+			attachGeminiLooseSignatures(content, geminiSigs, &sigIdx)
 			geminiReq.Contents = append(geminiReq.Contents, content)
 
 			if len(geminiBlocks) > 0 || sigIdx > 0 {

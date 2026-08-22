@@ -5,12 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/bestruirui/octopus/internal/transformer/model"
-	"github.com/bestruirui/octopus/internal/transformer/outbound/openai"
+	openaiOutbound "github.com/bestruirui/octopus/internal/transformer/outbound/openai"
 )
 
 var supportedReasoningEffortModel = map[string]bool{
@@ -19,74 +19,74 @@ var supportedReasoningEffortModel = map[string]bool{
 	"doubao-seed-1-6-251015":      true,
 }
 
+// ResponseOutbound reuses the OpenAI Responses transformer and applies the
+// Volcengine-only thinking and partial input fields after common conversion.
 type ResponseOutbound struct {
-	inner openai.ResponseOutbound
+	inner openaiOutbound.ResponseOutbound
 }
 
-func (o *ResponseOutbound) TransformRequest(ctx context.Context, request *model.InternalLLMRequest, baseUrl, key string) (*http.Request, error) {
+func (o *ResponseOutbound) TransformRequest(ctx context.Context, request *model.InternalLLMRequest, baseURL, key string) (*http.Request, error) {
 	if request == nil {
 		return nil, fmt.Errorf("request is nil")
 	}
 
 	request.NormalizeMessages()
-
-	// Convert to Responses API request format
-	openaiReq := openai.ConvertToResponsesRequest(request)
-	openaiReq.Metadata = nil // volcengine not supported
-	if _, ok := supportedReasoningEffortModel[request.Model]; !ok {
-		openaiReq.Reasoning = nil
-	}
-	responsesReq := ResponsesRequest{
-		ResponsesRequest: openaiReq,
-		Input:            convertToResponsesInput(openaiReq.Input),
-	}
-	switch request.ReasoningEffort {
-	case "minimal":
-		responsesReq.Thinking.Type = ThinkingTypeDisabled
-	case "low", "medium", "high":
-		responsesReq.Thinking.Type = ThinkingTypeEnabled
-	default:
-	}
-
-	body, err := json.Marshal(responsesReq)
+	commonReq, err := o.inner.TransformRequest(ctx, request, baseURL, key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal responses api request: %w", err)
+		return nil, err
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "", bytes.NewReader(body))
+	body, err := io.ReadAll(commonReq.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to read Responses request: %w", err)
 	}
 
-	// Set headers
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+key)
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("failed to decode Responses request: %w", err)
+	}
+	delete(payload, "metadata")
+	if !supportedReasoningEffortModel[request.Model] {
+		delete(payload, "reasoning")
+	}
 
-	// Parse and set URL
-	parsedUrl, err := url.Parse(strings.TrimSuffix(baseUrl, "/"))
+	if thinking := thinkingFor(request.ReasoningEffort); thinking.Type != "" {
+		encoded, marshalErr := json.Marshal(thinking)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		payload["thinking"] = encoded
+	}
+
+	if input, ok := payload["input"]; ok {
+		var commonInput openaiOutbound.ResponsesInput
+		if err := json.Unmarshal(input, &commonInput); err == nil {
+			converted := convertToResponsesInput(commonInput)
+			encoded, marshalErr := json.Marshal(converted)
+			if marshalErr != nil {
+				return nil, marshalErr
+			}
+			payload["input"] = encoded
+		}
+	}
+
+	encoded, err := json.Marshal(payload)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse base url: %w", err)
+		return nil, fmt.Errorf("failed to marshal Volcengine Responses request: %w", err)
 	}
-	parsedUrl.Path = parsedUrl.Path + "/responses"
-	req.URL = parsedUrl
-	req.Method = http.MethodPost
-
-	return req, nil
-
+	commonReq.Body = io.NopCloser(bytes.NewReader(encoded))
+	commonReq.ContentLength = int64(len(encoded))
+	commonReq.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(encoded)), nil
+	}
+	return commonReq, nil
 }
+
 func (o *ResponseOutbound) TransformResponse(ctx context.Context, response *http.Response) (*model.InternalLLMResponse, error) {
 	return o.inner.TransformResponse(ctx, response)
 }
 
 func (o *ResponseOutbound) TransformStream(ctx context.Context, eventData []byte) (*model.InternalLLMResponse, error) {
 	return o.inner.TransformStream(ctx, eventData)
-}
-
-type ResponsesRequest struct {
-	*openai.ResponsesRequest
-	Input    ResponsesInput `json:"input"`
-	Thinking Thinking       `json:"thinking,omitzero"`
 }
 
 type ThinkingType string
@@ -99,6 +99,17 @@ const (
 
 type Thinking struct {
 	Type ThinkingType `json:"type"`
+}
+
+func thinkingFor(effort string) Thinking {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "minimal", "none":
+		return Thinking{Type: ThinkingTypeDisabled}
+	case "low", "medium", "high":
+		return Thinking{Type: ThinkingTypeEnabled}
+	default:
+		return Thinking{}
+	}
 }
 
 type ResponsesInput struct {
@@ -128,24 +139,23 @@ func (i *ResponsesInput) UnmarshalJSON(data []byte) error {
 }
 
 type ResponsesItem struct {
-	openai.ResponsesItem
+	openaiOutbound.ResponsesItem
 	Partial bool `json:"partial,omitempty"`
 }
 
-func convertToResponsesInput(input openai.ResponsesInput) ResponsesInput {
-	result := ResponsesInput{}
+func convertToResponsesInput(input openaiOutbound.ResponsesInput) ResponsesInput {
+	result := ResponsesInput{Text: input.Text}
 	if input.Text != nil {
-		result.Text = input.Text
 		return result
 	}
-
 	for _, item := range input.Items {
 		result.Items = append(result.Items, ResponsesItem{ResponsesItem: item})
 	}
-	// If the role of the last message is the assistant, needs set partial.
-	idx := len(input.Items) - 1
-	if result.Items[idx].Role == "assistant" {
-		result.Items[idx].Partial = true
+	if len(result.Items) > 0 {
+		last := len(result.Items) - 1
+		if result.Items[last].Role == "assistant" {
+			result.Items[last].Partial = true
+		}
 	}
 	return result
 }

@@ -80,6 +80,58 @@ func TestConvertGeminiRequestBindsToolCallThoughtSignature(t *testing.T) {
 	}
 }
 
+func TestTransformRequestPreservesMultiBlockReasoningAlongsideAxonMultimodalContent(t *testing.T) {
+	outbound := &MessagesOutbound{}
+	request := &model.InternalLLMRequest{
+		Model: "gemini-3.1-pro",
+		Messages: []model.Message{
+			{
+				Role: "user",
+				Content: model.MessageContent{MultipleContent: []model.MessageContentPart{
+					{Type: "text", Text: stringPtr("inspect this")},
+					{Type: "image_url", ImageURL: &model.ImageURL{URL: "data:image/png;base64,AAAA"}},
+				}},
+			},
+			{
+				Role: "assistant",
+				ReasoningBlocks: []model.ReasoningBlock{
+					{Kind: model.ReasoningBlockKindThinking, Text: "plan", Signature: "sig-plan", Provider: "gemini"},
+					{Kind: model.ReasoningBlockKindThinking, Text: "refine", Signature: "sig-refine", Provider: "gemini"},
+				},
+				Content: model.MessageContent{Content: stringPtr("answer")},
+			},
+		},
+	}
+
+	req, err := outbound.TransformRequest(context.Background(), request, "https://generativelanguage.googleapis.com/v1beta", "secret")
+	if err != nil {
+		t.Fatalf("TransformRequest: %v", err)
+	}
+	var body model.GeminiGenerateContentRequest
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		t.Fatalf("decode transformed request: %v", err)
+	}
+	if len(body.Contents) != 2 {
+		t.Fatalf("expected two Gemini contents, got %#v", body.Contents)
+	}
+	if len(body.Contents[0].Parts) != 2 || body.Contents[0].Parts[1].InlineData == nil {
+		t.Fatalf("AxonHub multimodal user content was not retained: %#v", body.Contents[0])
+	}
+	parts := body.Contents[1].Parts
+	if len(parts) != 3 {
+		t.Fatalf("expected two thought parts plus visible text, got %#v", parts)
+	}
+	if !parts[0].Thought || parts[0].Text != "plan" || parts[0].ThoughtSignature != "sig-plan" {
+		t.Fatalf("first reasoning part = %#v", parts[0])
+	}
+	if !parts[1].Thought || parts[1].Text != "refine" || parts[1].ThoughtSignature != "sig-refine" {
+		t.Fatalf("second reasoning part = %#v", parts[1])
+	}
+	if parts[2].Text != "answer" || parts[2].Thought {
+		t.Fatalf("visible part = %#v", parts[2])
+	}
+}
+
 func TestConvertGeminiRequestDowngradesUnsignedHistoricalToolUse(t *testing.T) {
 	req := &model.InternalLLMRequest{
 		Model: "gemini-3.1-pro",

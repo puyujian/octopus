@@ -82,7 +82,7 @@ func (i *ResponseInbound) TransformRequest(ctx context.Context, body []byte) (*m
 
 	i.truncation = req.Truncation
 
-	return convertToInternalRequest(&req)
+	return convertToInternalRequest(&req, body)
 }
 
 func (i *ResponseInbound) TransformResponse(ctx context.Context, response *model.InternalLLMResponse) ([]byte, error) {
@@ -95,6 +95,14 @@ func (i *ResponseInbound) TransformResponse(ctx context.Context, response *model
 
 	// Convert to Responses API format
 	resp := convertToResponsesAPIResponse(response)
+	// AxonHub keeps the exact Responses output array when the upstream response
+	// was already in Responses format. Prefer that payload for the wire response
+	// so provider-specific output items (for example custom tools, annotations,
+	// or newer multimodal items) are not narrowed by the local compatibility
+	// structs below.
+	if len(response.RawResponsesOutputItems) > 0 && json.Valid(response.RawResponsesOutputItems) {
+		resp.RawOutput = cloneRaw(response.RawResponsesOutputItems)
+	}
 	if i.truncation != nil {
 		resp.Truncation = i.truncation
 	}
@@ -947,9 +955,11 @@ type ResponsesItem struct {
 	Annotations *[]ResponsesAnnotation `json:"annotations,omitempty"`
 
 	// Function call fields
-	CallID    string `json:"call_id,omitempty"`
-	Name      string `json:"name,omitempty"`
-	Arguments string `json:"arguments,omitempty"`
+	CallID    string  `json:"call_id,omitempty"`
+	Name      string  `json:"name,omitempty"`
+	Namespace string  `json:"namespace,omitempty"`
+	Arguments string  `json:"arguments,omitempty"`
+	Input     *string `json:"input,omitempty"`
 
 	// Function call output
 	Output        *ResponsesInput `json:"output,omitempty"`
@@ -965,6 +975,7 @@ type ResponsesItem struct {
 	// Reasoning fields
 	Summary          []ResponsesReasoningSummary `json:"summary,omitempty"`
 	EncryptedContent *string                     `json:"encrypted_content,omitempty"`
+	CreatedBy        *string                     `json:"created_by,omitempty"`
 
 	// Multimodal input fields. OpenAI Responses accepts an `input_file`
 	// item as either { file_id } for an uploaded file, { filename,
@@ -978,6 +989,11 @@ type ResponsesItem struct {
 	// InputAudio carries the `input_audio` nested object for audio inputs.
 	// O-H6.
 	InputAudio *ResponsesInputAudio `json:"input_audio,omitempty"`
+
+	// Audio carries Chat Completions-compatible generated audio metadata when
+	// the source protocol exposes it. Responses-compatible providers which do
+	// not use this field can safely ignore it.
+	Audio *ResponsesOutputAudio `json:"audio,omitempty"`
 }
 
 // ResponsesInputAudio mirrors OpenAI's `input_audio` content shape used for
@@ -987,12 +1003,19 @@ type ResponsesInputAudio struct {
 	Format string `json:"format,omitempty"`
 }
 
+type ResponsesOutputAudio struct {
+	ID         string `json:"id,omitempty"`
+	Data       string `json:"data,omitempty"`
+	ExpiresAt  int64  `json:"expires_at,omitempty"`
+	Transcript string `json:"transcript,omitempty"`
+}
+
 func (item ResponsesItem) isOutputMessageContent() bool {
 	if item.Content == nil || len(item.Content.Items) == 0 {
 		return false
 	}
 	for _, ci := range item.Content.Items {
-		if ci.Type == "output_text" {
+		if ci.Type == "output_text" || ci.Type == "refusal" {
 			return true
 		}
 	}
@@ -1010,16 +1033,20 @@ func (item ResponsesItem) GetContentItems() []ResponsesContentItem {
 			text = *ci.Text
 		}
 		result = append(result, ResponsesContentItem{
-			Type: ci.Type,
-			Text: text,
+			Type:        ci.Type,
+			Text:        text,
+			Refusal:     valueOrEmpty(ci.Refusal),
+			Annotations: cloneResponsesAnnotations(ci.Annotations),
 		})
 	}
 	return result
 }
 
 type ResponsesContentItem struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
+	Type        string                `json:"type"`
+	Text        string                `json:"text,omitempty"`
+	Refusal     string                `json:"refusal,omitempty"`
+	Annotations []ResponsesAnnotation `json:"annotations,omitempty"`
 }
 
 type ResponsesReasoningSummary struct {
@@ -1029,31 +1056,66 @@ type ResponsesReasoningSummary struct {
 
 type ResponsesAnnotation struct {
 	Type       string  `json:"type"`
-	StartIndex *int    `json:"start_index,omitempty"`
-	EndIndex   *int    `json:"end_index,omitempty"`
+	StartIndex *int64  `json:"start_index,omitempty"`
+	EndIndex   *int64  `json:"end_index,omitempty"`
 	URL        *string `json:"url,omitempty"`
 	Title      *string `json:"title,omitempty"`
 	FileID     *string `json:"file_id,omitempty"`
 	Filename   *string `json:"filename,omitempty"`
 }
 
+func cloneResponsesAnnotations(annotations *[]ResponsesAnnotation) []ResponsesAnnotation {
+	if annotations == nil {
+		return nil
+	}
+	return append([]ResponsesAnnotation(nil), (*annotations)...)
+}
+
 type ResponsesTool struct {
-	Type              string         `json:"type,omitempty"`
-	Name              string         `json:"name,omitempty"`
-	Description       string         `json:"description,omitempty"`
-	Parameters        map[string]any `json:"parameters,omitempty"`
-	Strict            *bool          `json:"strict,omitempty"`
-	Background        string         `json:"background,omitempty"`
-	OutputFormat      string         `json:"output_format,omitempty"`
-	Quality           string         `json:"quality,omitempty"`
-	Size              string         `json:"size,omitempty"`
-	OutputCompression *int64         `json:"output_compression,omitempty"`
+	Type              string                          `json:"type,omitempty"`
+	Name              string                          `json:"name,omitempty"`
+	Description       string                          `json:"description,omitempty"`
+	Parameters        map[string]any                  `json:"parameters,omitempty"`
+	Strict            *bool                           `json:"strict,omitempty"`
+	Tools             []ResponsesTool                 `json:"tools,omitempty"`
+	Format            *ResponsesCustomToolFormat      `json:"format,omitempty"`
+	Filters           *ResponsesWebSearchFilters      `json:"filters,omitempty"`
+	UserLocation      *ResponsesWebSearchUserLocation `json:"user_location,omitempty"`
+	Background        string                          `json:"background,omitempty"`
+	OutputFormat      string                          `json:"output_format,omitempty"`
+	Quality           string                          `json:"quality,omitempty"`
+	Size              string                          `json:"size,omitempty"`
+	OutputCompression *int64                          `json:"output_compression,omitempty"`
 }
 
 type ResponsesToolChoice struct {
-	Mode *string `json:"mode,omitempty"`
-	Type *string `json:"type,omitempty"`
-	Name *string `json:"name,omitempty"`
+	Mode  *string                     `json:"mode,omitempty"`
+	Type  *string                     `json:"type,omitempty"`
+	Name  *string                     `json:"name,omitempty"`
+	Tools []ResponsesToolChoiceOption `json:"tools,omitempty"`
+}
+
+type ResponsesToolChoiceOption struct {
+	Type string `json:"type"`
+	Name string `json:"name"`
+}
+
+type ResponsesWebSearchFilters struct {
+	AllowedDomains []string `json:"allowed_domains,omitempty"`
+}
+
+type ResponsesWebSearchUserLocation struct {
+	Type     string `json:"type,omitempty"`
+	City     string `json:"city,omitempty"`
+	Country  string `json:"country,omitempty"`
+	Region   string `json:"region,omitempty"`
+	Timezone string `json:"timezone,omitempty"`
+}
+
+type ResponsesCustomToolFormat struct {
+	Type       string `json:"type"`
+	Syntax     string `json:"syntax,omitempty"`
+	Definition string `json:"definition,omitempty"`
 }
 
 func (t *ResponsesToolChoice) UnmarshalJSON(data []byte) error {
@@ -1079,12 +1141,15 @@ type ResponsesTextOptions struct {
 }
 
 type ResponsesTextFormat struct {
-	Type   string          `json:"type,omitempty"`
-	Name   string          `json:"name,omitempty"`
-	Schema json.RawMessage `json:"schema,omitempty"`
+	Type        string          `json:"type,omitempty"`
+	Name        string          `json:"name,omitempty"`
+	Description string          `json:"description,omitempty"`
+	Strict      *bool           `json:"strict,omitempty"`
+	Schema      json.RawMessage `json:"schema,omitempty"`
 }
 
 type ResponsesReasoning struct {
+	Context         string  `json:"context,omitempty"`
 	Effort          string  `json:"effort,omitempty"`
 	MaxTokens       *int64  `json:"max_tokens,omitempty"`
 	Summary         *string `json:"summary,omitempty"`
@@ -1094,15 +1159,42 @@ type ResponsesReasoning struct {
 // Response types
 
 type ResponsesResponse struct {
-	Object     string          `json:"object"`
-	ID         string          `json:"id"`
-	Model      string          `json:"model"`
-	CreatedAt  int64           `json:"created_at"`
-	Output     []ResponsesItem `json:"output"`
-	Status     *string         `json:"status,omitempty"`
-	Truncation *string         `json:"truncation,omitempty"`
-	Usage      *ResponsesUsage `json:"usage,omitempty"`
-	Error      *ResponsesError `json:"error,omitempty"`
+	Object             string                      `json:"object"`
+	ID                 string                      `json:"id"`
+	Model              string                      `json:"model"`
+	CreatedAt          int64                       `json:"created_at"`
+	PreviousResponseID *string                     `json:"previous_response_id,omitempty"`
+	Output             []ResponsesItem             `json:"output"`
+	Status             *string                     `json:"status,omitempty"`
+	Truncation         *string                     `json:"truncation,omitempty"`
+	IncompleteDetails  *ResponsesIncompleteDetails `json:"incomplete_details,omitempty"`
+	Usage              *ResponsesUsage             `json:"usage,omitempty"`
+	Error              *ResponsesError             `json:"error,omitempty"`
+	RawOutput          json.RawMessage             `json:"-"`
+}
+
+// MarshalJSON lets the Responses inbound adapter replay an exact output array
+// captured by the AxonHub bridge. The normal typed Output remains the fallback
+// for responses produced by other protocols.
+func (r ResponsesResponse) MarshalJSON() ([]byte, error) {
+	type responseAlias ResponsesResponse
+	base, err := json.Marshal(responseAlias(r))
+	if err != nil {
+		return nil, err
+	}
+	if len(r.RawOutput) == 0 || !json.Valid(r.RawOutput) {
+		return base, nil
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(base, &object); err != nil {
+		return nil, err
+	}
+	object["output"] = cloneRaw(r.RawOutput)
+	return json.Marshal(object)
+}
+
+type ResponsesIncompleteDetails struct {
+	Reason string `json:"reason,omitempty"`
 }
 
 type ResponsesUsage struct {
@@ -1134,9 +1226,12 @@ type ResponsesStreamEvent struct {
 	Text           string                `json:"text,omitempty"`
 	Name           string                `json:"name,omitempty"`
 	CallID         string                `json:"call_id,omitempty"`
+	Namespace      string                `json:"namespace,omitempty"`
 	Arguments      string                `json:"arguments,omitempty"`
 	SummaryIndex   *int                  `json:"summary_index,omitempty"`
 	Part           *ResponsesContentPart `json:"part,omitempty"`
+	Code           string                `json:"code,omitempty"`
+	Message        string                `json:"message,omitempty"`
 }
 
 type ResponsesContentPart struct {
@@ -1147,7 +1242,7 @@ type ResponsesContentPart struct {
 
 // Conversion functions
 
-func convertToInternalRequest(req *ResponsesRequest) (*model.InternalLLMRequest, error) {
+func convertToInternalRequest(req *ResponsesRequest, rawBody ...[]byte) (*model.InternalLLMRequest, error) {
 	chatReq := &model.InternalLLMRequest{
 		Model:               req.Model,
 		Temperature:         req.Temperature,
@@ -1166,9 +1261,10 @@ func convertToInternalRequest(req *ResponsesRequest) (*model.InternalLLMRequest,
 		Include:             append([]string(nil), req.Include...),
 	}
 
+	rawRequestParts := parseRawResponsesRequestParts(req, rawBody...)
 	if req.Input.Text == nil && len(req.Input.Items) > 0 {
 		chatReq.TransformOptions.ArrayInputs = lo.ToPtr(true)
-		if rawItems, marshalErr := json.Marshal(req.Input.Items); marshalErr == nil {
+		if rawItems := marshalRawResponsesItems(rawRequestParts.InputItems); len(rawItems) > 0 {
 			chatReq.SetOpenAIRawInputItems(rawItems)
 		}
 	}
@@ -1179,6 +1275,9 @@ func convertToInternalRequest(req *ResponsesRequest) (*model.InternalLLMRequest,
 
 	// Convert reasoning
 	if req.Reasoning != nil {
+		// Reasoning.Context is provider-scoped Responses metadata. Keep it
+		// separate from the common reasoning fields so AxonHub can reconstruct
+		// the exact Responses request shape.
 		if effort := validateReasoningEffort(req.Reasoning.Effort); effort != "" {
 			chatReq.ReasoningEffort = effort
 		}
@@ -1206,6 +1305,11 @@ func convertToInternalRequest(req *ResponsesRequest) (*model.InternalLLMRequest,
 		StreamOptions:            req.StreamOptions,
 		ReasoningSummary:         reasoningSummary,
 		ReasoningGenerateSummary: reasoningGenerateSummary,
+		ReasoningContext:         valueOrString(req.Reasoning, func(reasoning *ResponsesReasoning) string { return reasoning.Context }),
+		RawTools:                 buildRawResponsesToolFragments(req.Tools, rawRequestParts.Tools),
+		ToolSignatures:           buildResponsesToolSignatures(req.Tools),
+		RawToolChoice:            rawResponsesToolChoice(req.ToolChoice, rawRequestParts.ToolChoice),
+		RawInputFragments:        buildRawResponsesInputFragments(rawRequestParts.InputItems),
 		RawInputItems:            chatReq.OpenAIRawInputItems(),
 	})
 
@@ -1245,8 +1349,10 @@ func convertToInternalRequest(req *ResponsesRequest) (*model.InternalLLMRequest,
 	// Convert text format
 	if req.Text != nil && req.Text.Format != nil && req.Text.Format.Type != "" {
 		rf := &model.ResponseFormat{
-			Type: req.Text.Format.Type,
-			Name: req.Text.Format.Name,
+			Type:        req.Text.Format.Type,
+			Name:        req.Text.Format.Name,
+			Description: req.Text.Format.Description,
+			Strict:      req.Text.Format.Strict,
 		}
 		if len(req.Text.Format.Schema) > 0 {
 			rf.RawSchema = req.Text.Format.Schema
@@ -1257,8 +1363,269 @@ func convertToInternalRequest(req *ResponsesRequest) (*model.InternalLLMRequest,
 		}
 		chatReq.ResponseFormat = rf
 	}
+	if req.Text != nil {
+		chatReq.Verbosity = req.Text.Verbosity
+	}
 
 	return chatReq, nil
+}
+
+// rawResponsesRequestParts retains the original wire fragments needed by
+// AxonHub's provider extension merger. The normalized local request continues
+// to carry the complete input array for websocket exact replay.
+type rawResponsesRequestParts struct {
+	Tools      []json.RawMessage
+	ToolChoice json.RawMessage
+	InputItems []json.RawMessage
+}
+
+func parseRawResponsesRequestParts(req *ResponsesRequest, rawBody ...[]byte) rawResponsesRequestParts {
+	var raw struct {
+		Tools      []json.RawMessage `json:"tools"`
+		ToolChoice json.RawMessage   `json:"tool_choice"`
+		Input      json.RawMessage   `json:"input"`
+	}
+	if len(rawBody) > 0 && len(rawBody[0]) > 0 {
+		_ = json.Unmarshal(rawBody[0], &raw)
+	}
+	if len(raw.Tools) == 0 && req != nil && len(req.Tools) > 0 {
+		for _, tool := range req.Tools {
+			if encoded, err := json.Marshal(tool); err == nil {
+				raw.Tools = append(raw.Tools, encoded)
+			}
+		}
+	}
+	if len(raw.ToolChoice) == 0 && req != nil && req.ToolChoice != nil {
+		if encoded, err := json.Marshal(req.ToolChoice); err == nil {
+			raw.ToolChoice = encoded
+		}
+	}
+	if len(raw.Input) == 0 && req != nil && req.Input.Text == nil && len(req.Input.Items) > 0 {
+		if encoded, err := json.Marshal(req.Input.Items); err == nil {
+			raw.Input = encoded
+		}
+	}
+	var inputItems []json.RawMessage
+	if len(raw.Input) > 0 {
+		_ = json.Unmarshal(raw.Input, &inputItems)
+	}
+	return rawResponsesRequestParts{
+		Tools:      raw.Tools,
+		ToolChoice: cloneRaw(raw.ToolChoice),
+		InputItems: inputItems,
+	}
+}
+
+func marshalRawResponsesItems(items []json.RawMessage) json.RawMessage {
+	if len(items) == 0 {
+		return nil
+	}
+	encoded, err := json.Marshal(items)
+	if err != nil {
+		return nil
+	}
+	return encoded
+}
+
+func buildRawResponsesToolFragments(tools []ResponsesTool, rawTools []json.RawMessage) []model.OpenAIResponsesRawFragment {
+	if len(rawTools) == 0 {
+		return nil
+	}
+	fragments := make([]model.OpenAIResponsesRawFragment, 0)
+	for index, rawTool := range rawTools {
+		var probe struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+		}
+		_ = json.Unmarshal(rawTool, &probe)
+		if isStructurallyRepresentedResponsesToolType(probe.Type) {
+			continue
+		}
+		representedToolCount := 0
+		if index < len(tools) {
+			representedToolCount = representedNamespaceToolCount(tools[index])
+		}
+		fragments = append(fragments, model.OpenAIResponsesRawFragment{
+			Type:                 probe.Type,
+			Name:                 probe.Name,
+			OriginalIndex:        index,
+			RepresentedToolCount: representedToolCount,
+			Raw:                  cloneRaw(rawTool),
+		})
+	}
+	return fragments
+}
+
+func buildResponsesToolSignatures(tools []ResponsesTool) []string {
+	if len(tools) == 0 {
+		return nil
+	}
+	signatures := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		if tool.Type == "namespace" {
+			for _, subTool := range tool.Tools {
+				if subTool.Type == "function" {
+					signatures = append(signatures, responseToolSignature(ResponsesTool{
+						Type: "function",
+						Name: namespaceFunctionName(tool.Name, subTool.Name),
+					}))
+				}
+			}
+			continue
+		}
+		if !isStructurallyRepresentedResponsesToolType(tool.Type) {
+			continue
+		}
+		signatures = append(signatures, responseToolSignature(tool))
+	}
+	return signatures
+}
+
+func isStructurallyRepresentedResponsesToolType(toolType string) bool {
+	switch toolType {
+	case "function", "image_generation", "web_search", "custom":
+		return true
+	default:
+		return false
+	}
+}
+
+func responseToolSignature(tool ResponsesTool) string {
+	switch tool.Type {
+	case "function", "custom":
+		return tool.Type + ":" + tool.Name
+	default:
+		return tool.Type
+	}
+}
+
+func representedNamespaceToolCount(tool ResponsesTool) int {
+	if tool.Type != "namespace" {
+		return 0
+	}
+	count := 0
+	for _, subTool := range tool.Tools {
+		if subTool.Type == "function" {
+			count++
+		}
+	}
+	return count
+}
+
+// namespaceFunctionName is the flattened name used by the shared internal
+// function-tool representation. Keep it aligned with AxonHub's Responses
+// inbound conversion so raw-fragment merging and provider tool signatures use
+// the same identity.
+func namespaceFunctionName(namespaceName, functionName string) string {
+	return namespaceName + "__" + functionName
+}
+
+func buildRawResponsesInputFragments(rawItems []json.RawMessage) []model.OpenAIResponsesRawFragment {
+	if len(rawItems) == 0 {
+		return nil
+	}
+	fragments := make([]model.OpenAIResponsesRawFragment, 0)
+	for index, rawItem := range rawItems {
+		var probe struct {
+			Type   string `json:"type"`
+			Name   string `json:"name"`
+			CallID string `json:"call_id"`
+		}
+		_ = json.Unmarshal(rawItem, &probe)
+		if isStructurallyRepresentedResponsesInputItem(probe.Type, rawItem) {
+			continue
+		}
+		fragments = append(fragments, model.OpenAIResponsesRawFragment{
+			Type:          probe.Type,
+			Name:          probe.Name,
+			CallID:        probe.CallID,
+			OriginalIndex: index,
+			Raw:           cloneRaw(rawItem),
+		})
+	}
+	return fragments
+}
+
+func isStructurallyRepresentedResponsesInputType(itemType string) bool {
+	switch itemType {
+	case "", "message", "input_text", "input_image", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "reasoning", "compaction", "compaction_summary":
+		return true
+	default:
+		return false
+	}
+}
+
+// isStructurallyRepresentedResponsesInputItem is stricter than the type-only
+// check for message items. AxonHub can rebuild text and images inside a
+// message, but its Responses converter does not yet emit nested input_file or
+// input_audio parts. Preserve the complete parent item in that case instead of
+// silently dropping only the unsupported nested part.
+func isStructurallyRepresentedResponsesInputItem(itemType string, raw json.RawMessage) bool {
+	if !isStructurallyRepresentedResponsesInputType(itemType) {
+		return false
+	}
+	if itemType != "message" {
+		return true
+	}
+
+	var item struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(raw, &item) != nil || len(item.Content) == 0 {
+		return true
+	}
+	var contentItems []struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(item.Content, &contentItems) != nil {
+		return true
+	}
+	for _, contentItem := range contentItems {
+		if !isStructurallyRepresentedResponsesContentType(contentItem.Type) {
+			return false
+		}
+	}
+	return true
+}
+
+func isStructurallyRepresentedResponsesContentType(contentType string) bool {
+	switch contentType {
+	case "", "input_text", "text", "output_text", "input_image", "compaction", "compaction_summary":
+		return true
+	default:
+		return false
+	}
+}
+
+func rawResponsesToolChoice(choice *ResponsesToolChoice, raw json.RawMessage) json.RawMessage {
+	if choice == nil || len(raw) == 0 {
+		return nil
+	}
+	if len(choice.Tools) > 0 {
+		return cloneRaw(raw)
+	}
+	return nil
+}
+
+func valueOrString(reasoning *ResponsesReasoning, value func(*ResponsesReasoning) string) string {
+	if reasoning == nil || value == nil {
+		return ""
+	}
+	return value(reasoning)
+}
+
+func valueOrEmpty(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func cloneRaw(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+	return append(json.RawMessage(nil), raw...)
 }
 
 func markOpenAIResponsesPassthroughIfNeeded(req *ResponsesRequest, chatReq *model.InternalLLMRequest) {
@@ -1276,7 +1643,7 @@ func markOpenAIResponsesPassthroughIfNeeded(req *ResponsesRequest, chatReq *mode
 func firstUnsupportedResponsesToolType(tools []ResponsesTool) string {
 	for _, tool := range tools {
 		switch tool.Type {
-		case "function", "image_generation":
+		case "function", "image_generation", "web_search", "custom", "namespace":
 			continue
 		case "":
 			return "<empty>"
@@ -1304,7 +1671,7 @@ func firstUnsupportedResponsesTopLevelItemType(item *ResponsesItem) string {
 		return ""
 	}
 	switch item.Type {
-	case "", "message", "input_text", "input_image", "input_file", "input_audio", "function_call", "function_call_output", "reasoning":
+	case "", "message", "input_text", "input_image", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "reasoning", "compaction", "compaction_summary":
 	default:
 		return item.Type
 	}
@@ -1323,7 +1690,7 @@ func firstUnsupportedResponsesContentItemType(input *ResponsesInput) string {
 	}
 	for _, item := range input.Items {
 		switch item.Type {
-		case "input_text", "text", "output_text", "input_image", "input_file", "input_audio":
+		case "input_text", "text", "output_text", "input_image", "compaction", "compaction_summary":
 			continue
 		case "":
 			return "<empty>"
@@ -1342,14 +1709,14 @@ func convertToolChoiceToInternal(src *ResponsesToolChoice) *model.ToolChoice {
 	result := &model.ToolChoice{}
 	if src.Mode != nil {
 		result.ToolChoice = src.Mode
-	} else if src.Type != nil && src.Name != nil {
-		name := *src.Name
+	} else if src.Type != nil {
 		result.NamedToolChoice = &model.NamedToolChoice{
 			Type: *src.Type,
-			Function: &model.ToolFunction{
-				Name: name,
-			},
-			Name: &name,
+		}
+		if src.Name != nil {
+			name := *src.Name
+			result.NamedToolChoice.Function = &model.ToolFunction{Name: name}
+			result.NamedToolChoice.Name = &name
 		}
 	}
 	return result
@@ -1395,11 +1762,19 @@ func convertItemToMessage(item *ResponsesItem) (*model.Message, error) {
 	switch item.Type {
 	case "message", "input_text", "":
 		msg := &model.Message{
+			ID:   item.ID,
 			Role: item.Role,
 		}
 
 		if item.Content != nil && len(item.Content.Items) > 0 && item.isOutputMessageContent() {
-			msg.Content = convertContentItemsToMessageContent(item.GetContentItems())
+			contentItems := item.GetContentItems()
+			msg.Content = convertContentItemsToMessageContent(contentItems)
+			for _, contentItem := range contentItems {
+				if contentItem.Refusal != "" {
+					msg.Refusal += contentItem.Refusal
+				}
+				msg.Annotations = append(msg.Annotations, fromResponsesAnnotations(contentItem.Annotations)...)
+			}
 		} else if item.Content != nil {
 			msg.Content = convertInputToMessageContent(*item.Content)
 		} else if item.Text != nil {
@@ -1433,21 +1808,60 @@ func convertItemToMessage(item *ResponsesItem) (*model.Message, error) {
 					Type: "function",
 					Function: model.FunctionCall{
 						Name:      item.Name,
+						Namespace: item.Namespace,
 						Arguments: item.Arguments,
 					},
 				},
 			},
 		}, nil
 
+	case "custom_tool_call":
+		input := ""
+		if item.Input != nil {
+			input = *item.Input
+		}
+		return &model.Message{
+			Role: "assistant",
+			ToolCalls: []model.ToolCall{{
+				ID:   item.CallID,
+				Type: "responses_custom_tool",
+				ResponseCustomToolCall: &model.ResponseCustomToolCall{
+					CallID: item.CallID,
+					Name:   item.Name,
+					Input:  input,
+				},
+			}},
+		}, nil
+
 	case "function_call_output":
+		if item.Output == nil {
+			return nil, fmt.Errorf("function_call_output item must have non-nil output")
+		}
 		return &model.Message{
 			Role:       "tool",
 			ToolCallID: lo.ToPtr(item.CallID),
 			Content:    convertInputToMessageContent(*item.Output),
 		}, nil
 
+	case "custom_tool_call_output":
+		if item.Output == nil {
+			return nil, fmt.Errorf("custom_tool_call_output item must have non-nil output")
+		}
+		return &model.Message{
+			Role:       "tool",
+			ToolCallID: lo.ToPtr(item.CallID),
+			ToolCallName: func() *string {
+				if item.Name == "" {
+					return nil
+				}
+				return lo.ToPtr(item.Name)
+			}(),
+			Content: convertInputToMessageContent(*item.Output),
+		}, nil
+
 	case "reasoning":
 		msg := &model.Message{
+			ID:   item.ID,
 			Role: "assistant",
 		}
 
@@ -1456,15 +1870,36 @@ func convertItemToMessage(item *ResponsesItem) (*model.Message, error) {
 			reasoningText.WriteString(summary.Text)
 		}
 
-		if reasoningText.Len() > 0 {
-			msg.ReasoningContent = lo.ToPtr(reasoningText.String())
-		}
-
-		if item.EncryptedContent != nil && *item.EncryptedContent != "" {
-			msg.ReasoningSignature = item.EncryptedContent
+		if reasoningText.Len() > 0 || item.EncryptedContent != nil {
+			itemContent := model.ReasoningItem{ID: item.ID, Content: reasoningText.String()}
+			if item.EncryptedContent != nil {
+				itemContent.Signature = *item.EncryptedContent
+			}
+			msg.ReasoningItems = []model.ReasoningItem{itemContent}
+			if reasoningText.Len() > 0 {
+				msg.ReasoningContent = lo.ToPtr(reasoningText.String())
+			}
+			if itemContent.Signature != "" {
+				msg.ReasoningSignature = lo.ToPtr(itemContent.Signature)
+			}
 		}
 
 		return msg, nil
+
+	case "compaction", "compaction_summary":
+		return &model.Message{
+			ID:   item.ID,
+			Role: "assistant",
+			Content: model.MessageContent{MultipleContent: []model.MessageContentPart{{
+				ID:   item.ID,
+				Type: item.Type,
+				Compact: &model.CompactContent{
+					ID:               item.ID,
+					EncryptedContent: valueOrEmpty(item.EncryptedContent),
+					CreatedBy:        item.CreatedBy,
+				},
+			}}},
+		}, nil
 
 	default:
 		return nil, nil
@@ -1533,6 +1968,16 @@ func convertInputToMessageContent(input ResponsesInput) model.MessageContent {
 					Data:   item.InputAudio.Data,
 				},
 			})
+		case "compaction", "compaction_summary":
+			parts = append(parts, model.MessageContentPart{
+				ID:   item.ID,
+				Type: item.Type,
+				Compact: &model.CompactContent{
+					ID:               item.ID,
+					EncryptedContent: valueOrEmpty(item.EncryptedContent),
+					CreatedBy:        item.CreatedBy,
+				},
+			})
 		}
 	}
 
@@ -1560,6 +2005,31 @@ func convertContentItemsToMessageContent(items []ResponsesContentItem) model.Mes
 	}
 
 	return model.MessageContent{MultipleContent: parts}
+}
+
+func fromResponsesAnnotations(annotations []ResponsesAnnotation) []model.Annotation {
+	if len(annotations) == 0 {
+		return nil
+	}
+	result := make([]model.Annotation, 0, len(annotations))
+	for _, annotation := range annotations {
+		converted := model.Annotation{
+			Type:       annotation.Type,
+			StartIndex: annotation.StartIndex,
+			EndIndex:   annotation.EndIndex,
+		}
+		if annotation.URL != nil || annotation.Title != nil {
+			converted.URLCitation = &model.URLCitation{}
+			if annotation.URL != nil {
+				converted.URLCitation.URL = *annotation.URL
+			}
+			if annotation.Title != nil {
+				converted.URLCitation.Title = *annotation.Title
+			}
+		}
+		result = append(result, converted)
+	}
+	return result
 }
 
 func convertToolsToInternal(tools []ResponsesTool) ([]model.Tool, error) {
@@ -1594,6 +2064,53 @@ func convertToolsToInternal(tools []ResponsesTool) ([]model.Tool, error) {
 					OutputCompression: tool.OutputCompression,
 				},
 			})
+
+		case "web_search":
+			webSearch := &model.WebSearch{}
+			if tool.Filters != nil {
+				webSearch.AllowedDomains = append(webSearch.AllowedDomains, tool.Filters.AllowedDomains...)
+			}
+			if tool.UserLocation != nil {
+				locationType := tool.UserLocation.Type
+				if locationType == "" {
+					locationType = "approximate"
+				}
+				webSearch.UserLocation = model.WebSearchToolUserLocation{
+					Type: locationType, City: tool.UserLocation.City,
+					Country: tool.UserLocation.Country, Region: tool.UserLocation.Region,
+					Timezone: tool.UserLocation.Timezone,
+				}
+			}
+			result = append(result, model.Tool{Type: "web_search", WebSearch: webSearch})
+
+		case "custom":
+			custom := &model.ResponseCustomTool{Name: tool.Name, Description: tool.Description}
+			if tool.Format != nil {
+				custom.Format = &model.ResponseCustomToolFormat{
+					Type: tool.Format.Type, Syntax: tool.Format.Syntax, Definition: tool.Format.Definition,
+				}
+			}
+			result = append(result, model.Tool{Type: "responses_custom_tool", ResponseCustomTool: custom})
+
+		case "namespace":
+			for _, subTool := range tool.Tools {
+				if subTool.Type != "function" {
+					continue
+				}
+				params, err := json.Marshal(subTool.Parameters)
+				if err != nil {
+					return nil, fmt.Errorf("failed to marshal namespace tool parameters: %w", err)
+				}
+				result = append(result, model.Tool{
+					Type: "function",
+					Function: model.Function{
+						Name:        namespaceFunctionName(tool.Name, subTool.Name),
+						Description: subTool.Description,
+						Parameters:  params,
+						Strict:      subTool.Strict,
+					},
+				})
+			}
 		}
 	}
 
@@ -1602,12 +2119,13 @@ func convertToolsToInternal(tools []ResponsesTool) ([]model.Tool, error) {
 
 func convertToResponsesAPIResponse(resp *model.InternalLLMResponse) *ResponsesResponse {
 	result := &ResponsesResponse{
-		Object:    "response",
-		ID:        resp.ID,
-		Model:     resp.Model,
-		CreatedAt: resp.Created,
-		Output:    make([]ResponsesItem, 0),
-		Status:    lo.ToPtr("completed"),
+		Object:             "response",
+		ID:                 resp.ID,
+		Model:              resp.Model,
+		CreatedAt:          resp.Created,
+		PreviousResponseID: cloneResponseStringPtr(resp.PreviousResponseID),
+		Output:             make([]ResponsesItem, 0),
+		Status:             lo.ToPtr("completed"),
 	}
 
 	// Convert usage
@@ -1625,34 +2143,53 @@ func convertToResponsesAPIResponse(resp *model.InternalLLMResponse) *ResponsesRe
 		if message == nil {
 			continue
 		}
-
-		// Handle reasoning content
-		if message.ReasoningContent != nil && *message.ReasoningContent != "" {
-			result.Output = append(result.Output, ResponsesItem{
-				ID:     generateItemID(),
-				Type:   "reasoning",
-				Status: lo.ToPtr("completed"),
-				Summary: []ResponsesReasoningSummary{
-					{
-						Type: "summary_text",
-						Text: *message.ReasoningContent,
-					},
-				},
-			})
+		messageID := message.ID
+		if messageID == "" {
+			messageID = generateItemID()
 		}
 
-		// Handle tool calls
+		// Keep each reasoning item separate. A single scalar reasoning field is
+		// retained only as a compatibility fallback for older providers.
+		result.Output = append(result.Output, buildResponsesReasoningItems(*message)...)
+
+		// Handle function and custom tool calls.
 		if len(message.ToolCalls) > 0 {
 			for _, toolCall := range message.ToolCalls {
+				if toolCall.ResponseCustomToolCall != nil {
+					callID := toolCall.ResponseCustomToolCall.CallID
+					itemID := toolCall.ID
+					if itemID == "" {
+						itemID = callID
+					}
+					result.Output = append(result.Output, ResponsesItem{
+						ID:     itemID,
+						Type:   "custom_tool_call",
+						CallID: callID,
+						Name:   toolCall.ResponseCustomToolCall.Name,
+						Input:  lo.ToPtr(toolCall.ResponseCustomToolCall.Input),
+						Status: lo.ToPtr("completed"),
+					})
+					continue
+				}
+
 				result.Output = append(result.Output, ResponsesItem{
 					ID:        toolCall.ID,
 					Type:      "function_call",
 					CallID:    toolCall.ID,
 					Name:      toolCall.Function.Name,
+					Namespace: toolCall.Function.Namespace,
 					Arguments: toolCall.Function.Arguments,
 					Status:    lo.ToPtr("completed"),
 				})
 			}
+		}
+
+		// Anthropic server-side tool results can be carried inline on the
+		// assistant message. Responses has no generic inline-result item, so
+		// represent them as function_call_output while retaining their call id
+		// and textual output.
+		for _, inline := range message.InlineToolResults {
+			result.Output = append(result.Output, responsesItemFromInlineToolResult(inline))
 		}
 
 		// Handle message content
@@ -1662,7 +2199,7 @@ func convertToResponsesAPIResponse(resp *model.InternalLLMResponse) *ResponsesRe
 			contentItems = append(contentItems, ResponsesItem{
 				Type:        "output_text",
 				Text:        &text,
-				Annotations: &[]ResponsesAnnotation{},
+				Annotations: responsesAnnotations(message.Annotations),
 			})
 		} else if len(message.Content.MultipleContent) > 0 {
 
@@ -1674,18 +2211,26 @@ func convertToResponsesAPIResponse(resp *model.InternalLLMResponse) *ResponsesRe
 						contentItems = append(contentItems, ResponsesItem{
 							Type:        "output_text",
 							Text:        &text,
-							Annotations: &[]ResponsesAnnotation{},
+							Annotations: responsesAnnotations(nil),
 						})
 					}
 				case "image_url":
 					if part.ImageURL != nil {
 						result.Output = append(result.Output, ResponsesItem{
-							ID:     generateItemID(),
-							Type:   "image_generation_call",
-							Role:   "assistant",
-							Result: lo.ToPtr(xurl.ExtractBase64FromDataURL(part.ImageURL.URL)),
-							Status: lo.ToPtr("completed"),
+							ID:           generateItemID(),
+							Type:         "image_generation_call",
+							Role:         "assistant",
+							Result:       lo.ToPtr(xurl.ExtractBase64FromDataURL(part.ImageURL.URL)),
+							Status:       lo.ToPtr("completed"),
+							Background:   responsesMetadataString(part.TransformerMetadata, "background"),
+							OutputFormat: responsesMetadataString(part.TransformerMetadata, "output_format"),
+							Quality:      responsesMetadataString(part.TransformerMetadata, "quality"),
+							Size:         responsesMetadataString(part.TransformerMetadata, "size"),
 						})
+					}
+				case "compaction", "compaction_summary":
+					if part.Compact != nil {
+						result.Output = append(result.Output, responsesCompactionItem(part, part.Type))
 					}
 				}
 			}
@@ -1699,14 +2244,22 @@ func convertToResponsesAPIResponse(resp *model.InternalLLMResponse) *ResponsesRe
 			})
 		}
 
-		if len(contentItems) > 0 {
-			result.Output = append(result.Output, ResponsesItem{
-				ID:      generateItemID(),
+		if len(contentItems) > 0 || message.Audio != nil {
+			attachResponsesAnnotations(contentItems, message.Annotations)
+			messageItem := ResponsesItem{
+				ID:      messageID,
 				Type:    "message",
 				Role:    "assistant",
 				Content: &ResponsesInput{Items: contentItems},
 				Status:  lo.ToPtr("completed"),
-			})
+			}
+			if message.Audio != nil {
+				messageItem.Audio = &ResponsesOutputAudio{
+					ID: message.Audio.ID, Data: message.Audio.Data,
+					ExpiresAt: message.Audio.ExpiresAt, Transcript: message.Audio.Transcript,
+				}
+			}
+			result.Output = append(result.Output, messageItem)
 		}
 
 		// Set status based on finish reason
@@ -1738,6 +2291,137 @@ func convertToResponsesAPIResponse(resp *model.InternalLLMResponse) *ResponsesRe
 	}
 
 	return result
+}
+
+func buildResponsesReasoningItems(message model.Message) []ResponsesItem {
+	reasoningItems := message.ReasoningItems
+	if len(reasoningItems) == 0 {
+		var content string
+		if message.ReasoningContent != nil {
+			content = *message.ReasoningContent
+		} else if message.Reasoning != nil {
+			content = *message.Reasoning
+		}
+		var signature string
+		if message.ReasoningSignature != nil {
+			signature = *message.ReasoningSignature
+		}
+		if content != "" || signature != "" {
+			reasoningItems = []model.ReasoningItem{{Content: content, Signature: signature}}
+		}
+	}
+
+	result := make([]ResponsesItem, 0, len(reasoningItems))
+	for _, reasoning := range reasoningItems {
+		if reasoning.Content == "" && reasoning.Signature == "" {
+			continue
+		}
+		itemID := reasoning.ID
+		if itemID == "" {
+			itemID = generateItemID()
+		}
+		item := ResponsesItem{
+			ID:      itemID,
+			Type:    "reasoning",
+			Status:  lo.ToPtr("completed"),
+			Summary: []ResponsesReasoningSummary{},
+		}
+		if reasoning.Content != "" {
+			item.Summary = append(item.Summary, ResponsesReasoningSummary{
+				Type: "summary_text",
+				Text: reasoning.Content,
+			})
+		}
+		if reasoning.Signature != "" {
+			item.EncryptedContent = lo.ToPtr(reasoning.Signature)
+		}
+		result = append(result, item)
+	}
+	return result
+}
+
+func responsesAnnotations(annotations []model.Annotation) *[]ResponsesAnnotation {
+	result := make([]ResponsesAnnotation, 0, len(annotations))
+	for _, annotation := range annotations {
+		converted := ResponsesAnnotation{
+			Type:       annotation.Type,
+			StartIndex: annotation.StartIndex,
+			EndIndex:   annotation.EndIndex,
+		}
+		if annotation.URLCitation != nil {
+			converted.URL = lo.ToPtr(annotation.URLCitation.URL)
+			converted.Title = lo.ToPtr(annotation.URLCitation.Title)
+		}
+		result = append(result, converted)
+	}
+	return &result
+}
+
+func attachResponsesAnnotations(items []ResponsesItem, annotations []model.Annotation) {
+	if len(annotations) == 0 {
+		return
+	}
+	for index := range items {
+		if items[index].Type == "output_text" || items[index].Type == "input_text" || items[index].Type == "text" {
+			items[index].Annotations = responsesAnnotations(annotations)
+			return
+		}
+	}
+}
+
+func responsesCompactionItem(part model.MessageContentPart, contentType string) ResponsesItem {
+	item := ResponsesItem{Type: contentType}
+	if part.Compact == nil {
+		return item
+	}
+	item.ID = part.Compact.ID
+	item.EncryptedContent = lo.ToPtr(part.Compact.EncryptedContent)
+	item.CreatedBy = part.Compact.CreatedBy
+	return item
+}
+
+func responsesItemFromInlineToolResult(result model.InlineToolResult) ResponsesItem {
+	itemType := "function_call_output"
+	if result.TransformerMetadata != nil {
+		if value, ok := result.TransformerMetadata["responses_type"].(string); ok {
+			switch value {
+			case "function_call_output", "custom_tool_call_output":
+				itemType = value
+			}
+		}
+	}
+	output := result.Output
+	return ResponsesItem{
+		Type:   itemType,
+		CallID: result.ToolCallID,
+		Output: &ResponsesInput{Text: &output},
+		Status: lo.ToPtr("completed"),
+	}
+}
+
+func responsesMetadataString(metadata map[string]any, key string) *string {
+	if metadata == nil {
+		return nil
+	}
+	switch value := metadata[key].(type) {
+	case string:
+		if value != "" {
+			return lo.ToPtr(value)
+		}
+	case *string:
+		if value != nil && *value != "" {
+			return lo.ToPtr(*value)
+		}
+	}
+	return nil
+}
+
+func cloneResponseStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 func convertUsageToResponses(usage *model.Usage) *ResponsesUsage {

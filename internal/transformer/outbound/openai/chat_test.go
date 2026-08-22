@@ -200,6 +200,45 @@ func TestTransformRequestPreservesDeveloperRole(t *testing.T) {
 	}
 }
 
+func TestTransformRequestDoesNotClearReusableReasoningFields(t *testing.T) {
+	outbound := &ChatOutbound{}
+	content := "previous answer"
+	signature := "opaque-signature"
+	reasoningBlock := model.ReasoningBlock{
+		Kind:      model.ReasoningBlockKindThinking,
+		Text:      "think",
+		Signature: signature,
+		Provider:  "gemini",
+	}
+	req := &model.InternalLLMRequest{
+		Model: "gpt-5",
+		Messages: []model.Message{{
+			Role:               "assistant",
+			Content:            model.MessageContent{Content: &content},
+			ReasoningSignature: &signature,
+			ReasoningBlocks:    []model.ReasoningBlock{reasoningBlock},
+		}},
+	}
+
+	if _, err := outbound.TransformRequest(context.Background(), req, "https://api.openai.com/v1", "sk-test"); err != nil {
+		t.Fatalf("TransformRequest: %v", err)
+	}
+	if req.Messages[0].ReasoningSignature == nil || *req.Messages[0].ReasoningSignature != signature {
+		t.Fatalf("TransformRequest cleared the reusable reasoning signature: %+v", req.Messages[0])
+	}
+	if len(req.Messages[0].ReasoningBlocks) != 1 || req.Messages[0].ReasoningBlocks[0].Signature != signature {
+		t.Fatalf("TransformRequest cleared the reusable reasoning blocks: %+v", req.Messages[0].ReasoningBlocks)
+	}
+
+	// A second conversion of the same IR must retain the same replay data.
+	if _, err := outbound.TransformRequest(context.Background(), req, "https://api.openai.com/v1", "sk-test"); err != nil {
+		t.Fatalf("second TransformRequest: %v", err)
+	}
+	if req.Messages[0].ReasoningSignature == nil || len(req.Messages[0].ReasoningBlocks) != 1 {
+		t.Fatalf("reusable reasoning fields were lost on retry: %+v", req.Messages[0])
+	}
+}
+
 // Chat outbound forwards OpenAI-Organization / OpenAI-Project when they
 // are present in TransformerMetadata, and skips them cleanly when absent
 // or blank.

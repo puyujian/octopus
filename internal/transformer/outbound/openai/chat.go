@@ -1,19 +1,46 @@
 package openai
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"net/url"
 	"strings"
 
+	"github.com/bestruirui/octopus/internal/transformer/bridge"
 	"github.com/bestruirui/octopus/internal/transformer/model"
+	"github.com/looplj/axonhub/llm/auth"
+	"github.com/looplj/axonhub/llm/transformer"
+	axonOpenAI "github.com/looplj/axonhub/llm/transformer/openai"
 )
 
-type ChatOutbound struct{}
+type ChatOutbound struct {
+	inner                transformer.Outbound
+	streams              *model.AxonStreamBridge
+	streamMessageStarted map[int]bool
+}
+
+// ensureAxon lazily initializes AxonHub with the actual channel endpoint and
+// key.  The same transformer instance is then used for request, response and
+// stream conversion so request metadata and protocol routing stay consistent.
+func (o *ChatOutbound) ensureAxon(baseURL, key string) (transformer.Outbound, error) {
+	if o.inner != nil {
+		return o.inner, nil
+	}
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = "https://api.openai.com/v1"
+	}
+	inner, err := axonOpenAI.NewOutboundTransformerWithConfig(&axonOpenAI.Config{
+		PlatformType:   axonOpenAI.PlatformOpenAI,
+		BaseURL:        baseURL,
+		APIKeyProvider: auth.NewStaticKeyProvider(key),
+	})
+	if err != nil {
+		return nil, err
+	}
+	o.inner = inner
+	return inner, nil
+}
 
 // ChatCompletionsTool is the explicit OpenAI chat/completions wire tool payload.
 // Keeping this separate from the shared model prevents provider-specific fields
@@ -80,7 +107,9 @@ type ChatCompletionsAudio struct {
 }
 
 func (o *ChatOutbound) TransformRequest(ctx context.Context, request *model.InternalLLMRequest, baseUrl, key string) (*http.Request, error) {
-	request.ClearHelpFields()
+	if request == nil {
+		return nil, fmt.Errorf("request is nil")
+	}
 	request.NormalizeMessages()
 	request.FlattenUnsupportedBlocks(model.AlternationProviderOpenAI)
 
@@ -103,28 +132,45 @@ func (o *ChatOutbound) TransformRequest(ctx context.Context, request *model.Inte
 		}
 	}
 
-	body, err := json.Marshal(buildChatCompletionsRequest(request))
+	inner, err := o.ensureAxon(baseUrl, key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, err
+	}
+	req, axonRequest, err := model.BuildAxonHTTPRequest(ctx, inner, request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to transform request with AxonHub: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "", bytes.NewReader(body))
+	// AxonHub owns the common Chat Completions conversion.  These fields are
+	// intentionally kept as a local overlay because they are provider/channel
+	// extensions not present in AxonHub's common llm.Request yet.
+	// Clear compatibility-only fields on a private copy.  The same normalized IR
+	// can be retried or sent to another protocol, and reasoning signatures/blocks
+	// are opaque replay data that must survive those later conversions.
+	wireRequest := *request
+	wireRequest.Messages = append([]model.Message(nil), request.Messages...)
+	wireRequest.ClearHelpFields()
+	overlay, err := json.Marshal(buildChatCompletionsRequest(&wireRequest))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to marshal Chat Completions extensions: %w", err)
 	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+key)
+	axonRequest.Body, err = model.MergeJSONFields(axonRequest.Body, overlay,
+		"thinking", "prediction", "web_search_options", "audio")
+	if err != nil {
+		return nil, err
+	}
+	axonRequest.JSONBody = append([]byte(nil), axonRequest.Body...)
+	req, err = bridge.BuildHTTPRequest(ctx, axonRequest)
+	if err != nil {
+		return nil, err
+	}
 	applyOpenAIOrgProjectHeaders(req, request)
-
-	parsedUrl, err := url.Parse(strings.TrimSuffix(baseUrl, "/"))
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse base url: %w", err)
+	if request.Stream != nil && *request.Stream {
+		if o.streams == nil {
+			o.streams = model.NewAxonStreamBridge(inner)
+		}
+		o.streams.SetRequest(axonRequest)
 	}
-	parsedUrl.Path = parsedUrl.Path + "/chat/completions"
-	req.URL = parsedUrl
-	req.Method = http.MethodPost
 	return req, nil
 }
 
@@ -256,43 +302,22 @@ func convertToolsToChatCompletions(tools []model.Tool) []ChatCompletionsTool {
 }
 
 func (o *ChatOutbound) TransformResponse(ctx context.Context, response *http.Response) (*model.InternalLLMResponse, error) {
-	body, err := io.ReadAll(response.Body)
+	inner, err := o.ensureAxon("", "")
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, err
 	}
-
-	if len(body) == 0 {
-		return nil, fmt.Errorf("response body is empty")
-	}
-
-	var resp model.InternalLLMResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
-	}
-	return &resp, nil
+	return model.TransformResponse(ctx, inner, response)
 }
 
 func (o *ChatOutbound) TransformStream(ctx context.Context, eventData []byte) (*model.InternalLLMResponse, error) {
-	if bytes.HasPrefix(eventData, []byte("[DONE]")) {
-		return &model.InternalLLMResponse{
-			Object: "[DONE]",
-		}, nil
+	inner, err := o.ensureAxon("", "")
+	if err != nil {
+		return nil, err
 	}
-
-	var errCheck struct {
-		Error *model.ErrorDetail `json:"error"`
+	if o.streams == nil {
+		o.streams = model.NewAxonStreamBridge(inner)
 	}
-	if err := json.Unmarshal(eventData, &errCheck); err == nil && errCheck.Error != nil {
-		return nil, &model.ResponseError{
-			Detail: *errCheck.Error,
-		}
-	}
-
-	var resp model.InternalLLMResponse
-	if err := json.Unmarshal(eventData, &resp); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal stream chunk: %w", err)
-	}
-	return &resp, nil
+	return o.streams.Feed(ctx, eventData)
 }
 
 func (o *ChatOutbound) TransformStreamEvent(ctx context.Context, eventData []byte) ([]model.StreamEvent, error) {
@@ -300,5 +325,8 @@ func (o *ChatOutbound) TransformStreamEvent(ctx context.Context, eventData []byt
 	if err != nil {
 		return nil, err
 	}
-	return model.StreamEventsFromInternalResponse(stream), nil
+	if o.streamMessageStarted == nil {
+		o.streamMessageStarted = make(map[int]bool)
+	}
+	return model.SuppressRepeatedMessageStarts(model.StreamEventsFromInternalResponse(stream), o.streamMessageStarted), nil
 }

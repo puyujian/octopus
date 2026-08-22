@@ -1,6 +1,11 @@
 package gemini
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
 	"testing"
 
 	"github.com/bestruirui/octopus/internal/transformer/model"
@@ -52,5 +57,58 @@ func TestConvertGeminiToLLMResponseSynthesizesBlockedChoice(t *testing.T) {
 	}
 	if got := *fr; got != string(model.FinishReasonSafety) && got != string(model.FinishReasonContentFilter) {
 		t.Fatalf("FinishReason = %q, want safety-family or content_filter", got)
+	}
+}
+
+func TestTransformResponseMergesGeminiMetadataWithAxonHubResponse(t *testing.T) {
+	reason := "STOP"
+	geminiResp := &model.GeminiGenerateContentResponse{
+		ResponseId:   "resp-42",
+		ModelVersion: "gemini-3.1-pro",
+		Candidates: []*model.GeminiCandidate{{
+			Index:        0,
+			FinishReason: &reason,
+			Content:      &model.GeminiContent{Role: "model", Parts: []*model.GeminiPart{{Text: "hello"}}},
+			GroundingMetadata: &model.GeminiGroundingMetadata{
+				WebSearchQueries: []string{"octopus"},
+				GroundingChunks:  []*model.GeminiGroundingChunk{{Web: &model.GeminiGroundingChunkWeb{URI: "https://example.test", Title: "Example"}}},
+			},
+			CitationMetadata: &model.GeminiCitationMetadata{CitationSources: []*model.GeminiCitationSource{{
+				StartIndex: 0, EndIndex: 5, URI: "https://example.test", License: "MIT",
+			}}},
+			UrlContextMetadata: &model.GeminiUrlContextMetadata{URLMetadata: []*model.GeminiURLMetadata{{
+				RetrievedURL: "https://example.test", URLRetrievalStatus: "URL_RETRIEVAL_STATUS_SUCCESS",
+			}}},
+			SafetyRatings: []*model.GeminiSafetyRating{{Category: "HARM_CATEGORY_DANGEROUS_CONTENT", Probability: "LOW"}},
+		}},
+	}
+	body, err := json.Marshal(geminiResp)
+	if err != nil {
+		t.Fatalf("marshal Gemini response: %v", err)
+	}
+
+	response, err := (&MessagesOutbound{}).TransformResponse(context.Background(), &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(body)),
+		Header:     make(http.Header),
+	})
+	if err != nil {
+		t.Fatalf("TransformResponse: %v", err)
+	}
+	if response == nil || len(response.Choices) != 1 {
+		t.Fatalf("unexpected transformed response: %#v", response)
+	}
+	choice := response.Choices[0]
+	if choice.Grounding == nil || len(choice.Grounding.Sources) != 1 || choice.Grounding.Sources[0].URI != "https://example.test" {
+		t.Fatalf("grounding metadata was lost: %#v", choice.Grounding)
+	}
+	if len(choice.Citations) != 1 || choice.Citations[0].License != "MIT" {
+		t.Fatalf("citation metadata was lost: %#v", choice.Citations)
+	}
+	if choice.URLContext == nil || len(choice.URLContext.URLs) != 1 {
+		t.Fatalf("URL context metadata was lost: %#v", choice.URLContext)
+	}
+	if len(choice.SafetyRatings) != 1 || choice.SafetyRatings[0].Probability != "LOW" {
+		t.Fatalf("safety metadata was lost: %#v", choice.SafetyRatings)
 	}
 }

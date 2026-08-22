@@ -296,6 +296,13 @@ type InternalLLMRequest struct {
 	// RawRequest is the raw request from the client.
 	RawRequest []byte `json:"-"`
 
+	// RawHeaders, RawPath and RawHTTPRequest preserve inbound transport details
+	// needed by provider transformers. They are runtime-only and deliberately
+	// separate from RawRequest, which contains the request body bytes.
+	RawHeaders     http.Header   `json:"-"`
+	RawPath        string        `json:"-"`
+	RawHTTPRequest *http.Request `json:"-"`
+
 	// RawAPIFormat is the original format of the request.
 	// e.g. the request from the chat/completions endpoint is in the openai/chat_completion format.
 	RawAPIFormat APIFormat `json:"-"`
@@ -733,6 +740,8 @@ type ThinkingConfig struct {
 
 // Message represents a message in the conversation.
 type Message struct {
+	// ID is the upstream message or item identifier when the provider exposes one.
+	ID   string `json:"-"`
 	Role string `json:"role,omitempty"`
 	// Content of the message.
 	// string or []ContentPart, be careful about the omitzero tag, it required.
@@ -781,6 +790,19 @@ type Message struct {
 	// legacy single-block emitters (OpenRouter, Ollama compat) keep working.
 	ReasoningSignature *string `json:"reasoning_signature,omitempty"`
 
+	// ReasoningItems preserves provider-scoped reasoning items without forcing
+	// encrypted signatures or summaries into one scalar field.
+	ReasoningItems []ReasoningItem `json:"-"`
+
+	// Annotations carries response-only metadata used by OpenAI-compatible
+	// providers. It remains off the default request wire representation.
+	Annotations []Annotation `json:"-"`
+
+	// InlineToolResults preserves provider-native tool results emitted inside an
+	// assistant turn, such as Anthropic server-side search results.
+	InlineToolResults []InlineToolResult `json:"-"`
+	Attribution       string             `json:"-"`
+
 	// RedactedThinkingBlocks stores opaque redacted_thinking blocks from Anthropic.
 	// Deprecated: mirrored into ReasoningBlocks with Kind=ReasoningBlockKindRedacted. Kept for
 	// backward compatibility with callers that read this field directly.
@@ -817,6 +839,7 @@ const (
 // ReasoningBlock preserves one thinking/redacted_thinking/thought_signature block verbatim.
 // All fields are opaque to the aggregator; they are round-tripped to the upstream as-is.
 type ReasoningBlock struct {
+	ID        string             `json:"id,omitempty"`
 	Kind      ReasoningBlockKind `json:"kind,omitempty"`
 	Index     int                `json:"index,omitempty"`
 	Text      string             `json:"text,omitempty"`
@@ -832,6 +855,43 @@ type ReasoningBlock struct {
 	// swapped and Gemini rejects the replay with 400. See G-H7.
 	ToolCallID   string `json:"tool_call_id,omitempty"`
 	ToolCallName string `json:"tool_call_name,omitempty"`
+}
+
+// ReasoningItem is an ordered provider-neutral reasoning item. Signature is
+// opaque provider data and must not be concatenated or modified.
+type ReasoningItem struct {
+	ID        string `json:"id,omitempty"`
+	Content   string `json:"content,omitempty"`
+	Signature string `json:"signature,omitempty"`
+}
+
+// InlineToolResult represents a provider-native tool result embedded in an
+// assistant message instead of a standalone tool-role message.
+type InlineToolResult struct {
+	ToolCallID          string         `json:"tool_call_id,omitempty"`
+	Output              string         `json:"output,omitempty"`
+	IsError             bool           `json:"is_error,omitempty"`
+	TransformerMetadata map[string]any `json:"transformer_metadata,omitempty"`
+}
+
+// Annotation represents a citation attached to generated text.
+type Annotation struct {
+	Type        string       `json:"type,omitempty"`
+	StartIndex  *int64       `json:"start_index,omitempty"`
+	EndIndex    *int64       `json:"end_index,omitempty"`
+	URLCitation *URLCitation `json:"url_citation,omitempty"`
+}
+
+type URLCitation struct {
+	URL   string `json:"url,omitempty"`
+	Title string `json:"title,omitempty"`
+}
+
+type OutputAudio struct {
+	ID         string `json:"id,omitempty"`
+	Data       string `json:"data,omitempty"`
+	ExpiresAt  int64  `json:"expires_at,omitempty"`
+	Transcript string `json:"transcript,omitempty"`
 }
 
 // AppendReasoningBlock appends a reasoning block preserving insertion order.
@@ -997,6 +1057,7 @@ func (c *MessageContent) UnmarshalJSON(data []byte) error {
 
 // MessageContentPart represents different types of content (text, image, etc.)
 type MessageContentPart struct {
+	ID string `json:"-"`
 	// Type is the type of the content part.
 	// e.g. "text", "image_url", "input_audio", "file", "document",
 	// "server_tool_use", "server_tool_result".
@@ -1005,7 +1066,12 @@ type MessageContentPart struct {
 	Text *string `json:"text,omitempty"`
 
 	// ImageURL is the image URL content, required when type is "image_url"
-	ImageURL *ImageURL `json:"image_url,omitempty"`
+	ImageURL *ImageURL       `json:"image_url,omitempty"`
+	VideoURL *VideoURL       `json:"-"`
+	Compact  *CompactContent `json:"-"`
+	// TransformerMetadata is opaque provider metadata needed for exact
+	// round-trips (for example Responses input item identifiers).
+	TransformerMetadata map[string]any `json:"-"`
 
 	// Audio is the audio content, required when type is "input_audio"
 	Audio *Audio `json:"input_audio,omitempty"`
@@ -1119,13 +1185,24 @@ type ServerToolResultBlock struct {
 // ImageURL represents an image URL with optional detail level.
 type ImageURL struct {
 	// URL is the URL of the image.
-	URL string `json:"url"`
+	URL      string `json:"url"`
+	MIMEType string `json:"mime_type,omitempty"`
 
 	// Specifies the detail level of the image. Learn more in the
 	// [Vision guide](https://platform.openai.com/docs/guides/vision#low-or-high-fidelity-image-understanding).
 	//
 	// Any of "auto", "low", "high".
 	Detail *string `json:"detail,omitempty"`
+}
+
+type VideoURL struct {
+	URL string `json:"url"`
+}
+
+type CompactContent struct {
+	ID               string  `json:"id,omitempty"`
+	EncryptedContent string  `json:"encrypted_content,omitempty"`
+	CreatedBy        *string `json:"created_by,omitempty"`
 }
 
 type Audio struct {
@@ -1292,7 +1369,14 @@ func (r ResponseFormat) MarshalJSON() ([]byte, error) {
 // And other llm provider should convert the response to this format.
 // NOTE: the OpenAI stream and non-stream response reuse same struct.
 type InternalLLMResponse struct {
-	ID string `json:"id"`
+	ID                 string  `json:"id"`
+	PreviousResponseID *string `json:"previous_response_id,omitempty"`
+	// RequestType and APIFormat are transport metadata from the AxonHub
+	// response. They are intentionally hidden from provider wire JSON but are
+	// needed by downstream adapters and metrics.
+	RequestType         string         `json:"-"`
+	APIFormat           APIFormat      `json:"-"`
+	TransformerMetadata map[string]any `json:"-"`
 
 	// RawResponsesOutputItems preserves exact OpenAI Responses output items when available.
 	// It is an internal helper field for exact replay reconstruction and is not part of API output.
@@ -1384,7 +1468,8 @@ type Choice struct {
 	// inbound can round-trip the value.
 	StopSequence *string `json:"stop_sequence,omitempty"`
 
-	Logprobs *LogprobsContent `json:"logprobs,omitempty"`
+	Logprobs            *LogprobsContent `json:"logprobs,omitempty"`
+	TransformerMetadata map[string]any   `json:"-"`
 
 	// Grounding carries search / retrieval metadata surfaced by providers
 	// that support grounded generation (Gemini googleSearch tool, future
@@ -1583,7 +1668,7 @@ func (u *Usage) HasAnthropicCacheSemantic() bool {
 	if u == nil {
 		return false
 	}
-	return u.CacheCreationInputTokens > 0 || u.CacheReadInputTokens > 0
+	return u.CacheCreationInputTokens > 0 || u.CacheCreation5mInputTokens > 0 || u.CacheCreation1hInputTokens > 0 || u.CacheReadInputTokens > 0
 }
 
 // BillableCacheReadInput returns the cache-read token count, preferring the
@@ -1641,7 +1726,11 @@ func (u *Usage) EffectiveInputTokens() int64 {
 	if u == nil {
 		return 0
 	}
-	return u.PromptTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
+	cacheWrite := u.CacheCreationInputTokens
+	if cacheWrite == 0 {
+		cacheWrite = u.CacheCreation5mInputTokens + u.CacheCreation1hInputTokens
+	}
+	return u.PromptTokens + u.CacheReadInputTokens + cacheWrite
 }
 
 // CompletionTokensDetails Breakdown of tokens used in a completion.
@@ -1723,10 +1812,13 @@ type ModalityTokenCount struct {
 // Tool represents a function tool.
 type Tool struct {
 	// Type is the type of the tool.
-	// Any of "function", "image_generation".
-	Type            string           `json:"type"`
-	Function        Function         `json:"function"`
-	ImageGeneration *ImageGeneration `json:"image_generation,omitempty"`
+	// Any of "function", "image_generation", "web_search", or provider-native types.
+	Type               string              `json:"type"`
+	Function           Function            `json:"function"`
+	ImageGeneration    *ImageGeneration    `json:"image_generation,omitempty"`
+	WebSearch          *WebSearch          `json:"-"`
+	Google             *GoogleTools        `json:"-"`
+	ResponseCustomTool *ResponseCustomTool `json:"-"`
 
 	// CacheControl is used for provider-specific cache control (e.g., Anthropic).
 	// This field is not serialized in JSON.
@@ -1783,16 +1875,19 @@ type toolJSONMarshaller Tool
 
 // Function represents a function definition.
 type Function struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitempty"`
-	Parameters  json.RawMessage `json:"parameters"`
-	Strict      *bool           `json:"strict,omitempty"`
+	Name                 string          `json:"name"`
+	Description          string          `json:"description,omitempty"`
+	Parameters           json.RawMessage `json:"parameters"`
+	ParametersJsonSchema json.RawMessage `json:"parametersJsonSchema,omitempty"`
+	Strict               *bool           `json:"strict,omitempty"`
 }
 
 // FunctionCall represents a function call (deprecated).
 type FunctionCall struct {
 	// The name of the function to call.
 	Name string `json:"name"`
+	// Namespace is used by OpenAI Responses namespace tools.
+	Namespace string `json:"namespace,omitempty"`
 
 	// The arguments to call the function with, as generated by the model in JSON
 	// format. Note that the model does not always generate valid JSON, and may
@@ -1808,7 +1903,8 @@ type ToolCall struct {
 	// The type of the tool. Currently, only `function` is supported.
 	Type string `json:"type,omitempty"`
 
-	Function FunctionCall `json:"function"`
+	Function               FunctionCall            `json:"function"`
+	ResponseCustomToolCall *ResponseCustomToolCall `json:"-"`
 
 	// Index is the index of the tool call in the list of tool calls.
 	// Cannot use omitempty, as an index of 0 would be omitted, which can break consumers.
@@ -1915,6 +2011,7 @@ func (t *ToolChoice) UnmarshalJSON(data []byte) error {
 // parameters. It mirrors the OpenRouter/OpenAI Responses API fields we care
 // about, but is intentionally loose to allow forward-compatibility.
 type ImageGeneration struct {
+	Model string `json:"model,omitempty"`
 	// One of opaque, transparent.
 	Background     string         `json:"background,omitempty"`
 	InputFidelity  string         `json:"input_fidelity,omitempty"`
@@ -1926,7 +2023,9 @@ type ImageGeneration struct {
 	// One of png, webp, or jpeg. Default: png.
 	OutputFormat string `json:"output_format,omitempty"`
 	// The number of images to generate. Default: 1.
-	PartialImages *int64 `json:"partial_images,omitempty"`
+	PartialImages  *int64 `json:"partial_images,omitempty"`
+	N              *int64 `json:"n,omitempty"`
+	ResponseFormat string `json:"response_format,omitempty"`
 	// The quality of the image that will be generated.
 	// auto (default value) will automatically select the best quality for the given model.
 	// high, medium and low are supported for gpt-image-1.
@@ -1934,11 +2033,56 @@ type ImageGeneration struct {
 	// standard is the only option for dall-e-2.
 	Quality string `json:"quality,omitempty"`
 	// One of 256x256, 512x512, or 1024x1024. Default: 1024x1024.
-	Size string `json:"size,omitempty"`
+	Size  string `json:"size,omitempty"`
+	Style string `json:"style,omitempty"`
 
 	// Whether to add a watermark to the generated image. Default: false.
 	// It only works for the models support watermark, it will be ignored otherwise.
 	Watermark bool `json:"watermark,omitempty"`
+}
+
+type WebSearch struct {
+	MaxUses        *int64                    `json:"max_uses,omitempty"`
+	Strict         *bool                     `json:"strict,omitempty"`
+	AllowedDomains []string                  `json:"allowed_domains,omitempty"`
+	BlockedDomains []string                  `json:"blocked_domains,omitempty"`
+	UserLocation   WebSearchToolUserLocation `json:"user_location,omitempty"`
+}
+
+type WebSearchToolUserLocation struct {
+	Type     string `json:"type,omitempty"`
+	City     string `json:"city,omitempty"`
+	Country  string `json:"country,omitempty"`
+	Region   string `json:"region,omitempty"`
+	Timezone string `json:"timezone,omitempty"`
+}
+
+type GoogleTools struct {
+	Search        *GoogleSearch        `json:"search,omitempty"`
+	CodeExecution *GoogleCodeExecution `json:"code_execution,omitempty"`
+	UrlContext    *GoogleUrlContext    `json:"url_context,omitempty"`
+}
+
+type GoogleSearch struct{}
+type GoogleCodeExecution struct{}
+type GoogleUrlContext struct{}
+
+type ResponseCustomTool struct {
+	Name        string                    `json:"name"`
+	Description string                    `json:"description,omitempty"`
+	Format      *ResponseCustomToolFormat `json:"format,omitempty"`
+}
+
+type ResponseCustomToolFormat struct {
+	Type       string `json:"type"`
+	Syntax     string `json:"syntax,omitempty"`
+	Definition string `json:"definition,omitempty"`
+}
+
+type ResponseCustomToolCall struct {
+	CallID string `json:"call_id"`
+	Name   string `json:"name"`
+	Input  string `json:"input"`
 }
 
 // EmbeddingInput represents the input for embedding requests.

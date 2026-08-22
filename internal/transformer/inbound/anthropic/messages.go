@@ -88,6 +88,11 @@ func (i *MessagesInbound) TransformRequest(ctx context.Context, body []byte) (*m
 			Container:  anthropicReq.Container,
 		})
 	}
+	if anthropicReq.CacheControl != nil {
+		chatReq.SetAnthropicExtensions(model.AnthropicExtension{
+			CacheControl: convertToLLMCacheControl(anthropicReq.CacheControl),
+		})
+	}
 
 	// Convert messages
 	messages := make([]model.Message, 0, len(anthropicReq.Messages))

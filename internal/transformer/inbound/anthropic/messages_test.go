@@ -306,6 +306,25 @@ func TestTransformRequestExtractsTopKAndServiceTier(t *testing.T) {
 	}
 }
 
+func TestTransformRequestPreservesTopLevelCacheControl(t *testing.T) {
+	inbound := &MessagesInbound{}
+	body := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"max_tokens":16,
+		"messages":[{"role":"user","content":"hello"}],
+		"cache_control":{"type":"ephemeral","ttl":"1h"}
+	}`)
+
+	req, err := inbound.TransformRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("TransformRequest: %v", err)
+	}
+	cacheControl := req.GetAnthropicExtensions().CacheControl
+	if cacheControl == nil || cacheControl.Type != "ephemeral" || cacheControl.TTL != "1h" {
+		t.Fatalf("expected top-level cache_control to survive inbound conversion, got %+v", cacheControl)
+	}
+}
+
 func TestTransformRequestPreservesUnknownCacheControlValues(t *testing.T) {
 	inbound := &MessagesInbound{}
 	body := []byte(`{

@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/http"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/bestruirui/octopus/internal/transformer/model"
 )
@@ -154,6 +157,95 @@ func TestConvertToResponsesRequestSanitizesRawReasoningInputSummary(t *testing.T
 	}
 	if reasoning["encrypted_content"] != "enc" {
 		t.Fatalf("expected encrypted_content to be preserved, got %#v", reasoning["encrypted_content"])
+	}
+}
+
+func TestTransformRequestOverlaysCompleteRawResponsesInput(t *testing.T) {
+	stream := false
+	req := &model.InternalLLMRequest{
+		Model:        "gpt-4o",
+		RawAPIFormat: model.APIFormatOpenAIResponse,
+		Stream:       &stream,
+		Messages: []model.Message{{
+			Role: "user",
+			Content: model.MessageContent{MultipleContent: []model.MessageContentPart{{
+				Type: "text",
+				Text: stringPtr("normalized projection"),
+			}}},
+		}},
+	}
+	req.SetOpenAIRawInputItems(json.RawMessage(`[
+		{"type":"input_file","file_id":"file_123","native_meta":{"keep":true}},
+		{"type":"input_audio","input_audio":{"format":"wav","data":"AAA="}}
+	]`))
+
+	httpReq, err := (&ResponseOutbound{}).TransformRequest(context.Background(), req, "https://api.openai.com/v1", "sk-test")
+	if err != nil {
+		t.Fatalf("TransformRequest: %v", err)
+	}
+	body, err := io.ReadAll(httpReq.Body)
+	if err != nil {
+		t.Fatalf("read request body: %v", err)
+	}
+
+	var payload struct {
+		Input []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal request body: %v; body=%s", err, body)
+	}
+	if len(payload.Input) != 2 {
+		t.Fatalf("expected exactly two raw input items without an empty generated message, got %#v", payload.Input)
+	}
+	if payload.Input[0]["type"] != "input_file" || payload.Input[0]["file_id"] != "file_123" {
+		t.Fatalf("expected top-level input_file to survive, got %#v", payload.Input[0])
+	}
+	if _, ok := payload.Input[0]["native_meta"]; !ok {
+		t.Fatalf("expected unknown input_file fields to survive, got %#v", payload.Input[0])
+	}
+	audio, ok := payload.Input[1]["input_audio"].(map[string]any)
+	if !ok || audio["format"] != "wav" || audio["data"] != "AAA=" {
+		t.Fatalf("expected nested input_audio to survive, got %#v", payload.Input[1])
+	}
+}
+
+func TestTransformRequestOverlaysRawMixedMessageInput(t *testing.T) {
+	req := &model.InternalLLMRequest{
+		Model:        "gpt-4o",
+		RawAPIFormat: model.APIFormatOpenAIResponse,
+		Messages:     []model.Message{{Role: "user", Content: model.MessageContent{Content: stringPtr("normalized")}}},
+	}
+	req.SetOpenAIRawInputItems(json.RawMessage(`[
+		{"type":"message","role":"user","content":[
+			{"type":"input_text","text":"hello"},
+			{"type":"input_file","file_url":"https://example.com/a.pdf"},
+			{"type":"input_audio","input_audio":{"format":"mp3","data":"BBB="}}
+		]}
+	]`))
+
+	httpReq, err := (&ResponseOutbound{}).TransformRequest(context.Background(), req, "https://api.openai.com/v1", "sk-test")
+	if err != nil {
+		t.Fatalf("TransformRequest: %v", err)
+	}
+	body, err := io.ReadAll(httpReq.Body)
+	if err != nil {
+		t.Fatalf("read request body: %v", err)
+	}
+	var payload struct {
+		Input []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal request body: %v; body=%s", err, body)
+	}
+	if len(payload.Input) != 1 {
+		t.Fatalf("expected one mixed message item, got %#v", payload.Input)
+	}
+	content, ok := payload.Input[0]["content"].([]any)
+	if !ok || len(content) != 3 {
+		t.Fatalf("expected text, file and audio in one raw message, got %#v", payload.Input[0]["content"])
+	}
+	if content[1].(map[string]any)["type"] != "input_file" || content[2].(map[string]any)["type"] != "input_audio" {
+		t.Fatalf("expected file/audio content ordering to survive, got %#v", content)
 	}
 }
 
@@ -423,6 +515,53 @@ func TestTransformStreamAggregatesFunctionCallIDAcrossEvents(t *testing.T) {
 	}
 }
 
+func TestTransformRequestUsesAxonResponsesStreamBridge(t *testing.T) {
+	stream := true
+	content := "hello"
+	outbound := &ResponseOutbound{}
+	request := &model.InternalLLMRequest{
+		Model: "gpt-5",
+		Messages: []model.Message{{
+			Role:    "user",
+			Content: model.MessageContent{Content: &content},
+		}},
+		Stream:       &stream,
+		RawAPIFormat: model.APIFormatOpenAIResponse,
+	}
+	if _, err := outbound.TransformRequest(context.Background(), request, "https://api.openai.com/v1", "sk-test"); err != nil {
+		t.Fatalf("TransformRequest: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	created := []byte(`{"type":"response.created","response":{"id":"resp_bridge","model":"gpt-5","created_at":1710000000,"status":"in_progress"}}`)
+	if chunk, err := outbound.TransformStream(ctx, created); err != nil || chunk == nil {
+		t.Fatalf("response.created: chunk=%#v err=%v", chunk, err)
+	}
+	delta := []byte(`{"type":"response.output_text.delta","item_id":"msg_1","delta":"hello"}`)
+	if chunk, err := outbound.TransformStream(ctx, delta); err != nil || chunk == nil {
+		t.Fatalf("response.output_text.delta: chunk=%#v err=%v", chunk, err)
+	}
+	completed := []byte(`{"type":"response.completed","response":{"id":"resp_bridge","model":"gpt-5","created_at":1710000000,"status":"completed","output":[{"type":"message","id":"msg_1","audio":{"id":"audio_1","transcript":"hello"}}],"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14}}}`)
+	chunk, err := outbound.TransformStream(ctx, completed)
+	if err != nil || chunk == nil {
+		t.Fatalf("response.completed: chunk=%#v err=%v", chunk, err)
+	}
+	if chunk.Usage == nil || chunk.Usage.TotalTokens != 14 {
+		t.Fatalf("expected terminal usage, got %#v", chunk.Usage)
+	}
+	if len(chunk.RawResponsesOutputItems) == 0 {
+		t.Fatalf("expected raw completed output items, got %#v", chunk)
+	}
+	if len(chunk.Choices) == 0 || chunk.Choices[0].Message == nil || chunk.Choices[0].Message.Audio == nil || chunk.Choices[0].Message.Audio.ID != "audio_1" {
+		t.Fatalf("expected generated audio metadata on terminal stream chunk, got %#v", chunk)
+	}
+	done, err := outbound.TransformStream(ctx, []byte(`[DONE]`))
+	if err != nil || done == nil || done.Object != "[DONE]" {
+		t.Fatalf("expected one terminal done chunk, got %#v err=%v", done, err)
+	}
+}
+
 func TestConvertToLLMResponseFromResponsesPreservesRawOutputItems(t *testing.T) {
 	resp := &ResponsesResponse{
 		ID:        "resp_123",
@@ -473,6 +612,153 @@ func TestConvertToLLMResponseFromResponsesPreservesRefusalContent(t *testing.T) 
 	}
 	if got := internalResp.Choices[0].Message.Refusal; got != refusal {
 		t.Fatalf("expected refusal %q, got %q", refusal, got)
+	}
+}
+
+func TestConvertToLLMResponseFromResponsesPreservesAxonHubOutputSemantics(t *testing.T) {
+	previous := "resp_previous"
+	annotationStart, annotationEnd := 0, 5
+	resp := &ResponsesResponse{
+		ID:                 "resp_semantics",
+		Object:             "response",
+		Model:              "gpt-5",
+		CreatedAt:          42,
+		PreviousResponseID: &previous,
+		Status:             stringPtr("completed"),
+		Output: []ResponsesItem{
+			{
+				ID:   "rs_1",
+				Type: "reasoning",
+				Summary: []ResponsesReasoningSummary{{
+					Type: "summary_text",
+					Text: "plan",
+				}},
+				EncryptedContent: stringPtr("enc_1"),
+			},
+			{
+				ID:               "rs_2",
+				Type:             "reasoning",
+				EncryptedContent: stringPtr("enc_2"),
+			},
+			{
+				Type:      "function_call",
+				CallID:    "call_fn",
+				Name:      "lookup",
+				Namespace: "docs",
+				Arguments: `{"q":"octopus"}`,
+			},
+			{
+				ID:     "call_custom_item",
+				Type:   "custom_tool_call",
+				CallID: "call_custom",
+				Name:   "apply_patch",
+				Input:  stringPtr("*** patch ***"),
+			},
+			{
+				ID:   "msg_1",
+				Type: "message",
+				Audio: &ResponsesOutputAudio{
+					ID: "audio_1", Data: "AAA=", ExpiresAt: 123, Transcript: "spoken",
+				},
+				Content: &ResponsesInput{Items: []ResponsesItem{
+					{
+						Type: "output_text", Text: stringPtr("hello"),
+						Annotations: []ResponsesAnnotation{{
+							Type: "url_citation", StartIndex: &annotationStart, EndIndex: &annotationEnd,
+							URL: stringPtr("https://example.com"), Title: stringPtr("Example"),
+						}},
+					},
+				}},
+			},
+			{
+				Type:             "compaction",
+				ID:               "cmp_1",
+				EncryptedContent: stringPtr("compact_blob"),
+				CreatedBy:        stringPtr("server"),
+			},
+			{
+				Type:   "function_call_output",
+				CallID: "call_custom",
+				Output: &ResponsesInput{Text: stringPtr("tool result")},
+			},
+		},
+	}
+
+	internalResp := convertToLLMResponseFromResponses(resp)
+	if internalResp.PreviousResponseID == nil || *internalResp.PreviousResponseID != previous {
+		t.Fatalf("expected previous_response_id to survive, got %#v", internalResp.PreviousResponseID)
+	}
+	message := internalResp.Choices[0].Message
+	if len(message.ReasoningItems) != 2 || message.ReasoningItems[0].Signature != "enc_1" || message.ReasoningItems[1].Signature != "enc_2" {
+		t.Fatalf("expected independent reasoning items/signatures, got %#v", message.ReasoningItems)
+	}
+	if len(message.ToolCalls) != 2 || message.ToolCalls[0].Function.Namespace != "docs" {
+		t.Fatalf("expected function namespace and custom tool call, got %#v", message.ToolCalls)
+	}
+	if message.ToolCalls[1].ResponseCustomToolCall == nil || message.ToolCalls[1].ResponseCustomToolCall.Input != "*** patch ***" {
+		t.Fatalf("expected custom tool input, got %#v", message.ToolCalls[1])
+	}
+	if len(message.Annotations) != 1 || message.Annotations[0].URLCitation == nil || message.Annotations[0].URLCitation.URL != "https://example.com" {
+		t.Fatalf("expected output annotation, got %#v", message.Annotations)
+	}
+	if message.Audio == nil || message.Audio.ID != "audio_1" || message.Audio.Transcript != "spoken" {
+		t.Fatalf("expected generated audio metadata, got %#v", message.Audio)
+	}
+	if len(message.InlineToolResults) != 1 || message.InlineToolResults[0].Output != "tool result" {
+		t.Fatalf("expected inline tool result, got %#v", message.InlineToolResults)
+	}
+	if len(message.Content.MultipleContent) != 2 || message.Content.MultipleContent[1].Type != "compaction" {
+		t.Fatalf("expected text followed by compaction content, got %#v", message.Content.MultipleContent)
+	}
+}
+
+func TestTransformResponseAxonHubBridgePreservesResponsesOutputSemantics(t *testing.T) {
+	body := `{
+		"id":"resp_bridge_response",
+		"object":"response",
+		"model":"gpt-5",
+		"created_at":42,
+		"previous_response_id":"resp_previous",
+		"status":"completed",
+		"output":[
+			{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"plan"}],"encrypted_content":"enc_1"},
+			{"id":"rs_2","type":"reasoning","summary":[],"encrypted_content":"enc_2"},
+			{"type":"function_call","call_id":"call_fn","name":"lookup","namespace":"docs","arguments":"{}"},
+			{"id":"custom_item","type":"custom_tool_call","call_id":"call_custom","name":"apply_patch","input":"patch"},
+			{"id":"message_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello","annotations":[{"type":"url_citation","start_index":0,"end_index":5,"url":"https://example.com","title":"Example"}]}],"audio":{"id":"audio_1","data":"AAA=","expires_at":123,"transcript":"spoken"}},
+			{"id":"cmp_1","type":"compaction","encrypted_content":"compact_blob","created_by":"server"}
+		]
+	}`
+
+	response, err := (&ResponseOutbound{}).TransformResponse(context.Background(), &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     make(http.Header),
+	})
+	if err != nil {
+		t.Fatalf("TransformResponse: %v", err)
+	}
+	if response.PreviousResponseID == nil || *response.PreviousResponseID != "resp_previous" {
+		t.Fatalf("expected previous_response_id, got %#v", response.PreviousResponseID)
+	}
+	if len(response.Choices) != 1 || response.Choices[0].Message == nil {
+		t.Fatalf("expected one assistant choice, got %#v", response.Choices)
+	}
+	message := response.Choices[0].Message
+	if len(message.ReasoningItems) != 2 {
+		t.Fatalf("expected two reasoning items, got %#v", message.ReasoningItems)
+	}
+	if len(message.ToolCalls) != 2 || message.ToolCalls[0].Function.Namespace != "docs" || message.ToolCalls[1].ResponseCustomToolCall == nil {
+		t.Fatalf("expected namespaced and custom tool calls, got %#v", message.ToolCalls)
+	}
+	if len(message.Annotations) != 1 || message.Annotations[0].URLCitation == nil {
+		t.Fatalf("expected annotations, got %#v", message.Annotations)
+	}
+	if message.Audio == nil || message.Audio.ID != "audio_1" {
+		t.Fatalf("expected generated audio metadata, got %#v", message.Audio)
+	}
+	if len(message.Content.MultipleContent) != 2 || message.Content.MultipleContent[1].Type != "compaction" {
+		t.Fatalf("expected compaction content, got %#v", message.Content.MultipleContent)
 	}
 }
 
@@ -549,6 +835,36 @@ func TestTransformRequestRawRewritesModel(t *testing.T) {
 	tool, ok := tools[0].(map[string]any)
 	if !ok || tool["type"] != "apply_patch" {
 		t.Fatalf("expected raw apply_patch tool to be preserved, got %#v", tools[0])
+	}
+}
+
+func TestTransformRequestUsesRawResponsesLiteHeader(t *testing.T) {
+	outbound := &ResponseOutbound{}
+	content := "hello"
+	req := &model.InternalLLMRequest{
+		Model: "gpt-5",
+		Messages: []model.Message{{
+			Role:    "user",
+			Content: model.MessageContent{Content: &content},
+		}},
+		RawAPIFormat: model.APIFormatOpenAIResponse,
+		RawHeaders:   http.Header{"X-Openai-Internal-Codex-Responses-Lite": []string{"true"}},
+	}
+	httpReq, err := outbound.TransformRequest(context.Background(), req, "https://api.openai.com/v1", "sk-test")
+	if err != nil {
+		t.Fatalf("TransformRequest: %v", err)
+	}
+	body, err := io.ReadAll(httpReq.Body)
+	if err != nil {
+		t.Fatalf("read request body: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal request body: %v", err)
+	}
+	parallel, ok := payload["parallel_tool_calls"].(bool)
+	if !ok || parallel {
+		t.Fatalf("expected Responses Lite to force parallel_tool_calls=false, got %#v", payload["parallel_tool_calls"])
 	}
 }
 

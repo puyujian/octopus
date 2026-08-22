@@ -253,6 +253,9 @@ func cloneInternalRequest(req *transformerModel.InternalLLMRequest) *transformer
 	cloned.ProviderExtensions = transformerModel.CloneProviderExtensions(req.ProviderExtensions)
 	cloned.Query = cloneQuery(req.Query)
 	cloned.RawRequest = append([]byte(nil), req.RawRequest...)
+	cloned.RawHeaders = req.RawHeaders.Clone()
+	cloned.RawPath = req.RawPath
+	cloned.RawHTTPRequest = req.RawHTTPRequest
 	cloned.ExtraBody = append([]byte(nil), req.ExtraBody...)
 	cloned.Prompt = append([]byte(nil), req.Prompt...)
 	cloned.Conversation = append([]byte(nil), req.Conversation...)

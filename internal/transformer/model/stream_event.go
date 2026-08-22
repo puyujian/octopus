@@ -146,6 +146,30 @@ func StreamEventsFromInternalResponse(response *InternalLLMResponse) []StreamEve
 	return events
 }
 
+// SuppressRepeatedMessageStarts removes role-only message-start projections
+// emitted by provider transformers on every content delta. The unified
+// response model carries a role on each AxonHub delta for compatibility, but
+// protocol event consumers expect message_start only once per stream/candidate.
+func SuppressRepeatedMessageStarts(events []StreamEvent, started map[int]bool) []StreamEvent {
+	if len(events) == 0 {
+		return events
+	}
+	if started == nil {
+		started = map[int]bool{}
+	}
+	out := make([]StreamEvent, 0, len(events))
+	for _, event := range events {
+		if event.Kind == StreamEventKindMessageStart {
+			if started[event.Index] {
+				continue
+			}
+			started[event.Index] = true
+		}
+		out = append(out, event)
+	}
+	return out
+}
+
 func InternalResponseFromStreamEvents(events []StreamEvent) *InternalLLMResponse {
 	if len(events) == 0 {
 		return nil

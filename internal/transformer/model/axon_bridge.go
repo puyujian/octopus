@@ -199,7 +199,16 @@ func (b *AxonStreamBridge) Feed(ctx context.Context, data []byte) (*InternalLLMR
 	seq, err := b.feeder.Feed(ctx, data, eventType)
 	if err != nil {
 		if errors.Is(err, io.ErrClosedPipe) {
-			return nil, fmt.Errorf("AxonHub stream is closed")
+			// The feeder was closed by a previous terminal event (error,
+			// response.completed, [DONE], etc.).  The transformer goroutine
+			// has already exited and any error response has been delivered
+			// via the earlier Feed() call.  Surface the error response if
+			// available; otherwise return nil so the relay processor skips
+			// the trailing event instead of failing the request.
+			if response := b.streamErrorResponse(); response != nil {
+				return response, nil
+			}
+			return nil, nil
 		}
 		return nil, err
 	}

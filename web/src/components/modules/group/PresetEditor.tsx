@@ -110,7 +110,7 @@ export function PresetEditorContent({ preset }: PresetEditorContentProps) {
             </MorphingDialogTitle>
             <MorphingDialogDescription
                 disableLayoutAnimation
-                className="flex-1 min-h-0 overflow-hidden"
+                className="flex-1 min-h-0 overflow-hidden flex flex-col"
             >
                 <GroupEditor
                     key={`preset-${preset.id}`}

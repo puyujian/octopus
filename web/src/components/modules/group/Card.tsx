@@ -10,6 +10,7 @@ import { cn } from '@/lib/utils';
 import { toast } from '@/components/common/Toast';
 import { CopyIconButton } from '@/components/common/CopyButton';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/animate-ui/components/animate/tooltip';
+import { useIsMobile } from '@/hooks/use-mobile';
 import type { SelectedMember } from './ItemList';
 import { MemberList } from './ItemList';
 import { GroupEditor, type GroupEditorValues } from './Editor';
@@ -48,7 +49,7 @@ function EditDialogContent({ group, displayMembers, isSubmitting, onSubmit }: Ed
                     <MorphingDialogClose className="relative right-0 top-0" />
                 </header>
             </MorphingDialogTitle>
-            <MorphingDialogDescription className="flex-1 min-h-0 overflow-hidden">
+            <MorphingDialogDescription className="flex-1 min-h-0 overflow-hidden flex flex-col">
                 <GroupEditor
                     key={`edit-group-${group.id}`}
                     initial={{
@@ -74,6 +75,7 @@ function EditDialogContent({ group, displayMembers, isSubmitting, onSubmit }: Ed
 
 export function GroupCard({ group }: { group: Group }) {
     const t = useTranslations('group');
+    const isMobile = useIsMobile();
     const updateGroup = useUpdateGroup();
     const deleteGroup = useDeleteGroup();
     const togglePin = useToggleGroupPin();
@@ -324,7 +326,7 @@ export function GroupCard({ group }: { group: Group }) {
                         </MorphingDialogTrigger>
 
                         <MorphingDialogContainer>
-                            <MorphingDialogContent className="relative w-screen max-w-full md:max-w-4xl bg-card text-card-foreground px-6 py-4 rounded-3xl h-[calc(100vh-2rem)] flex flex-col overflow-hidden">
+                            <MorphingDialogContent className="relative w-screen max-w-full md:max-w-4xl bg-card text-card-foreground px-4 py-3 sm:px-6 sm:py-4 rounded-2xl sm:rounded-3xl h-[calc(100dvh-1rem)] sm:h-[calc(100vh-2rem)] flex flex-col overflow-hidden">
                                 <EditDialogContent
                                     group={group}
                                     displayMembers={displayMembers}
@@ -375,6 +377,7 @@ export function GroupCard({ group }: { group: Group }) {
                     autoScrollOnAdd={false}
                     showWeight={group.mode === GroupMode.Weighted}
                     layoutScope={`card-${group.id ?? 'unknown'}`}
+                    enableDnd={!isMobile}
                 />
             </section>
 
@@ -415,7 +418,7 @@ export function GroupCard({ group }: { group: Group }) {
                     <Tooltip side="top" sideOffset={6} align="center">
                         <TooltipTrigger asChild>
                             <motion.button
-                                layoutId={`delete-btn-group-${group.id}`}
+                                layoutId={isMobile ? undefined : `delete-btn-group-${group.id}`}
                                 type="button"
                                 onClick={() => setConfirmDelete(true)}
                                 className="p-1.5 rounded-lg hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors"
@@ -431,7 +434,7 @@ export function GroupCard({ group }: { group: Group }) {
             <AnimatePresence>
                 {confirmDelete && (
                     <motion.div
-                        layoutId={`delete-btn-group-${group.id}`}
+                        layoutId={isMobile ? undefined : `delete-btn-group-${group.id}`}
                         className="absolute left-3 bottom-3 z-10 flex items-center gap-2 bg-destructive p-2 rounded-xl shadow-md"
                         transition={{ type: 'spring', stiffness: 400, damping: 30 }}
                     >

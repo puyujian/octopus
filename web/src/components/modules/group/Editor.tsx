@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useMemo, useState, type FormEvent } from 'react';
-import { Check, ChevronDownIcon, Plus, Search, Sparkles, Trash2 } from 'lucide-react';
+import { Check, ChevronDownIcon, Plus, Search, Sparkles, Trash2, List } from 'lucide-react';
 import { useTranslations } from 'next-intl';
 import * as AccordionPrimitive from '@radix-ui/react-accordion';
 import { useModelChannelList, type LLMChannel } from '@/api/endpoints/model';
@@ -47,6 +47,7 @@ function ModelPickerSection({
 }) {
     const t = useTranslations('group');
     const [searchKeyword, setSearchKeyword] = useState('');
+    const [openChannels, setOpenChannels] = useState<string[]>([]);
 
     const selectedKeys = useMemo(() => new Set(selectedMembers.map(memberKey)), [selectedMembers]);
     const normalizedSearch = searchKeyword.trim().toLowerCase();
@@ -78,24 +79,26 @@ function ModelPickerSection({
         }, []);
     }, [channels, normalizedSearch]);
 
+    const hasSearch = normalizedSearch.length > 0;
+
     const modelSourceLabel = (model: LLMChannel) => [model.site_name, model.site_account_name, model.site_group_name]
         .map((value) => value?.trim())
         .filter(Boolean)
         .join(' / ');
 
     return (
-        <div className="rounded-xl border border-border/50 bg-muted/30 flex flex-col min-h-0">
-            <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2 px-3 py-2 border-b border-border/30 bg-muted/50">
-                <span className="min-w-0 justify-self-start text-sm font-medium text-foreground">
+        <div className="rounded-xl border border-border/50 bg-muted/30 flex flex-col min-h-0 flex-1 overflow-hidden">
+            <div className="flex items-center gap-2 px-3 py-2 border-b border-border/30 bg-muted/50">
+                <span className="min-w-0 shrink-0 text-sm font-medium text-foreground">
                     {t('form.addItem')}
                 </span>
 
-                <div className="relative justify-self-center w-30">
-                    <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                <div className="relative flex-1 min-w-[120px]">
+                    <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
                     <Input
                         value={searchKeyword}
                         onChange={(event) => setSearchKeyword(event.target.value)}
-                        className="h-6 rounded-lg border-border/60 bg-background/70 pl-7 pr-2 text-xs shadow-none focus-visible:border-border/60 focus-visible:ring-0"
+                        className="h-7 rounded-lg border-border/60 bg-background/70 pl-8 pr-2 text-xs shadow-none focus-visible:border-border/60 focus-visible:ring-0"
                         aria-label="search"
                     />
                 </div>
@@ -104,7 +107,7 @@ function ModelPickerSection({
                     type="button"
                     onClick={onAutoAdd}
                     className={cn(
-                        'justify-self-end shrink-0 flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium transition-colors',
+                        'shrink-0 flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs font-medium transition-colors',
                         autoAddDisabled
                             ? 'text-muted-foreground/50 cursor-not-allowed'
                             : 'hover:bg-muted text-muted-foreground hover:text-foreground'
@@ -117,8 +120,13 @@ function ModelPickerSection({
                 </button>
             </div>
 
-            <div className="flex-1 min-h-0 overflow-y-auto p-2">
-                <Accordion type="multiple" className="w-full space-y-2">
+            <div className="flex-1 min-h-0 overflow-y-auto p-2 overscroll-contain">
+                <Accordion
+                    type="multiple"
+                    className="w-full space-y-2"
+                    value={hasSearch ? filteredChannels.map((c) => `channel-${c.id}`) : openChannels}
+                    onValueChange={(v) => hasSearch ? undefined : setOpenChannels(v)}
+                >
                     {filteredChannels.map((channel) => {
                         const total = channel.models.length;
                         const selectedCount = channel.models.reduce(
@@ -126,9 +134,11 @@ function ModelPickerSection({
                             0
                         );
                         const available = total - selectedCount;
+                        const channelValue = `channel-${channel.id}`;
+                        const isOpen = hasSearch || openChannels.includes(channelValue);
 
                         return (
-                            <AccordionItem key={channel.id} value={`channel-${channel.id}`}>
+                            <AccordionItem key={channel.id} value={channelValue}>
                                 <AccordionPrimitive.Header className="rounded-lg bg-muted sticky top-0 z-10 flex px-2 overflow-hidden">
                                     <AccordionPrimitive.Trigger className="flex flex-1 min-w-0 items-center gap-4 py-4 text-left text-sm transition-all outline-none focus-visible:ring-[3px] disabled:pointer-events-none disabled:opacity-50 [&[data-state=open]>svg]:rotate-180">
                                         <span className="truncate">{channel.name}</span>
@@ -139,6 +149,7 @@ function ModelPickerSection({
                                     </AccordionPrimitive.Trigger>
                                 </AccordionPrimitive.Header>
                                 <AccordionContent className="px-2 pt-2">
+                                    {isOpen && (
                                     <div className="flex flex-col gap-1.5">
                                         {channel.models.map((m) => {
                                             const isSelected = selectedKeys.has(memberKey(m));
@@ -178,6 +189,7 @@ function ModelPickerSection({
                                             );
                                         })}
                                     </div>
+                                    )}
                                 </AccordionContent>
                             </AccordionItem>
                         );
@@ -208,7 +220,7 @@ function SortSection({
     const t = useTranslations('group');
 
     return (
-        <div className="rounded-xl border border-border/50 bg-muted/30 flex flex-col min-h-0">
+        <div className="rounded-xl border border-border/50 bg-muted/30 flex flex-col min-h-0 flex-1 overflow-hidden">
             <div className="flex items-center justify-between px-3 py-2 border-b border-border/30 bg-muted/50">
                 <span className="text-sm font-medium text-foreground">
                     {t('form.items')}
@@ -279,6 +291,7 @@ export function GroupEditor({
     const [maxRetries, setMaxRetries] = useState<number>(initial?.max_retries ?? 3);
     const [selectedMembers, setSelectedMembers] = useState<SelectedMember[]>(initial?.members ?? []);
     const [removingIds, setRemovingIds] = useState<Set<string>>(new Set());
+    const [mobileTab, setMobileTab] = useState<string>('picker');
 
     const groupKey = normalizeKey(groupName);
     const regexKey = matchRegex.trim();
@@ -314,6 +327,11 @@ export function GroupEditor({
             return [...prev, { ...channel, id: key, weight: 1 }];
         });
     }, []);
+
+    const handleAddMemberMobile = useCallback((channel: LLMChannel) => {
+        handleAddMember(channel);
+        setMobileTab('sort');
+    }, [handleAddMember]);
 
     const autoAddDisabled = useMemo(() => {
         if ((!regexKey && !groupKey) || regexError || matchedModelChannels.length === 0) return true;
@@ -371,7 +389,7 @@ export function GroupEditor({
         <form onSubmit={handleSubmit} className="flex flex-col h-full min-h-0 ">
             <div className="flex-1 min-h-0 overflow-hidden px-1">
                 <FieldGroup className="gap-4 flex flex-col min-h-0 h-full">
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                    <div className="grid grid-cols-2 md:grid-cols-2 lg:grid-cols-4 gap-4">
                         <Field>
                             <FieldLabel htmlFor="group-name">{nameLabel ?? t('form.name')}</FieldLabel>
                             <Input
@@ -467,15 +485,15 @@ export function GroupEditor({
                     </div>
 
                     {/* Mode + Retry Toggle */}
-                    <div className="flex items-center gap-2">
-                        <div className="flex gap-1 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                        <div className="flex gap-1 flex-1 min-w-[200px]">
                             {([1, 2, 3, 4] as const).map((m) => (
                                 <button
                                     key={m}
                                     type="button"
                                     onClick={() => setMode(m)}
                                     className={cn(
-                                        'flex-1 py-1 text-xs rounded-lg transition-colors',
+                                        'flex-1 py-1.5 text-xs rounded-lg transition-colors',
                                         mode === m ? 'bg-primary text-primary-foreground' : 'bg-muted hover:bg-muted/80'
                                     )}
                                 >
@@ -530,7 +548,62 @@ export function GroupEditor({
                     </div>
 
                     <div className="flex-1 min-h-0">
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 h-full min-h-0">
+                        {/* Mobile: Tab switch */}
+                        <div className="flex h-full min-h-0 flex-col md:hidden">
+                            <div className="flex p-1 bg-muted rounded-xl mb-2 shrink-0 gap-1">
+                                <button
+                                    type="button"
+                                    onClick={() => setMobileTab('picker')}
+                                    className={cn(
+                                        'flex-1 flex items-center justify-center gap-1.5 py-1.5 text-xs rounded-lg transition-colors',
+                                        mobileTab === 'picker' ? 'bg-background shadow-sm font-medium' : 'text-muted-foreground'
+                                    )}
+                                >
+                                    <Plus className="size-3.5" />
+                                    {t('form.addItem')}
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => setMobileTab('sort')}
+                                    className={cn(
+                                        'flex-1 flex items-center justify-center gap-1.5 py-1.5 text-xs rounded-lg transition-colors',
+                                        mobileTab === 'sort' ? 'bg-background shadow-sm font-medium' : 'text-muted-foreground'
+                                    )}
+                                >
+                                    <List className="size-3.5" />
+                                    {t('form.items')}
+                                    {selectedMembers.length > 0 && (
+                                        <span className="ml-0.5 px-1.5 py-0.5 rounded-full bg-primary/10 text-primary text-[10px] font-semibold">
+                                            {selectedMembers.length}
+                                        </span>
+                                    )}
+                                </button>
+                            </div>
+                            <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+                                {mobileTab === 'picker' ? (
+                                    <ModelPickerSection
+                                        modelChannels={modelChannels}
+                                        selectedMembers={selectedMembers}
+                                        onAdd={handleAddMemberMobile}
+                                        onAutoAdd={handleAutoAdd}
+                                        autoAddDisabled={autoAddDisabled}
+                                    />
+                                ) : (
+                                    <SortSection
+                                        members={selectedMembers}
+                                        onReorder={setSelectedMembers}
+                                        onRemove={handleRemoveMember}
+                                        onWeightChange={handleWeightChange}
+                                        removingIds={removingIds}
+                                        showWeight={mode === 4}
+                                        onClear={handleClearMembers}
+                                    />
+                                )}
+                            </div>
+                        </div>
+
+                        {/* Desktop: side-by-side */}
+                        <div className="hidden md:grid md:grid-cols-2 gap-4 h-full min-h-0">
                             <ModelPickerSection
                                 modelChannels={modelChannels}
                                 selectedMembers={selectedMembers}

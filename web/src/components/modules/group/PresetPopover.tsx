@@ -318,7 +318,7 @@ export function PresetPopover({ group }: PresetPopoverProps) {
                                                     onOpened={() => setPendingEditId(null)}
                                                 />
                                                 <MorphingDialogContainer>
-                                                    <MorphingDialogContent className="relative w-screen max-w-full md:max-w-4xl bg-card text-card-foreground px-6 py-4 rounded-3xl h-[calc(100vh-2rem)] flex flex-col overflow-hidden">
+                                                    <MorphingDialogContent className="relative w-screen max-w-full md:max-w-4xl bg-card text-card-foreground px-4 py-3 sm:px-6 sm:py-4 rounded-2xl sm:rounded-3xl h-[calc(100dvh-1rem)] sm:h-[calc(100vh-2rem)] flex flex-col overflow-hidden">
                                                         <PresetEditorContent preset={preset} />
                                                     </MorphingDialogContent>
                                                 </MorphingDialogContainer>

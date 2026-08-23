@@ -9,7 +9,7 @@ import {
     type DraggableProvided,
     type DropResult,
 } from '@hello-pangea/dnd';
-import { motion, AnimatePresence } from 'motion/react';
+import { AnimatePresence } from 'motion/react';
 import { cn } from '@/lib/utils';
 import { getModelIcon } from '@/lib/model-icons';
 import type { LLMChannel } from '@/api/endpoints/model';
@@ -44,7 +44,6 @@ function MemberItem({
     index,
     showWeight = false,
     showConfirmDelete = true,
-    layoutScope,
     dnd,
 }: {
     member: SelectedMember;
@@ -54,8 +53,7 @@ function MemberItem({
     index: number;
     showWeight?: boolean;
     showConfirmDelete?: boolean;
-    layoutScope?: string;
-    dnd: MemberItemDnd;
+    dnd: MemberItemDnd | null;
 }) {
     const { Avatar: ModelAvatar } = getModelIcon(member.name);
     const [confirmDelete, setConfirmDelete] = useState(false);
@@ -67,20 +65,13 @@ function MemberItem({
 
     return (
         <div
-            // DnD libraries provide imperative refs/props; the hook lint rule (`react-hooks/refs`)
-            // flags this pattern, but it's safe and required for correct drag behavior.
-            // eslint-disable-next-line react-hooks/refs
-            ref={dnd.innerRef}
-            // eslint-disable-next-line react-hooks/refs
-            {...dnd.draggableProps}
+            ref={dnd?.innerRef}
+            {...(dnd?.draggableProps ?? {})}
             className={cn('rounded-lg grid transition-[grid-template-rows] duration-200', isRemoving ? 'grid-rows-[0fr]' : 'grid-rows-[1fr]')}
-            // eslint-disable-next-line react-hooks/refs
-            style={{
-                /* eslint-disable-next-line react-hooks/refs */
+            style={dnd ? {
                 ...(dnd.draggableProps?.style ?? {}),
-                /* eslint-disable-next-line react-hooks/refs */
                 ...(dnd.isDragging ? { zIndex: 50, boxShadow: '0 8px 32px rgba(0,0,0,0.15)' } : null),
-            }}
+            } : undefined}
         >
             <div className={cn(
                 'flex items-center gap-2 rounded-lg bg-background border border-border/50 px-2.5 py-2 select-none transition-opacity duration-200 relative overflow-hidden',
@@ -94,6 +85,7 @@ function MemberItem({
                     {index + 1}
                 </span>
 
+                {dnd && (
                 <div
                     className={cn(
                         'p-0.5 rounded touch-none transition-colors',
@@ -101,11 +93,11 @@ function MemberItem({
                             ? 'cursor-grab active:cursor-grabbing hover:bg-muted/60'
                             : 'cursor-grab active:cursor-grabbing hover:bg-muted'
                     )}
-                    // eslint-disable-next-line react-hooks/refs
                     {...dnd.dragHandleProps}
                 >
                     <GripVertical className="size-3.5 text-muted-foreground" />
                 </div>
+                )}
 
                 <span className={cn(isDisabled && 'opacity-70')}>
                     <ModelAvatar size={18} />
@@ -138,26 +130,19 @@ function MemberItem({
                 )}
 
                 {(!showConfirmDelete || !confirmDelete) && (
-                    <motion.button
-                        layoutId={`delete-btn-member-${layoutScope ?? 'default'}-${member.id}`}
+                    <button
                         type="button"
                         onClick={() => showConfirmDelete ? setConfirmDelete(true) : onRemove(member.id)}
                         className="p-1 rounded hover:bg-destructive/10 hover:text-destructive transition-colors"
-                        initial={false}
-                        animate={{ opacity: 1, x: 0 }}
-                        transition={{ duration: 0.15 }}
-                        style={{ pointerEvents: 'auto' }}
                     >
                         <X className="size-3" />
-                    </motion.button>
+                    </button>
                 )}
 
                 <AnimatePresence>
                     {showConfirmDelete && confirmDelete && (
-                        <motion.div
-                            layoutId={`delete-btn-member-${layoutScope ?? 'default'}-${member.id}`}
+                        <div
                             className="absolute inset-0 flex items-center justify-center gap-2 bg-destructive p-1.5 rounded-lg"
-                            transition={{ type: 'spring', stiffness: 400, damping: 30 }}
                         >
                             <button
                                 type="button"
@@ -173,7 +158,7 @@ function MemberItem({
                             >
                                 <Trash2 className="h-3 w-3" />
                             </button>
-                        </motion.div>
+                        </div>
                     )}
                 </AnimatePresence>
             </div>
@@ -211,6 +196,12 @@ export interface MemberListProps {
      */
     showConfirmDelete?: boolean;
     layoutScope?: string;
+    /**
+     * When false, renders a plain list without DragDropContext.
+     * Useful for read-only or mobile views where DnD overhead hurts scroll performance.
+     * Defaults to true.
+     */
+    enableDnd?: boolean;
 }
 
 export function MemberList({
@@ -226,6 +217,7 @@ export function MemberList({
     showWeight = false,
     showConfirmDelete = true,
     layoutScope: externalLayoutScope,
+    enableDnd = true,
 }: MemberListProps) {
     const internalLayoutScope = useId();
     const layoutScope = externalLayoutScope ?? internalLayoutScope;
@@ -281,6 +273,24 @@ export function MemberList({
         }
     };
 
+    const StaticList = () => (
+        <div className="p-2 flex flex-col space-y-1.5">
+            {members.map((member, index) => (
+                <MemberItem
+                    key={member.id}
+                    member={member}
+                    onRemove={onRemove}
+                    onWeightChange={onWeightChange}
+                    isRemoving={removingIds.has(member.id)}
+                    index={index}
+                    showWeight={showWeight}
+                    showConfirmDelete={showConfirmDelete}
+                    dnd={null}
+                />
+            ))}
+        </div>
+    );
+
     return (
         <div className="relative h-full min-h-0">
             <div
@@ -296,11 +306,13 @@ export function MemberList({
 
             <div
                 className={cn(
-                    'h-full overflow-y-auto transition-opacity duration-200',
+                    'h-full overflow-y-auto overscroll-contain transition-opacity duration-200',
                     isEmpty ? 'opacity-0' : 'opacity-100'
                 )}
                 ref={scrollContainerRef}
+                style={{ WebkitOverflowScrolling: 'touch' }}
             >
+                {enableDnd ? (
                 <DragDropContext
                     onDragStart={() => onDragStart?.()}
                     onDragEnd={handleDragEnd}
@@ -328,7 +340,6 @@ export function MemberList({
                                                 index={index}
                                                 showWeight={showWeight}
                                                 showConfirmDelete={showConfirmDelete}
-                                                layoutScope={layoutScope}
                                                 dnd={{
                                                     innerRef: draggableProvided.innerRef,
                                                     draggableProps: draggableProvided.draggableProps,
@@ -344,6 +355,9 @@ export function MemberList({
                         )}
                     </Droppable>
                 </DragDropContext>
+                ) : (
+                    <StaticList />
+                )}
             </div>
         </div>
     );

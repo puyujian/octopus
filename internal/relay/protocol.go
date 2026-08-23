@@ -111,10 +111,6 @@ func inspectOpenAIResponseEvent(data []byte) error {
 		return fmt.Errorf("%w: %s", errUpstreamStreamError, msg)
 	}
 
-	if probe.Response != nil && probe.Response.Status != "" && probe.Response.Status != "completed" {
-		return fmt.Errorf("%w: response status %s", errUpstreamStreamError, probe.Response.Status)
-	}
-
 	return nil
 }
 

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,6 +35,157 @@ func setupGroupHealthTestDB(t *testing.T) context.Context {
 	})
 
 	return context.Background()
+}
+
+func TestExcludeAndRecoverFailedGroupItem(t *testing.T) {
+	ctx := setupGroupHealthTestDB(t)
+	var healthy atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !healthy.Load() {
+			http.Error(w, `{"error":"down"}`, http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","status":"completed"}`))
+	}))
+	defer server.Close()
+
+	channel := &model.Channel{Name: "recoverable", Type: outbound.OutboundTypeOpenAIResponse, Enabled: true, BaseUrls: []model.BaseUrl{{URL: server.URL + "/v1"}}, Model: "probe-model", Keys: []model.ChannelKey{{Enabled: true, ChannelKey: "sk-test"}}}
+	if err := op.ChannelCreate(channel, ctx); err != nil {
+		t.Fatal(err)
+	}
+	group := &model.Group{Name: "recoverable-group", Mode: model.GroupModeFailover}
+	if err := op.GroupCreate(group, ctx); err != nil {
+		t.Fatal(err)
+	}
+	item := &model.GroupItem{GroupID: group.ID, ChannelID: channel.ID, ModelName: "probe-model"}
+	if err := op.GroupItemAdd(item, ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	service := NewService(op.NewGroupHealthRepository(), &Prober{CandidateTimeout: 2 * time.Second})
+	if err := service.RunGroupHealth(ctx, group.ID); err != nil {
+		t.Fatal(err)
+	}
+	view, err := service.GetGroupHealthViewByID(ctx, group.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptID := view.Latest.Attempts[0].ID
+	if _, err := service.ExcludeLatestFailures(ctx, group.ID, false); err == nil {
+		t.Fatal("expected batch last-active-item conflict")
+	}
+	view, err = service.ExcludeLatestFailures(ctx, group.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.ActiveItemCount != 0 || len(view.ExcludedItems) != 1 || view.Latest.Attempts[0].MembershipState != model.GroupHealthMembershipStateExcluded {
+		t.Fatalf("unexpected excluded view: %#v", view)
+	}
+	if repeated, repeatErr := service.ExcludeAttempt(ctx, group.ID, attemptID, true); repeatErr != nil || repeated.ActiveItemCount != 0 || len(repeated.ExcludedItems) != 1 {
+		t.Fatalf("repeated exclusion was not idempotent: view=%#v err=%v", repeated, repeatErr)
+	}
+	routed, err := op.GroupGetEnabledMap(group.Name, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routed.Items) != 0 {
+		t.Fatalf("excluded item remained routable: %#v", routed.Items)
+	}
+
+	failedRecovery, err := service.RestoreItem(ctx, group.ID, item.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failedRecovery.Restored || failedRecovery.Probe.Success {
+		t.Fatalf("failed probe restored item: %#v", failedRecovery)
+	}
+	healthy.Store(true)
+	recovered, err := service.RestoreItem(ctx, group.ID, item.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovered.Restored || !recovered.Probe.Success || recovered.ActiveItemCount != 1 {
+		t.Fatalf("unexpected recovery: %#v", recovered)
+	}
+	if _, err := service.ExcludeAttempt(ctx, group.ID, attemptID, true); err != nil {
+		t.Fatalf("exclude before force restore: %v", err)
+	}
+	forced, err := service.RestoreItem(ctx, group.ID, item.ID, true)
+	if err != nil || !forced.Restored || forced.ActiveItemCount != 1 {
+		t.Fatalf("unexpected force restore: result=%#v err=%v", forced, err)
+	}
+}
+
+func TestBatchExcludeFailuresAndRestoreOnlyHealthyItems(t *testing.T) {
+	ctx := setupGroupHealthTestDB(t)
+	var firstHealthy atomic.Bool
+	newServer := func(healthy func() bool) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !healthy() {
+				http.Error(w, `{"error":"down"}`, http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","status":"completed"}`))
+		}))
+	}
+	firstServer := newServer(firstHealthy.Load)
+	defer firstServer.Close()
+	secondServer := newServer(func() bool { return false })
+	defer secondServer.Close()
+	healthyServer := newServer(func() bool { return true })
+	defer healthyServer.Close()
+
+	createChannel := func(name, baseURL string) *model.Channel {
+		channel := &model.Channel{Name: name, Type: outbound.OutboundTypeOpenAIResponse, Enabled: true, BaseUrls: []model.BaseUrl{{URL: baseURL + "/v1"}}, Model: "batch-model", Keys: []model.ChannelKey{{Enabled: true, ChannelKey: "sk-test"}}}
+		if err := op.ChannelCreate(channel, ctx); err != nil {
+			t.Fatalf("ChannelCreate %s: %v", name, err)
+		}
+		return channel
+	}
+	channels := []*model.Channel{
+		createChannel("batch-failed-first", firstServer.URL),
+		createChannel("batch-failed-second", secondServer.URL),
+		createChannel("batch-healthy", healthyServer.URL),
+	}
+	group := &model.Group{Name: "batch-recovery-group", Mode: model.GroupModeFailover}
+	if err := op.GroupCreate(group, ctx); err != nil {
+		t.Fatal(err)
+	}
+	for index, channel := range channels {
+		if err := op.GroupItemAdd(&model.GroupItem{GroupID: group.ID, ChannelID: channel.ID, ModelName: "batch-model", Priority: index + 1, Weight: 1}, ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	service := NewService(op.NewGroupHealthRepository(), &Prober{CandidateTimeout: 2 * time.Second})
+	if err := service.RunGroupHealth(ctx, group.ID, model.GroupHealthProbeModeFull); err != nil {
+		t.Fatal(err)
+	}
+	view, err := service.ExcludeLatestFailures(ctx, group.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.ActiveItemCount != 1 || len(view.ExcludedItems) != 2 {
+		t.Fatalf("expected 2 failed items excluded and 1 active, got %#v", view)
+	}
+
+	firstHealthy.Store(true)
+	batch, err := service.ProbeAndRestoreExcluded(ctx, group.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch.Total != 2 || batch.RestoredCount != 1 || batch.FailedCount != 1 || batch.ActiveItemCount != 2 {
+		t.Fatalf("unexpected batch recovery result: %#v", batch)
+	}
+	view, err = service.GetGroupHealthViewByID(ctx, group.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.ActiveItemCount != 2 || len(view.ExcludedItems) != 1 || view.ExcludedItems[0].ChannelID != channels[1].ID {
+		t.Fatalf("only the still-failing item should remain excluded: %#v", view)
+	}
 }
 
 func TestRunGroupHealthFailoverDoesNotMutateRuntimeStats(t *testing.T) {

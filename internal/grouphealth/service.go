@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bestruirui/octopus/internal/apperror"
 	"github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/op"
 	"gorm.io/gorm"
@@ -24,6 +25,8 @@ type Repository interface {
 	GetRunningSnapshotByGroupID(ctx context.Context, groupID int) (*model.GroupHealthSnapshot, error)
 	ListGroupHealthViews(ctx context.Context) ([]model.GroupHealthGroupView, error)
 	GetGroupHealthViewByID(ctx context.Context, groupID int) (*model.GroupHealthGroupView, error)
+	GetAttemptByID(ctx context.Context, attemptID int) (*model.GroupHealthAttempt, error)
+	GetSnapshotByID(ctx context.Context, snapshotID int) (*model.GroupHealthSnapshot, error)
 }
 
 type Service struct {
@@ -46,13 +49,15 @@ func NewService(repo Repository, prober *Prober) *Service {
 	}
 }
 
-func lockGroup(groupID int) func() {
+func tryLockGroup(groupID int) (func(), bool) {
 	value, _ := runLocks.LoadOrStore(groupID, &sync.Mutex{})
 	lock := value.(*sync.Mutex)
-	lock.Lock()
+	if !lock.TryLock() {
+		return nil, false
+	}
 	return func() {
 		lock.Unlock()
-	}
+	}, true
 }
 
 // normalizeProbeMode returns the effective probe mode from a prioritized list.
@@ -78,7 +83,10 @@ func resolveChannelName(ctx context.Context, channelID int) string {
 }
 
 func (s *Service) RunGroupHealth(ctx context.Context, groupID int, probeModes ...model.GroupHealthProbeMode) error {
-	unlock := lockGroup(groupID)
+	unlock, ok := tryLockGroup(groupID)
+	if !ok {
+		return ErrGroupHealthAlreadyRunning
+	}
 	defer unlock()
 
 	if _, err := s.repo.GetRunningSnapshotByGroupID(ctx, groupID); err == nil {
@@ -99,7 +107,12 @@ func (s *Service) RunGroupHealth(ctx context.Context, groupID int, probeModes ..
 		return err
 	}
 
-	items := append([]model.GroupItem(nil), group.Items...)
+	items := make([]model.GroupItem, 0, len(group.Items))
+	for _, item := range group.Items {
+		if item.ExcludedAt == nil {
+			items = append(items, item)
+		}
+	}
 	sort.Slice(items, func(i, j int) bool {
 		if items[i].Priority != items[j].Priority {
 			return items[i].Priority < items[j].Priority
@@ -274,4 +287,251 @@ func (s *Service) GetGroupHealthViewByID(ctx context.Context, groupID int) (*mod
 
 func (s *Service) GetRunningSnapshotByGroupID(ctx context.Context, groupID int) (*model.GroupHealthSnapshot, error) {
 	return s.repo.GetRunningSnapshotByGroupID(ctx, groupID)
+}
+
+const (
+	CodeAttemptNotFailed = "group_health.attempt_not_failed"
+	CodeAttemptStale     = "group_health.attempt_stale"
+	CodeAttemptMismatch  = "group_health.attempt_mismatch"
+	CodeAlreadyRunning   = "group_health.already_running"
+	CodeItemNotExcluded  = "group_health.item_not_excluded"
+)
+
+func conflict(code, message string) error {
+	return apperror.New(code, message).WithStatus(409)
+}
+
+func (s *Service) ExcludeAttempt(ctx context.Context, groupID, attemptID int, allowEmpty bool) (*model.GroupHealthGroupView, error) {
+	unlock, ok := tryLockGroup(groupID)
+	if !ok {
+		return nil, conflict(CodeAlreadyRunning, ErrGroupHealthAlreadyRunning.Error())
+	}
+	defer unlock()
+	if _, err := s.repo.GetRunningSnapshotByGroupID(ctx, groupID); err == nil {
+		return nil, conflict(CodeAlreadyRunning, ErrGroupHealthAlreadyRunning.Error())
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	attempt, err := s.repo.GetAttemptByID(ctx, attemptID)
+	if err != nil {
+		return nil, err
+	}
+	attemptSnapshot, err := s.repo.GetSnapshotByID(ctx, attempt.SnapshotID)
+	if err != nil {
+		return nil, err
+	}
+	if attemptSnapshot.GroupID != groupID {
+		return nil, conflict(CodeAttemptMismatch, "attempt does not belong to this group")
+	}
+	latest, err := s.repo.GetLatestSnapshotByGroupID(ctx, groupID)
+	if err != nil {
+		return nil, err
+	}
+	if attempt.SnapshotID != latest.ID {
+		return nil, conflict(CodeAttemptStale, "only the latest health result can be excluded")
+	}
+	if attempt.Status != model.GroupHealthAttemptStatusFailed {
+		return nil, conflict(CodeAttemptNotFailed, "only failed attempts can be excluded")
+	}
+	if _, _, err := op.GroupHealthExcludeItem(ctx, groupID, attempt.GroupItemID, attempt.ID, allowEmpty); err != nil {
+		return nil, err
+	}
+	return s.repo.GetGroupHealthViewByID(ctx, groupID)
+}
+
+// ExcludeLatestFailures atomically excludes every currently-active failed item
+// from the latest health snapshot. Historical, skipped and successful attempts
+// are never included.
+func (s *Service) ExcludeLatestFailures(ctx context.Context, groupID int, allowEmpty bool) (*model.GroupHealthGroupView, error) {
+	unlock, ok := tryLockGroup(groupID)
+	if !ok {
+		return nil, conflict(CodeAlreadyRunning, ErrGroupHealthAlreadyRunning.Error())
+	}
+	defer unlock()
+	if _, err := s.repo.GetRunningSnapshotByGroupID(ctx, groupID); err == nil {
+		return nil, conflict(CodeAlreadyRunning, ErrGroupHealthAlreadyRunning.Error())
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	latest, err := s.repo.GetLatestSnapshotByGroupID(ctx, groupID)
+	if err != nil {
+		return nil, err
+	}
+	group, err := op.GroupGet(groupID, ctx)
+	if err != nil {
+		return nil, err
+	}
+	activeItemIDs := make(map[int]struct{}, len(group.Items))
+	for _, item := range group.Items {
+		if item.ExcludedAt == nil {
+			activeItemIDs[item.ID] = struct{}{}
+		}
+	}
+	attemptByItem := make(map[int]int)
+	for _, attempt := range latest.Attempts {
+		if attempt.Status != model.GroupHealthAttemptStatusFailed {
+			continue
+		}
+		if _, active := activeItemIDs[attempt.GroupItemID]; active {
+			attemptByItem[attempt.GroupItemID] = attempt.ID
+		}
+	}
+	if _, _, err := op.GroupHealthExcludeItems(ctx, groupID, attemptByItem, allowEmpty); err != nil {
+		return nil, err
+	}
+	return s.repo.GetGroupHealthViewByID(ctx, groupID)
+}
+
+func (s *Service) RestoreItem(ctx context.Context, groupID, itemID int, force bool) (*model.GroupHealthRecoveryResult, error) {
+	unlock, ok := tryLockGroup(groupID)
+	if !ok {
+		return nil, conflict(CodeAlreadyRunning, ErrGroupHealthAlreadyRunning.Error())
+	}
+	defer unlock()
+	if _, err := s.repo.GetRunningSnapshotByGroupID(ctx, groupID); err == nil {
+		return nil, conflict(CodeAlreadyRunning, ErrGroupHealthAlreadyRunning.Error())
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	group, err := op.GroupGet(groupID, ctx)
+	if err != nil {
+		return nil, err
+	}
+	var item *model.GroupItem
+	for i := range group.Items {
+		if group.Items[i].ID == itemID {
+			copyItem := group.Items[i]
+			item = &copyItem
+			break
+		}
+	}
+	if item == nil {
+		return nil, apperror.New(op.CodeGroupHealthItemNotFound, "group item not found").WithStatus(404)
+	}
+	if item.ExcludedAt == nil {
+		return nil, conflict(CodeItemNotExcluded, "group item is not excluded")
+	}
+	result := &model.GroupHealthRecoveryResult{ItemID: itemID}
+	if force {
+		_, count, restoreErr := op.GroupHealthRestoreItem(ctx, groupID, itemID)
+		if restoreErr != nil {
+			return nil, restoreErr
+		}
+		result.Restored, result.ActiveItemCount = true, count
+		return result, nil
+	}
+	channel, err := op.ChannelGet(item.ChannelID, ctx)
+	if err != nil {
+		result.Probe.ErrorMessage = fmt.Sprintf("failed to load channel: %v", err)
+		return result, nil
+	}
+	if !channel.Enabled {
+		result.Probe.ErrorMessage = "channel is disabled"
+		return result, nil
+	}
+	usedKey := channel.GetChannelKey()
+	if usedKey.ID == 0 || strings.TrimSpace(usedKey.ChannelKey) == "" {
+		result.Probe.ErrorMessage = "no available key"
+		return result, nil
+	}
+	probe := s.prober.RunCandidateWithGroupOverride(ctx, *channel, usedKey, item.ModelName, group.ParamOverride)
+	result.Probe = model.GroupHealthRecoveryProbe{Success: probe.Success, HTTPStatus: probe.HTTPStatus, DurationMS: probe.DurationMS, ErrorMessage: probe.ErrorMessage}
+	if !probe.Success {
+		return result, nil
+	}
+	_, count, err := op.GroupHealthRestoreItem(ctx, groupID, itemID)
+	if err != nil {
+		return nil, err
+	}
+	result.Restored, result.ActiveItemCount = true, count
+	return result, nil
+}
+
+// ProbeAndRestoreExcluded probes all currently excluded items and restores only
+// the successful subset in one transaction. Failed/disabled/keyless items stay excluded.
+func (s *Service) ProbeAndRestoreExcluded(ctx context.Context, groupID int) (*model.GroupHealthBatchRecoveryResult, error) {
+	unlock, ok := tryLockGroup(groupID)
+	if !ok {
+		return nil, conflict(CodeAlreadyRunning, ErrGroupHealthAlreadyRunning.Error())
+	}
+	defer unlock()
+	if _, err := s.repo.GetRunningSnapshotByGroupID(ctx, groupID); err == nil {
+		return nil, conflict(CodeAlreadyRunning, ErrGroupHealthAlreadyRunning.Error())
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	group, err := op.GroupGet(groupID, ctx)
+	if err != nil {
+		return nil, err
+	}
+	excluded := make([]model.GroupItem, 0)
+	activeCount := 0
+	for _, item := range group.Items {
+		if item.ExcludedAt != nil {
+			excluded = append(excluded, item)
+		} else {
+			activeCount++
+		}
+	}
+	batch := &model.GroupHealthBatchRecoveryResult{
+		Total: len(excluded), ActiveItemCount: activeCount,
+		Results: make([]model.GroupHealthRecoveryResult, len(excluded)),
+	}
+	if len(excluded) == 0 {
+		return batch, nil
+	}
+
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	for index := range excluded {
+		index := index
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			item := excluded[index]
+			result := model.GroupHealthRecoveryResult{ItemID: item.ID}
+			channel, channelErr := op.ChannelGet(item.ChannelID, ctx)
+			switch {
+			case channelErr != nil:
+				result.Probe.ErrorMessage = fmt.Sprintf("failed to load channel: %v", channelErr)
+			case !channel.Enabled:
+				result.Probe.ErrorMessage = "channel is disabled"
+			default:
+				usedKey := channel.GetChannelKey()
+				if usedKey.ID == 0 || strings.TrimSpace(usedKey.ChannelKey) == "" {
+					result.Probe.ErrorMessage = "no available key"
+				} else {
+					probe := s.prober.RunCandidateWithGroupOverride(ctx, *channel, usedKey, item.ModelName, group.ParamOverride)
+					result.Probe = model.GroupHealthRecoveryProbe{Success: probe.Success, HTTPStatus: probe.HTTPStatus, DurationMS: probe.DurationMS, ErrorMessage: probe.ErrorMessage}
+				}
+			}
+			batch.Results[index] = result
+		}()
+	}
+	wg.Wait()
+
+	restoreIDs := make([]int, 0, len(excluded))
+	for i := range batch.Results {
+		if batch.Results[i].Probe.Success {
+			restoreIDs = append(restoreIDs, batch.Results[i].ItemID)
+		}
+	}
+	if len(restoreIDs) > 0 {
+		_, activeCount, restoreErr := op.GroupHealthRestoreItems(ctx, groupID, restoreIDs)
+		if restoreErr != nil {
+			return nil, restoreErr
+		}
+		batch.ActiveItemCount = activeCount
+	}
+	for i := range batch.Results {
+		batch.Results[i].Restored = batch.Results[i].Probe.Success
+		batch.Results[i].ActiveItemCount = batch.ActiveItemCount
+		if batch.Results[i].Restored {
+			batch.RestoredCount++
+		}
+	}
+	batch.FailedCount = batch.Total - batch.RestoredCount
+	return batch, nil
 }

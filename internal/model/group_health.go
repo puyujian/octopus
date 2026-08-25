@@ -19,6 +19,14 @@ const (
 	GroupHealthAttemptStatusSkipped GroupHealthAttemptStatus = "skipped"
 )
 
+type GroupHealthMembershipState string
+
+const (
+	GroupHealthMembershipStateActive   GroupHealthMembershipState = "active"
+	GroupHealthMembershipStateExcluded GroupHealthMembershipState = "excluded"
+	GroupHealthMembershipStateMissing  GroupHealthMembershipState = "missing"
+)
+
 type GroupHealthProbeMode string
 
 const (
@@ -43,25 +51,66 @@ type GroupHealthSnapshot struct {
 }
 
 type GroupHealthAttempt struct {
-	ID           int                      `json:"id" gorm:"primaryKey"`
-	SnapshotID   int                      `json:"snapshot_id" gorm:"index:idx_group_health_attempt_snapshot_priority;not null"`
-	GroupItemID  int                      `json:"group_item_id" gorm:"not null"`
-	ChannelID    int                      `json:"channel_id" gorm:"not null"`
-	ChannelName  string                   `json:"channel_name" gorm:"type:varchar(255);not null"`
-	ChannelKeyID int                      `json:"channel_key_id" gorm:"not null;default:0"`
-	KeyRemark    string                   `json:"key_remark"`
-	ModelName    string                   `json:"model_name" gorm:"type:varchar(255);not null"`
-	Priority     int                      `json:"priority" gorm:"index:idx_group_health_attempt_snapshot_priority;not null"`
-	Weight       int                      `json:"weight" gorm:"not null;default:0"`
-	Status       GroupHealthAttemptStatus `json:"status" gorm:"type:varchar(16);not null"`
-	HTTPStatus   int                      `json:"http_status" gorm:"not null;default:0"`
-	DurationMS   int64                    `json:"duration_ms" gorm:"not null;default:0"`
-	ErrorMessage string                   `json:"error_message"`
+	ID              int                        `json:"id" gorm:"primaryKey"`
+	SnapshotID      int                        `json:"snapshot_id" gorm:"index:idx_group_health_attempt_snapshot_priority;not null"`
+	GroupItemID     int                        `json:"group_item_id" gorm:"not null"`
+	ChannelID       int                        `json:"channel_id" gorm:"not null"`
+	ChannelName     string                     `json:"channel_name" gorm:"type:varchar(255);not null"`
+	ChannelKeyID    int                        `json:"channel_key_id" gorm:"not null;default:0"`
+	KeyRemark       string                     `json:"key_remark"`
+	ModelName       string                     `json:"model_name" gorm:"type:varchar(255);not null"`
+	Priority        int                        `json:"priority" gorm:"index:idx_group_health_attempt_snapshot_priority;not null"`
+	Weight          int                        `json:"weight" gorm:"not null;default:0"`
+	Status          GroupHealthAttemptStatus   `json:"status" gorm:"type:varchar(16);not null"`
+	HTTPStatus      int                        `json:"http_status" gorm:"not null;default:0"`
+	DurationMS      int64                      `json:"duration_ms" gorm:"not null;default:0"`
+	ErrorMessage    string                     `json:"error_message"`
+	MembershipState GroupHealthMembershipState `json:"membership_state" gorm:"-"`
+}
+
+type GroupHealthExcludedItem struct {
+	ID                  int        `json:"id"`
+	GroupID             int        `json:"group_id"`
+	ChannelID           int        `json:"channel_id"`
+	ChannelName         string     `json:"channel_name"`
+	ChannelEnabled      bool       `json:"channel_enabled"`
+	ModelName           string     `json:"model_name"`
+	Priority            int        `json:"priority"`
+	Weight              int        `json:"weight"`
+	ExcludedAt          *time.Time `json:"excluded_at"`
+	ExcludedByAttemptID *int       `json:"excluded_by_attempt_id,omitempty"`
+	HTTPStatus          int        `json:"http_status"`
+	DurationMS          int64      `json:"duration_ms"`
+	ErrorMessage        string     `json:"error_message"`
+}
+
+type GroupHealthRecoveryProbe struct {
+	Success      bool   `json:"success"`
+	HTTPStatus   int    `json:"http_status"`
+	DurationMS   int64  `json:"duration_ms"`
+	ErrorMessage string `json:"error_message"`
+}
+
+type GroupHealthRecoveryResult struct {
+	ItemID          int                      `json:"item_id"`
+	Restored        bool                     `json:"restored"`
+	ActiveItemCount int                      `json:"active_item_count"`
+	Probe           GroupHealthRecoveryProbe `json:"probe"`
+}
+
+type GroupHealthBatchRecoveryResult struct {
+	Total           int                         `json:"total"`
+	RestoredCount   int                         `json:"restored_count"`
+	FailedCount     int                         `json:"failed_count"`
+	ActiveItemCount int                         `json:"active_item_count"`
+	Results         []GroupHealthRecoveryResult `json:"results"`
 }
 
 type GroupHealthGroupView struct {
-	GroupID   int                  `json:"group_id"`
-	GroupName string               `json:"group_name"`
-	GroupMode GroupMode            `json:"group_mode"`
-	Latest    *GroupHealthSnapshot `json:"latest,omitempty"`
+	GroupID         int                       `json:"group_id"`
+	GroupName       string                    `json:"group_name"`
+	GroupMode       GroupMode                 `json:"group_mode"`
+	ActiveItemCount int                       `json:"active_item_count"`
+	ExcludedItems   []GroupHealthExcludedItem `json:"excluded_items"`
+	Latest          *GroupHealthSnapshot      `json:"latest,omitempty"`
 }

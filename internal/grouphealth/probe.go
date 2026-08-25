@@ -1,7 +1,9 @@
 package grouphealth
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,6 +27,14 @@ type ProbeResult struct {
 type Prober struct {
 	CandidateTimeout time.Duration
 }
+
+type probeProtocol int
+
+const (
+	probeProtocolChannel probeProtocol = iota
+	probeProtocolEmbedding
+	probeProtocolRerank
+)
 
 func NewProber() *Prober {
 	return &Prober{
@@ -120,12 +130,97 @@ func buildProbeRequest(ctx context.Context, channel *model.Channel, usedKey *mod
 		return nil, fmt.Errorf("model name is empty")
 	}
 
-	request := buildProbeInternalRequest(channel.Type, modelName)
-	adapter := outbound.Get(channel.Type)
+	protocol := classifyProbeProtocol(channel.Type, modelName)
+	if protocol == probeProtocolRerank {
+		return buildRerankProbeRequest(ctx, channel.GetBaseUrl(), usedKey.ChannelKey, modelName)
+	}
+
+	effectiveType := channel.Type
+	if protocol == probeProtocolEmbedding {
+		effectiveType = outbound.OutboundTypeOpenAIEmbedding
+	}
+	request := buildProbeInternalRequest(effectiveType, modelName)
+	adapter := outbound.Get(effectiveType)
 	if adapter == nil {
-		return nil, fmt.Errorf("unsupported outbound type: %d", channel.Type)
+		return nil, fmt.Errorf("unsupported outbound type: %d", effectiveType)
 	}
 	return adapter.TransformRequest(ctx, request, channel.GetBaseUrl(), usedKey.ChannelKey)
+}
+
+// classifyProbeProtocol keeps explicitly configured non-Chat channels on their
+// native protocol. OpenAI-compatible Chat channels can expose mixed model
+// families, so health checks infer low-cost embedding and rerank probes from
+// the actual group-item model instead of blindly calling chat/completions.
+func classifyProbeProtocol(channelType outbound.OutboundType, modelName string) probeProtocol {
+	if channelType == outbound.OutboundTypeOpenAIEmbedding {
+		return probeProtocolEmbedding
+	}
+	if channelType != outbound.OutboundTypeOpenAIChat {
+		return probeProtocolChannel
+	}
+
+	normalized := strings.ToLower(strings.TrimSpace(modelName))
+	if normalized == "" {
+		return probeProtocolChannel
+	}
+	if strings.Contains(normalized, "rerank") {
+		return probeProtocolRerank
+	}
+	if isEmbeddingModelName(normalized) {
+		return probeProtocolEmbedding
+	}
+	return probeProtocolChannel
+}
+
+func isEmbeddingModelName(normalized string) bool {
+	if strings.Contains(normalized, "embedding") || strings.Contains(normalized, "embed-") || strings.Contains(normalized, "embed_") {
+		return true
+	}
+
+	// Model IDs commonly include a provider namespace. Classify the final
+	// segment so aliases such as BAAI/bge-m3 and cf/bge-m3 are handled alike.
+	name := normalized
+	if index := strings.LastIndexAny(name, "/:"); index >= 0 && index+1 < len(name) {
+		name = name[index+1:]
+	}
+	for _, prefix := range []string{
+		"bge-",
+		"e5-",
+		"gte-",
+		"m3e-",
+		"multilingual-e5-",
+	} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func buildRerankProbeRequest(ctx context.Context, baseURL, key, modelName string) (*http.Request, error) {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		baseURL = "https://api.openai.com/v1"
+	}
+	body, err := json.Marshal(struct {
+		Model     string   `json:"model"`
+		Query     string   `json:"query"`
+		Documents []string `json:"documents"`
+	}{
+		Model:     modelName,
+		Query:     "ping",
+		Documents: []string{"ping"},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal rerank probe: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/rerank", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to build rerank probe: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+key)
+	request.Header.Set("Content-Type", "application/json")
+	return request, nil
 }
 
 func buildProbeInternalRequest(channelType outbound.OutboundType, modelName string) *transformerModel.InternalLLMRequest {

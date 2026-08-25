@@ -7,6 +7,7 @@ import type { GroupMode } from './group';
 export type GroupHealthStatus = 'running' | 'success' | 'partial' | 'failed';
 export type GroupHealthAttemptStatus = 'success' | 'failed' | 'skipped';
 export type GroupHealthProbeMode = 'standard' | 'full';
+export type GroupHealthMembershipState = 'active' | 'excluded' | 'missing';
 
 export interface GroupHealthAttempt {
     id: number;
@@ -23,6 +24,26 @@ export interface GroupHealthAttempt {
     http_status: number;
     duration_ms: number;
     error_message: string;
+    membership_state: GroupHealthMembershipState;
+}
+
+export interface GroupHealthExcludedItem {
+    id: number; group_id: number; channel_id: number; channel_name: string; channel_enabled: boolean;
+    model_name: string; priority: number; weight: number; excluded_at?: string | null;
+    excluded_by_attempt_id?: number | null; http_status: number; duration_ms: number; error_message: string;
+}
+
+export interface GroupHealthRecoveryResult {
+    item_id: number; restored: boolean; active_item_count: number;
+    probe: { success: boolean; http_status: number; duration_ms: number; error_message: string };
+}
+
+export interface GroupHealthBatchRecoveryResult {
+    total: number;
+    restored_count: number;
+    failed_count: number;
+    active_item_count: number;
+    results: GroupHealthRecoveryResult[];
 }
 
 export interface GroupHealthSnapshot {
@@ -45,6 +66,8 @@ export interface GroupHealthGroupView {
     group_id: number;
     group_name: string;
     group_mode: GroupMode;
+    active_item_count: number;
+    excluded_items: GroupHealthExcludedItem[];
     latest?: GroupHealthSnapshot | null;
 }
 
@@ -81,6 +104,7 @@ function normalizeAttempt(attempt: Partial<GroupHealthAttempt>): GroupHealthAtte
         http_status: typeof attempt.http_status === 'number' ? attempt.http_status : 0,
         duration_ms: typeof attempt.duration_ms === 'number' ? attempt.duration_ms : 0,
         error_message: attempt.error_message ?? '',
+        membership_state: attempt.membership_state === 'excluded' || attempt.membership_state === 'missing' ? attempt.membership_state : 'active',
     };
 }
 
@@ -110,6 +134,14 @@ function normalizeView(view: Partial<GroupHealthGroupView>): GroupHealthGroupVie
         group_id: typeof view.group_id === 'number' ? view.group_id : 0,
         group_name: view.group_name ?? '',
         group_mode: typeof view.group_mode === 'number' ? view.group_mode : 1,
+        active_item_count: typeof view.active_item_count === 'number' ? view.active_item_count : 0,
+        excluded_items: (view.excluded_items ?? []).map((item) => ({
+            id: item.id ?? 0, group_id: item.group_id ?? 0, channel_id: item.channel_id ?? 0,
+            channel_name: item.channel_name ?? '', channel_enabled: item.channel_enabled ?? false,
+            model_name: item.model_name ?? '', priority: item.priority ?? 0, weight: item.weight ?? 0,
+            excluded_at: item.excluded_at ?? null, excluded_by_attempt_id: item.excluded_by_attempt_id ?? null,
+            http_status: item.http_status ?? 0, duration_ms: item.duration_ms ?? 0, error_message: item.error_message ?? '',
+        })),
         latest: normalizeSnapshot(view.latest),
     };
 }
@@ -117,6 +149,54 @@ function normalizeView(view: Partial<GroupHealthGroupView>): GroupHealthGroupVie
 function invalidateGroupHealth(queryClient: ReturnType<typeof useQueryClient>) {
     queryClient.invalidateQueries({ queryKey: ['group-health', 'list'] });
     queryClient.invalidateQueries({ queryKey: ['groups', 'list'] });
+    queryClient.invalidateQueries({ queryKey: ['group-health', 'detail'] });
+}
+
+export function useExcludeGroupHealthAttempt() {
+    const queryClient = useQueryClient();
+    return useMutation({
+        mutationFn: ({ groupId, attemptId, allowEmpty = false }: { groupId: number; attemptId: number; allowEmpty?: boolean }) =>
+            apiClient.post<GroupHealthGroupView>(`/api/v1/group/health/${groupId}/attempts/${attemptId}/exclude`, { allow_empty: allowEmpty }),
+        onSuccess: () => invalidateGroupHealth(queryClient),
+        onError: (error) => logger.error('group health exclusion failed:', error),
+    });
+}
+
+export function useExcludeAllFailedGroupHealthAttempts() {
+    const queryClient = useQueryClient();
+    return useMutation({
+        mutationFn: ({ groupId, allowEmpty = false }: { groupId: number; allowEmpty?: boolean }) =>
+            apiClient.post<GroupHealthGroupView>(`/api/v1/group/health/${groupId}/attempts/exclude-failed`, { allow_empty: allowEmpty }),
+        onSuccess: () => invalidateGroupHealth(queryClient),
+        onError: (error) => logger.error('batch group health exclusion failed:', error),
+    });
+}
+
+export function useProbeAndRestoreGroupHealthItem() {
+    const queryClient = useQueryClient();
+    return useMutation({
+        mutationFn: ({ groupId, itemId }: { groupId: number; itemId: number }) =>
+            apiClient.post<GroupHealthRecoveryResult>(`/api/v1/group/health/${groupId}/items/${itemId}/probe-and-restore`, {}),
+        onSuccess: () => invalidateGroupHealth(queryClient),
+    });
+}
+
+export function useProbeAndRestoreAllGroupHealthItems() {
+    const queryClient = useQueryClient();
+    return useMutation({
+        mutationFn: ({ groupId }: { groupId: number }) =>
+            apiClient.post<GroupHealthBatchRecoveryResult>(`/api/v1/group/health/${groupId}/items/probe-and-restore`, {}),
+        onSuccess: () => invalidateGroupHealth(queryClient),
+    });
+}
+
+export function useForceRestoreGroupHealthItem() {
+    const queryClient = useQueryClient();
+    return useMutation({
+        mutationFn: ({ groupId, itemId }: { groupId: number; itemId: number }) =>
+            apiClient.post<GroupHealthRecoveryResult>(`/api/v1/group/health/${groupId}/items/${itemId}/restore`, {}),
+        onSuccess: () => invalidateGroupHealth(queryClient),
+    });
 }
 
 export function useGroupHealthList() {

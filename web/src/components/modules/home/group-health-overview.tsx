@@ -7,7 +7,7 @@ import { useGroupHealthList, useRunAllGroupHealth, useRunGroupHealth, type Group
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
-import { GroupHealthAttemptDetails } from '../group/health';
+import { GroupHealthAttemptDetails, GroupHealthExcludedItems } from '../group/health';
 
 function formatDateTime(value?: string | null, fallback?: string) {
     if (!value) return fallback ?? '';
@@ -127,7 +127,7 @@ function GroupHealthCard({
                     {expanded ? (
                         <div className="flex max-h-[22rem] flex-col gap-2 overflow-y-auto pr-1">
                             {attempts.map((attempt) => (
-                                <GroupHealthAttemptDetails key={attempt.id} attempt={attempt} />
+                                <GroupHealthAttemptDetails key={attempt.id} attempt={attempt} groupId={view.group_id} activeItemCount={view.active_item_count} />
                             ))}
                         </div>
                     ) : null}
@@ -137,6 +137,7 @@ function GroupHealthCard({
                     {t('empty')}
                 </div>
             )}
+            <div className="mt-3"><GroupHealthExcludedItems groupId={view.group_id} items={view.excluded_items} /></div>
         </article>
     );
 }

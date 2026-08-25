@@ -18,9 +18,20 @@ var groupMap = cache.New[string, model.Group](16)
 func GroupList(ctx context.Context) ([]model.Group, error) {
 	groups := make([]model.Group, 0, groupCache.Len())
 	for _, group := range groupCache.GetAll() {
+		group.Items = activeGroupItems(group.Items)
 		groups = append(groups, group)
 	}
 	return groups, nil
+}
+
+func activeGroupItems(items []model.GroupItem) []model.GroupItem {
+	active := make([]model.GroupItem, 0, len(items))
+	for _, item := range items {
+		if item.ExcludedAt == nil {
+			active = append(active, item)
+		}
+	}
+	return active
 }
 
 func GroupListModel(ctx context.Context) ([]string, error) {
@@ -51,6 +62,9 @@ func GroupGetEnabledMap(name string, ctx context.Context) (model.Group, error) {
 
 	enabledItems := make([]model.GroupItem, 0, len(group.Items))
 	for _, item := range group.Items {
+		if item.ExcludedAt != nil {
+			continue
+		}
 		channel, ok := channelCache.Get(item.ChannelID)
 		if !ok || !channel.Enabled {
 			continue
@@ -189,7 +203,10 @@ func GroupUpdate(req *model.GroupUpdateRequest, ctx context.Context) (*model.Gro
 				Weight:    item.Weight,
 			}
 		}
-		if err := tx.Create(&newItems).Error; err != nil {
+		if err := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "group_id"}, {Name: "channel_id"}, {Name: "model_name"}},
+			DoUpdates: clause.AssignmentColumns([]string{"priority", "weight", "excluded_at", "excluded_by_attempt_id"}),
+		}).Create(&newItems).Error; err != nil {
 			tx.Rollback()
 			return nil, fmt.Errorf("failed to create items: %w", err)
 		}
@@ -303,7 +320,10 @@ func GroupItemAdd(item *model.GroupItem, ctx context.Context) error {
 		return fmt.Errorf("group not found")
 	}
 
-	if err := db.GetDB().WithContext(ctx).Create(item).Error; err != nil {
+	if err := db.GetDB().WithContext(ctx).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "group_id"}, {Name: "channel_id"}, {Name: "model_name"}},
+		DoUpdates: clause.AssignmentColumns([]string{"priority", "weight", "excluded_at", "excluded_by_attempt_id"}),
+	}).Create(item).Error; err != nil {
 		return err
 	}
 

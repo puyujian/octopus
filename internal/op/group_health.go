@@ -3,6 +3,7 @@ package op
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"time"
 
@@ -71,6 +72,22 @@ func (r *GroupHealthRepository) GetLatestSnapshotByGroupID(ctx context.Context, 
 	return &snapshot, nil
 }
 
+func (r *GroupHealthRepository) GetAttemptByID(ctx context.Context, attemptID int) (*model.GroupHealthAttempt, error) {
+	var attempt model.GroupHealthAttempt
+	if err := db.GetDB().WithContext(ctx).First(&attempt, attemptID).Error; err != nil {
+		return nil, err
+	}
+	return &attempt, nil
+}
+
+func (r *GroupHealthRepository) GetSnapshotByID(ctx context.Context, snapshotID int) (*model.GroupHealthSnapshot, error) {
+	var snapshot model.GroupHealthSnapshot
+	if err := db.GetDB().WithContext(ctx).First(&snapshot, snapshotID).Error; err != nil {
+		return nil, err
+	}
+	return &snapshot, nil
+}
+
 func (r *GroupHealthRepository) ListLatestSnapshots(ctx context.Context) ([]model.GroupHealthSnapshot, error) {
 	var snapshots []model.GroupHealthSnapshot
 	err := db.GetDB().WithContext(ctx).
@@ -100,10 +117,11 @@ func (r *GroupHealthRepository) GetRunningSnapshotByGroupID(ctx context.Context,
 }
 
 func (r *GroupHealthRepository) ListGroupHealthViews(ctx context.Context) ([]model.GroupHealthGroupView, error) {
-	groups, err := GroupList(ctx)
-	if err != nil {
+	var groups []model.Group
+	if err := db.GetDB().WithContext(ctx).Preload("Items").Find(&groups).Error; err != nil {
 		return nil, err
 	}
+	var err error
 	snapshots, err := r.ListLatestSnapshots(ctx)
 	if err != nil {
 		return nil, err
@@ -123,6 +141,9 @@ func (r *GroupHealthRepository) ListGroupHealthViews(ctx context.Context) ([]mod
 			copySnapshot := snapshot
 			view.Latest = &copySnapshot
 		}
+		if err := r.enrichView(ctx, &view, group.Items); err != nil {
+			return nil, err
+		}
 		views = append(views, view)
 	}
 	sort.Slice(views, func(i, j int) bool {
@@ -135,8 +156,8 @@ func (r *GroupHealthRepository) ListGroupHealthViews(ctx context.Context) ([]mod
 }
 
 func (r *GroupHealthRepository) GetGroupHealthViewByID(ctx context.Context, groupID int) (*model.GroupHealthGroupView, error) {
-	group, err := GroupGet(groupID, ctx)
-	if err != nil {
+	var group model.Group
+	if err := db.GetDB().WithContext(ctx).Preload("Items").First(&group, groupID).Error; err != nil {
 		return nil, err
 	}
 	view := &model.GroupHealthGroupView{
@@ -147,10 +168,74 @@ func (r *GroupHealthRepository) GetGroupHealthViewByID(ctx context.Context, grou
 	snapshot, err := r.GetLatestSnapshotByGroupID(ctx, groupID)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
+			if enrichErr := r.enrichView(ctx, view, group.Items); enrichErr != nil {
+				return nil, enrichErr
+			}
 			return view, nil
 		}
 		return nil, err
 	}
 	view.Latest = snapshot
+	if err := r.enrichView(ctx, view, group.Items); err != nil {
+		return nil, err
+	}
 	return view, nil
+}
+
+func (r *GroupHealthRepository) enrichView(ctx context.Context, view *model.GroupHealthGroupView, items []model.GroupItem) error {
+	itemByID := make(map[int]model.GroupItem, len(items))
+	for _, item := range items {
+		itemByID[item.ID] = item
+		if item.ExcludedAt == nil {
+			view.ActiveItemCount++
+		}
+	}
+	if view.Latest != nil {
+		for i := range view.Latest.Attempts {
+			item, ok := itemByID[view.Latest.Attempts[i].GroupItemID]
+			switch {
+			case !ok:
+				view.Latest.Attempts[i].MembershipState = model.GroupHealthMembershipStateMissing
+			case item.ExcludedAt != nil:
+				view.Latest.Attempts[i].MembershipState = model.GroupHealthMembershipStateExcluded
+			default:
+				view.Latest.Attempts[i].MembershipState = model.GroupHealthMembershipStateActive
+			}
+		}
+	}
+
+	for _, item := range items {
+		if item.ExcludedAt == nil {
+			continue
+		}
+		var channel model.Channel
+		channelName := fmt.Sprintf("channel-%d", item.ChannelID)
+		channelEnabled := false
+		if err := db.GetDB().WithContext(ctx).First(&channel, item.ChannelID).Error; err == nil {
+			channelName, channelEnabled = channel.Name, channel.Enabled
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		excluded := model.GroupHealthExcludedItem{
+			ID: item.ID, GroupID: item.GroupID, ChannelID: item.ChannelID,
+			ChannelName: channelName, ChannelEnabled: channelEnabled, ModelName: item.ModelName,
+			Priority: item.Priority, Weight: item.Weight, ExcludedAt: item.ExcludedAt,
+			ExcludedByAttemptID: item.ExcludedByAttemptID,
+		}
+		var attempt model.GroupHealthAttempt
+		query := db.GetDB().WithContext(ctx).Where("group_item_id = ? AND status = ?", item.ID, model.GroupHealthAttemptStatusFailed)
+		if item.ExcludedByAttemptID != nil {
+			query = query.Where("id = ?", *item.ExcludedByAttemptID)
+		}
+		if err := query.Order("id DESC").First(&attempt).Error; err == nil {
+			excluded.HTTPStatus = attempt.HTTPStatus
+			excluded.DurationMS = attempt.DurationMS
+			excluded.ErrorMessage = attempt.ErrorMessage
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		view.ExcludedItems = append(view.ExcludedItems, excluded)
+	}
+	sort.Slice(view.ExcludedItems, func(i, j int) bool { return view.ExcludedItems[i].ID < view.ExcludedItems[j].ID })
+	return nil
 }

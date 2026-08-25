@@ -48,6 +48,7 @@ func groupPresetSnapshotFromCache(groupID int) (mode model.GroupMode, matchRegex
 			ModelName: it.ModelName,
 			Priority:  it.Priority,
 			Weight:    it.Weight,
+			Excluded:  it.ExcludedAt != nil,
 		})
 	}
 	return
@@ -216,12 +217,18 @@ func mirrorPresetToActiveGroupTx(tx *gorm.DB, preset *model.GroupPreset) (groupI
 	if len(preset.Items) > 0 {
 		newItems := make([]model.GroupItem, 0, len(preset.Items))
 		for _, it := range preset.Items {
+			var excludedAt *time.Time
+			if it.Excluded {
+				now := time.Now()
+				excludedAt = &now
+			}
 			newItems = append(newItems, model.GroupItem{
-				GroupID:   group.ID,
-				ChannelID: it.ChannelID,
-				ModelName: it.ModelName,
-				Priority:  it.Priority,
-				Weight:    it.Weight,
+				GroupID:    group.ID,
+				ChannelID:  it.ChannelID,
+				ModelName:  it.ModelName,
+				Priority:   it.Priority,
+				Weight:     it.Weight,
+				ExcludedAt: excludedAt,
 			})
 		}
 		if err = tx.Create(&newItems).Error; err != nil {
@@ -267,6 +274,7 @@ func syncActivePresetTx(tx *gorm.DB, groupID int) error {
 			ModelName: it.ModelName,
 			Priority:  it.Priority,
 			Weight:    it.Weight,
+			Excluded:  it.ExcludedAt != nil,
 		})
 	}
 
@@ -435,12 +443,18 @@ func GroupPresetActivate(presetID int, ctx context.Context) error {
 	if len(preset.Items) > 0 {
 		newItems := make([]model.GroupItem, 0, len(preset.Items))
 		for _, it := range preset.Items {
+			var excludedAt *time.Time
+			if it.Excluded {
+				now := time.Now()
+				excludedAt = &now
+			}
 			newItems = append(newItems, model.GroupItem{
-				GroupID:   preset.GroupID,
-				ChannelID: it.ChannelID,
-				ModelName: it.ModelName,
-				Priority:  it.Priority,
-				Weight:    it.Weight,
+				GroupID:    preset.GroupID,
+				ChannelID:  it.ChannelID,
+				ModelName:  it.ModelName,
+				Priority:   it.Priority,
+				Weight:     it.Weight,
+				ExcludedAt: excludedAt,
 			})
 		}
 		if err := tx.Create(&newItems).Error; err != nil {

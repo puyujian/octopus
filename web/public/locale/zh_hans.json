@@ -655,7 +655,26 @@
             },
             "empty": "暂无健康快照。",
             "errorDetails": "错误详情",
-            "noHttpStatus": "无 HTTP 状态"
+            "noHttpStatus": "无 HTTP 状态",
+            "exclude": "剔除",
+            "excluded": "已剔除",
+            "excludedItems": "已剔除项（{count}）",
+            "excludeSuccess": "已从当前分组剔除",
+            "probeRestore": "复测并恢复",
+            "excludeAllFailed": "一键剔除失败项（{count}）",
+            "restoreAllExcluded": "一键复测并恢复（{count}）",
+            "batchExcludeSuccess": "已批量剔除 {count} 个失败项",
+            "batchRestoreResult": "复测完成：恢复 {restored} 个，仍故障 {failed} 个",
+            "batchLastItemTitle": "剔除全部失败项？",
+            "batchLastItemDescription": "本次操作会剔除 {count} 个失败项，并使该分组没有可用于路由的渠道模型项，但之后仍可复测恢复。",
+            "forceRestore": "强制恢复",
+            "restoreSuccess": "已恢复到当前分组",
+            "probeFailed": "复测未通过，仍保持剔除",
+            "lastItemTitle": "剔除最后一个可用项？",
+            "lastItemDescription": "剔除后该分组将没有可用于路由的渠道模型项，但之后仍可恢复。",
+            "confirmExclude": "仍然剔除",
+            "cancel": "取消",
+            "membership": { "active": "生效中", "excluded": "已剔除", "missing": "已移除" }
         },
         "empty": "暂无分组，点击左上角按钮创建",
         "autoGroup": {
@@ -1012,6 +1031,15 @@
             "create_failed": "创建分组失败。",
             "update_failed": "更新分组失败。",
             "delete_failed": "删除分组失败。"
+        },
+        "group_health": {
+            "item_not_found": "分组渠道模型项不存在。",
+            "last_active_item": "这是分组最后一个生效项，请确认后再剔除。",
+            "attempt_not_failed": "只能剔除失败的检查项。",
+            "attempt_stale": "只能操作最新一次健康检查结果。",
+            "attempt_mismatch": "该检查项不属于此分组。",
+            "already_running": "该分组正在进行健康检查，请稍后再试。",
+            "item_not_excluded": "该项当前未被剔除。"
         },
         "model": {
             "price_update_failed": "更新模型价格失败。",

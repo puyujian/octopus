@@ -24,6 +24,10 @@ type groupHealthRunRequest struct {
 	ProbeMode model.GroupHealthProbeMode `json:"probe_mode"`
 }
 
+type groupHealthExcludeRequest struct {
+	AllowEmpty bool `json:"allow_empty"`
+}
+
 func init() {
 	router.NewGroupRouter("/api/v1/group/health").
 		Use(middleware.Auth()).
@@ -42,7 +46,133 @@ func init() {
 		AddRoute(
 			router.NewRoute("/:id/run", http.MethodPost).
 				Handle(runGroupHealth),
+		).
+		AddRoute(
+			router.NewRoute("/:id/attempts/exclude-failed", http.MethodPost).
+				Handle(excludeAllFailedGroupHealthAttempts),
+		).
+		AddRoute(
+			router.NewRoute("/:id/attempts/:attemptId/exclude", http.MethodPost).
+				Handle(excludeGroupHealthAttempt),
+		).
+		AddRoute(
+			router.NewRoute("/:id/items/probe-and-restore", http.MethodPost).
+				Handle(probeAndRestoreAllGroupHealthItems),
+		).
+		AddRoute(
+			router.NewRoute("/:id/items/:itemId/probe-and-restore", http.MethodPost).
+				Handle(probeAndRestoreGroupHealthItem),
+		).
+		AddRoute(
+			router.NewRoute("/:id/items/:itemId/restore", http.MethodPost).
+				Handle(forceRestoreGroupHealthItem),
 		)
+}
+
+func excludeAllFailedGroupHealthAttempts(c *gin.Context) {
+	if !ensureGroupHealthEnabled(c) {
+		return
+	}
+	groupID, err := strconv.Atoi(c.Param("id"))
+	if err != nil || groupID <= 0 {
+		resp.InvalidParam(c)
+		return
+	}
+	var req groupHealthExcludeRequest
+	if c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			resp.InvalidJSON(c)
+			return
+		}
+	}
+	view, err := defaultGroupHealthService.ExcludeLatestFailures(c.Request.Context(), groupID, req.AllowEmpty)
+	if err != nil {
+		resp.ErrorWithAppError(c, http.StatusInternalServerError, err)
+		return
+	}
+	resp.Success(c, view)
+}
+
+func probeAndRestoreAllGroupHealthItems(c *gin.Context) {
+	if !ensureGroupHealthEnabled(c) {
+		return
+	}
+	groupID, err := strconv.Atoi(c.Param("id"))
+	if err != nil || groupID <= 0 {
+		resp.InvalidParam(c)
+		return
+	}
+	result, err := defaultGroupHealthService.ProbeAndRestoreExcluded(c.Request.Context(), groupID)
+	if err != nil {
+		resp.ErrorWithAppError(c, http.StatusInternalServerError, err)
+		return
+	}
+	resp.Success(c, result)
+}
+
+func parseTwoIDs(c *gin.Context, first, second string) (int, int, bool) {
+	a, errA := strconv.Atoi(c.Param(first))
+	b, errB := strconv.Atoi(c.Param(second))
+	if errA != nil || errB != nil || a <= 0 || b <= 0 {
+		resp.InvalidParam(c)
+		return 0, 0, false
+	}
+	return a, b, true
+}
+
+func excludeGroupHealthAttempt(c *gin.Context) {
+	if !ensureGroupHealthEnabled(c) {
+		return
+	}
+	groupID, attemptID, ok := parseTwoIDs(c, "id", "attemptId")
+	if !ok {
+		return
+	}
+	var req groupHealthExcludeRequest
+	if c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			resp.InvalidJSON(c)
+			return
+		}
+	}
+	view, err := defaultGroupHealthService.ExcludeAttempt(c.Request.Context(), groupID, attemptID, req.AllowEmpty)
+	if err != nil {
+		resp.ErrorWithAppError(c, http.StatusInternalServerError, err)
+		return
+	}
+	resp.Success(c, view)
+}
+
+func probeAndRestoreGroupHealthItem(c *gin.Context) {
+	if !ensureGroupHealthEnabled(c) {
+		return
+	}
+	groupID, itemID, ok := parseTwoIDs(c, "id", "itemId")
+	if !ok {
+		return
+	}
+	result, err := defaultGroupHealthService.RestoreItem(c.Request.Context(), groupID, itemID, false)
+	if err != nil {
+		resp.ErrorWithAppError(c, http.StatusInternalServerError, err)
+		return
+	}
+	resp.Success(c, result)
+}
+
+func forceRestoreGroupHealthItem(c *gin.Context) {
+	if !ensureGroupHealthEnabled(c) {
+		return
+	}
+	groupID, itemID, ok := parseTwoIDs(c, "id", "itemId")
+	if !ok {
+		return
+	}
+	result, err := defaultGroupHealthService.RestoreItem(c.Request.Context(), groupID, itemID, true)
+	if err != nil {
+		resp.ErrorWithAppError(c, http.StatusInternalServerError, err)
+		return
+	}
+	resp.Success(c, result)
 }
 
 func ensureGroupHealthEnabled(c *gin.Context) bool {

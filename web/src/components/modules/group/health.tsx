@@ -1,8 +1,10 @@
 'use client';
 
 import { useMemo, useState } from 'react';
-import { Activity, ChevronDown, Clock3, LoaderCircle, Play } from 'lucide-react';
+import { Activity, ChevronDown, Clock3, LoaderCircle, Play, RotateCcw, ShieldMinus } from 'lucide-react';
 import { useLocale, useTranslations } from 'next-intl';
+import { toast } from 'sonner';
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -18,9 +20,15 @@ import { cn } from '@/lib/utils';
 import { useGroupHealthEnabled } from '@/api/endpoints/setting';
 import {
     useGroupHealthList,
+    useExcludeAllFailedGroupHealthAttempts,
+    useExcludeGroupHealthAttempt,
+    useForceRestoreGroupHealthItem,
+    useProbeAndRestoreGroupHealthItem,
+    useProbeAndRestoreAllGroupHealthItems,
     useRunGroupHealth,
     type GroupHealthAttempt,
     type GroupHealthAttemptStatus,
+    type GroupHealthExcludedItem,
     type GroupHealthProbeMode,
     type GroupHealthStatus,
 } from '@/api/endpoints/group-health';
@@ -102,9 +110,16 @@ function attemptBadgeTone(status: GroupHealthAttemptStatus) {
     }
 }
 
-export function GroupHealthAttemptDetails({ attempt }: { attempt: GroupHealthAttempt }) {
+export function GroupHealthAttemptDetails({ attempt, groupId, activeItemCount = 0 }: { attempt: GroupHealthAttempt; groupId?: number; activeItemCount?: number }) {
     const t = useTranslations('group.health');
+    const exclude = useExcludeGroupHealthAttempt();
+    const [confirmOpen, setConfirmOpen] = useState(false);
     const hasError = Boolean(attempt.error_message);
+
+    const doExclude = (allowEmpty = false) => exclude.mutate(
+        { groupId: groupId!, attemptId: attempt.id, allowEmpty },
+        { onSuccess: () => toast.success(t('excludeSuccess')), onError: (error) => toast.error(error.message) },
+    );
 
     const content = (
         <div className="grid grid-cols-[1rem_minmax(0,1fr)_auto] items-start gap-x-2 text-xs">
@@ -123,9 +138,12 @@ export function GroupHealthAttemptDetails({ attempt }: { attempt: GroupHealthAtt
                     {attempt.model_name ? <><span className="shrink-0">·</span><span className="min-w-0 truncate">{attempt.model_name}</span></> : null}
                 </div>
             </div>
-            <Badge variant="outline" className={cn('shrink-0 text-[11px]', attemptBadgeTone(attempt.status))}>
-                {t(`attemptStatus.${attempt.status}`)}
-            </Badge>
+            <div className="flex shrink-0 items-center gap-1">
+                {attempt.membership_state !== 'active' ? <Badge variant="outline">{t(`membership.${attempt.membership_state}`)}</Badge> : null}
+                <Badge variant="outline" className={cn('shrink-0 text-[11px]', attemptBadgeTone(attempt.status))}>{t(`attemptStatus.${attempt.status}`)}</Badge>
+                {groupId && attempt.status === 'failed' && attempt.membership_state === 'active' ? <Button size="sm" variant="destructive" className="h-6 px-2 text-[11px]" disabled={exclude.isPending} onClick={(event) => { event.preventDefault(); event.stopPropagation(); if (activeItemCount <= 1) setConfirmOpen(true); else doExclude(); }}>{exclude.isPending ? <LoaderCircle className="size-3 animate-spin" /> : <ShieldMinus className="size-3" />}{t('exclude')}</Button> : null}
+                <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>{t('lastItemTitle')}</AlertDialogTitle><AlertDialogDescription>{t('lastItemDescription')}</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>{t('cancel')}</AlertDialogCancel><AlertDialogAction onClick={() => doExclude(true)}>{t('confirmExclude')}</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
+            </div>
         </div>
     );
 
@@ -154,13 +172,43 @@ export function GroupHealthAttemptDetails({ attempt }: { attempt: GroupHealthAtt
     );
 }
 
+export function GroupHealthExcludedItems({ groupId, items }: { groupId: number; items: GroupHealthExcludedItem[] }) {
+    const t = useTranslations('group.health');
+    const probeRestore = useProbeAndRestoreGroupHealthItem();
+    const probeRestoreAll = useProbeAndRestoreAllGroupHealthItems();
+    const forceRestore = useForceRestoreGroupHealthItem();
+    if (!items.length) return null;
+    return <div className="space-y-2">
+        <div className="flex items-center justify-between gap-2">
+            <div className="text-xs font-medium text-muted-foreground">{t('excludedItems', { count: items.length })}</div>
+            <Button size="sm" variant="outline" className="h-7 px-2 text-xs" disabled={probeRestoreAll.isPending || probeRestore.isPending || forceRestore.isPending} onClick={() => probeRestoreAll.mutate({ groupId }, { onSuccess: (result) => toast.success(t('batchRestoreResult', { restored: result.restored_count, failed: result.failed_count })), onError: (error) => toast.error(error.message) })}>
+                {probeRestoreAll.isPending ? <LoaderCircle className="size-3 animate-spin" /> : <RotateCcw className="size-3" />}
+                {t('restoreAllExcluded', { count: items.length })}
+            </Button>
+        </div>
+        {items.map((item) => {
+            const probing = probeRestore.isPending && probeRestore.variables?.itemId === item.id;
+            const forcing = forceRestore.isPending && forceRestore.variables?.itemId === item.id;
+            return <Card key={item.id} className="gap-0 border-amber-500/30 bg-amber-500/5 py-0"><CardContent className="flex items-center justify-between gap-2 px-3 py-2 text-xs">
+                <div className="min-w-0"><div className="truncate font-medium">{item.channel_name} · {item.model_name}</div><div className="truncate text-muted-foreground">{item.error_message || t('excluded')}</div></div>
+                <div className="flex shrink-0 gap-1">
+                    <Button size="sm" variant="outline" className="h-7 px-2 text-xs" disabled={probeRestoreAll.isPending || probing || forcing || !item.channel_enabled} onClick={() => probeRestore.mutate({ groupId, itemId: item.id }, { onSuccess: (result) => result.restored ? toast.success(t('restoreSuccess')) : toast.error(t('probeFailed'), { description: result.probe.error_message }), onError: (error) => toast.error(error.message) })}>{probing ? <LoaderCircle className="size-3 animate-spin" /> : <RotateCcw className="size-3" />}{t('probeRestore')}</Button>
+                    <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={probeRestoreAll.isPending || probing || forcing} onClick={() => forceRestore.mutate({ groupId, itemId: item.id }, { onSuccess: () => toast.success(t('restoreSuccess')), onError: (error) => toast.error(error.message) })}>{forcing ? <LoaderCircle className="size-3 animate-spin" /> : null}{t('forceRestore')}</Button>
+                </div>
+            </CardContent></Card>;
+        })}
+    </div>;
+}
+
 export function GroupHealthBadge({ groupId }: { groupId?: number }) {
     const t = useTranslations('group.health');
     const locale = useLocale();
     const { enabled } = useGroupHealthEnabled();
     const { data: views = [] } = useGroupHealthList();
     const runGroupHealth = useRunGroupHealth();
+    const excludeAllFailed = useExcludeAllFailedGroupHealthAttempts();
     const [open, setOpen] = useState(false);
+    const [batchConfirmOpen, setBatchConfirmOpen] = useState(false);
 
     const view = useMemo(
         () => views.find((item) => item.group_id === groupId),
@@ -169,6 +217,12 @@ export function GroupHealthBadge({ groupId }: { groupId?: number }) {
     const latest = view?.latest ?? null;
     const attempts = latest?.attempts ?? [];
     const successCount = attempts.filter((attempt) => attempt.status === 'success').length;
+    const failedActiveCount = attempts.filter((attempt) => attempt.status === 'failed' && attempt.membership_state === 'active').length;
+
+    const doBatchExclude = (allowEmpty = false) => excludeAllFailed.mutate(
+        { groupId: groupId!, allowEmpty },
+        { onSuccess: () => toast.success(t('batchExcludeSuccess', { count: failedActiveCount })), onError: (error) => toast.error(error.message) },
+    );
 
     if (!enabled || !groupId) return null;
 
@@ -273,14 +327,23 @@ export function GroupHealthBadge({ groupId }: { groupId?: number }) {
                     </Card>
                 </div>
 
+                {failedActiveCount > 0 ? <div className="flex justify-end">
+                    <Button type="button" size="sm" variant="destructive" disabled={excludeAllFailed.isPending || isRunning} onClick={() => { if (failedActiveCount >= (view?.active_item_count ?? 0)) setBatchConfirmOpen(true); else doBatchExclude(); }}>
+                        {excludeAllFailed.isPending ? <LoaderCircle className="size-4 animate-spin" /> : <ShieldMinus className="size-4" />}
+                        {t('excludeAllFailed', { count: failedActiveCount })}
+                    </Button>
+                    <AlertDialog open={batchConfirmOpen} onOpenChange={setBatchConfirmOpen}><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>{t('batchLastItemTitle')}</AlertDialogTitle><AlertDialogDescription>{t('batchLastItemDescription', { count: failedActiveCount })}</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>{t('cancel')}</AlertDialogCancel><AlertDialogAction onClick={() => doBatchExclude(true)}>{t('confirmExclude')}</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
+                </div> : null}
+
                 <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
                     {attempts.length ? attempts.map((attempt) => (
-                        <GroupHealthAttemptDetails key={attempt.id} attempt={attempt} />
+                        <GroupHealthAttemptDetails key={attempt.id} attempt={attempt} groupId={groupId} activeItemCount={view?.active_item_count ?? 0} />
                     )) : (
                         <div className="rounded-2xl border border-dashed border-border/70 bg-muted/20 px-3 py-6 text-center text-xs text-muted-foreground">
                             {t('empty')}
                         </div>
                     )}
+                    <GroupHealthExcludedItems groupId={groupId} items={view?.excluded_items ?? []} />
                 </div>
             </DialogContent>
         </Dialog>

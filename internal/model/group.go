@@ -28,12 +28,14 @@ type Group struct {
 }
 
 type GroupItem struct {
-	ID        int    `json:"id" gorm:"primaryKey"`
-	GroupID   int    `json:"group_id" gorm:"not null;index:idx_group_channel_model,unique"` // 创建时不携带此字段,更新时需要
-	ChannelID int    `json:"channel_id" gorm:"not null;index:idx_group_channel_model,unique"`
-	ModelName string `json:"model_name" gorm:"not null;index:idx_group_channel_model,unique"`
-	Priority  int    `json:"priority"`
-	Weight    int    `json:"weight"`
+	ID                  int        `json:"id" gorm:"primaryKey"`
+	GroupID             int        `json:"group_id" gorm:"not null;index:idx_group_channel_model,unique"` // 创建时不携带此字段,更新时需要
+	ChannelID           int        `json:"channel_id" gorm:"not null;index:idx_group_channel_model,unique"`
+	ModelName           string     `json:"model_name" gorm:"not null;index:idx_group_channel_model,unique"`
+	Priority            int        `json:"priority"`
+	Weight              int        `json:"weight"`
+	ExcludedAt          *time.Time `json:"excluded_at,omitempty" gorm:"index"`
+	ExcludedByAttemptID *int       `json:"excluded_by_attempt_id,omitempty"`
 }
 
 // GroupPreset 分组的路由配置预设（命名快照）
@@ -61,6 +63,7 @@ type GroupPresetItem struct {
 	ModelName string `json:"model_name"`
 	Priority  int    `json:"priority"`
 	Weight    int    `json:"weight"`
+	Excluded  bool   `json:"excluded,omitempty"`
 }
 
 // GroupUpdateRequest 分组更新请求 - 仅包含变更的数据

@@ -655,7 +655,26 @@
             },
             "empty": "No health snapshot yet.",
             "errorDetails": "Error details",
-            "noHttpStatus": "No HTTP status"
+            "noHttpStatus": "No HTTP status",
+            "exclude": "Exclude",
+            "excluded": "Excluded",
+            "excludedItems": "Excluded items ({count})",
+            "excludeSuccess": "Excluded from this group",
+            "probeRestore": "Probe & restore",
+            "excludeAllFailed": "Exclude all failed ({count})",
+            "restoreAllExcluded": "Probe & restore all ({count})",
+            "batchExcludeSuccess": "Excluded {count} failed items",
+            "batchRestoreResult": "Probe complete: {restored} restored, {failed} still failing",
+            "batchLastItemTitle": "Exclude all failed items?",
+            "batchLastItemDescription": "This will exclude {count} failed items and leave the group with no item available for routing. You can probe and restore them later.",
+            "forceRestore": "Force restore",
+            "restoreSuccess": "Restored to this group",
+            "probeFailed": "Probe failed; item remains excluded",
+            "lastItemTitle": "Exclude the last active item?",
+            "lastItemDescription": "This group will have no item available for routing. You can restore it later.",
+            "confirmExclude": "Exclude anyway",
+            "cancel": "Cancel",
+            "membership": { "active": "Active", "excluded": "Excluded", "missing": "Removed" }
         },
         "empty": "No groups yet, click the button above to create one",
         "autoGroup": {
@@ -1012,6 +1031,15 @@
             "create_failed": "Failed to create the group.",
             "update_failed": "Failed to update the group.",
             "delete_failed": "Failed to delete the group."
+        },
+        "group_health": {
+            "item_not_found": "The group channel-model item was not found.",
+            "last_active_item": "This is the group's last active item. Confirm before excluding it.",
+            "attempt_not_failed": "Only failed health attempts can be excluded.",
+            "attempt_stale": "Only the latest health result can be changed.",
+            "attempt_mismatch": "The health attempt does not belong to this group.",
+            "already_running": "A health check is already running for this group.",
+            "item_not_excluded": "This item is not excluded."
         },
         "model": {
             "price_update_failed": "Failed to update model prices.",

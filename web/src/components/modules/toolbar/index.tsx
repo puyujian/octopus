@@ -537,7 +537,12 @@ export function Toolbar() {
                             </button>
                         </MorphingDialogTrigger>
                         <MorphingDialogContainer>
-                            <MorphingDialogContent className="relative w-screen max-w-full md:max-w-4xl bg-card text-card-foreground px-4 py-3 sm:px-6 sm:py-4 rounded-2xl sm:rounded-3xl h-[calc(100dvh-1rem)] sm:h-[calc(100vh-2rem)] flex flex-col overflow-hidden">
+                            <MorphingDialogContent className={cn(
+                                'relative w-screen max-w-full md:max-w-4xl bg-card text-card-foreground px-4 py-3 sm:px-6 sm:py-4 rounded-2xl sm:rounded-3xl flex flex-col',
+                                toolbarItem === 'group'
+                                    ? 'h-auto max-h-[calc(100dvh-1rem)] overflow-y-auto overscroll-contain md:h-[calc(100vh-2rem)] md:max-h-none md:overflow-hidden'
+                                    : 'h-[calc(100dvh-1rem)] sm:h-[calc(100vh-2rem)] overflow-hidden',
+                            )}>
                                 <CreateDialogContent activeItem={toolbarItem} />
                             </MorphingDialogContent>
                         </MorphingDialogContainer>

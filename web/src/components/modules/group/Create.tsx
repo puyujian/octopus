@@ -18,7 +18,7 @@ export function CreateDialogContent() {
     const t = useTranslations('group');
 
     return (
-        <div className="w-screen max-w-full md:max-w-4xl h-[calc(100dvh-1rem)] sm:h-[calc(100vh-2rem)] min-h-0 flex flex-col">
+        <div className="w-screen max-w-full md:max-w-4xl h-auto max-h-full min-h-0 flex flex-col md:h-full">
             <MorphingDialogTitle className="shrink-0">
                 <header className="mb-5 flex items-center justify-between">
                     <h2 className="text-2xl font-bold text-card-foreground">
@@ -34,12 +34,12 @@ export function CreateDialogContent() {
                     />
                 </header>
             </MorphingDialogTitle>
-            <MorphingDialogDescription className="flex-1 min-h-0 overflow-hidden flex flex-col">
+            <MorphingDialogDescription className="flex-none overflow-visible flex flex-col md:flex-1 md:min-h-0 md:overflow-hidden">
                 <GroupEditor
                     submitText={t('create.submit')}
                     submittingText={t('create.submitting')}
                     isSubmitting={createGroup.isPending}
-                    onSubmit={({ name, match_regex, mode, first_token_time_out, session_keep_time, retry_enabled, members }) => {
+                    onSubmit={({ name, match_regex, param_override, mode, first_token_time_out, session_keep_time, retry_enabled, max_retries, members }) => {
                         const items: GroupItem[] = members.map((member, index) => ({
                             channel_id: member.channel_id,
                             model_name: member.name,
@@ -48,7 +48,7 @@ export function CreateDialogContent() {
                         }));
 
                         createGroup.mutate(
-                            { name, mode, match_regex: match_regex ?? '', first_token_time_out: first_token_time_out ?? 0, session_keep_time: session_keep_time ?? 0, retry_enabled, items },
+                            { name, mode, match_regex: match_regex ?? '', first_token_time_out: first_token_time_out ?? 0, session_keep_time: session_keep_time ?? 0, retry_enabled, max_retries, param_override: param_override || null, items },
                             {
                                 onSuccess: () => setIsOpen(false),
                                 onError: (error) => toast.error(t('toast.createFailed'), { description: error.message }),

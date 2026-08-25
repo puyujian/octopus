@@ -33,6 +33,17 @@ func NewProber() *Prober {
 }
 
 func (p *Prober) RunCandidate(ctx context.Context, channel model.Channel, usedKey model.ChannelKey, modelName string) ProbeResult {
+	return p.runCandidate(ctx, channel, usedKey, modelName, nil)
+}
+
+// RunCandidateWithGroupOverride probes a channel using the same group-level
+// force override as a normal relay request. The separate method keeps the
+// existing channelProber interface compatible with outlier-retirement tests.
+func (p *Prober) RunCandidateWithGroupOverride(ctx context.Context, channel model.Channel, usedKey model.ChannelKey, modelName string, groupOverride *string) ProbeResult {
+	return p.runCandidate(ctx, channel, usedKey, modelName, groupOverride)
+}
+
+func (p *Prober) runCandidate(ctx context.Context, channel model.Channel, usedKey model.ChannelKey, modelName string, groupOverride *string) ProbeResult {
 	startedAt := time.Now()
 	result := ProbeResult{}
 
@@ -56,7 +67,7 @@ func (p *Prober) RunCandidate(ctx context.Context, channel model.Channel, usedKe
 	if request.Header.Get("User-Agent") == "" {
 		request.Header.Set("User-Agent", "")
 	}
-	if err := helper.ApplyParamOverride(request, channel.ParamOverride); err != nil {
+	if err := helper.ApplyParamOverrides(request, channel.ParamOverride, groupOverride); err != nil {
 		result.ErrorMessage = err.Error()
 		result.DurationMS = time.Since(startedAt).Milliseconds()
 		return result

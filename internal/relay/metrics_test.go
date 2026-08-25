@@ -2,9 +2,70 @@ package relay
 
 import (
 	"testing"
+	"time"
 
+	"github.com/bestruirui/octopus/internal/model"
 	transformerModel "github.com/bestruirui/octopus/internal/transformer/model"
 )
+
+func TestRelayLogTPSSetsGenerationRate(t *testing.T) {
+	tests := []struct {
+		name       string
+		output     int
+		ftut       int
+		useTime    int
+		want       float64
+		wantAbsent bool
+	}{
+		{name: "generation window", output: 100, ftut: 500, useTime: 2500, want: 50},
+		{name: "no first token", output: 100, useTime: 2000, want: 50},
+		{name: "invalid first token falls back", output: 100, ftut: 2500, useTime: 2500, want: 40},
+		{name: "no output", output: 0, useTime: 1000, wantAbsent: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			log := model.RelayLog{OutputTokens: tt.output, Ftut: tt.ftut, UseTime: tt.useTime}
+			log.PopulateDerivedMetrics()
+			if tt.wantAbsent {
+				if log.TPS != nil {
+					t.Fatalf("TPS = %v, want nil", *log.TPS)
+				}
+				return
+			}
+			if log.TPS == nil || *log.TPS != tt.want {
+				t.Fatalf("TPS = %v, want %v", log.TPS, tt.want)
+			}
+		})
+	}
+}
+
+func TestRelayLogTPSUsesWholeDurationWhenFTUTUnavailable(t *testing.T) {
+	log := model.RelayLog{OutputTokens: 3, Ftut: -1, UseTime: 1500}
+	log.PopulateDerivedMetrics()
+	if log.TPS == nil || *log.TPS != 2 {
+		t.Fatalf("TPS = %v, want 2", log.TPS)
+	}
+}
+
+func TestRelayMetricsSetTransportRequestPayloadExtractsReasoning(t *testing.T) {
+	m := NewRelayMetrics(0, "model", nil, nil)
+	m.SetTransportRequestPayload([]byte(`{"reasoning":{"effort":"high"}}`), "model")
+	if m.ReasoningEffort != "high" {
+		t.Fatalf("ReasoningEffort = %q, want high", m.ReasoningEffort)
+	}
+	if m.TransportInputTokens == nil || *m.TransportInputTokens == 0 {
+		t.Fatalf("expected transport token estimate")
+	}
+}
+
+func TestRelayLogTPSSaveCompatibility(t *testing.T) {
+	start := time.Now()
+	log := model.RelayLog{Time: start.Unix(), OutputTokens: 12, Ftut: 100, UseTime: 700}
+	log.PopulateDerivedMetrics()
+	if log.TPS == nil || *log.TPS != 20 {
+		t.Fatalf("TPS = %v, want 20", log.TPS)
+	}
+}
 
 // usage 完全缺失时，应使用 TransportInputTokens 兜底填充 input，output 保持 0。
 func TestSetInternalResponseFallbackWhenUsageMissing(t *testing.T) {

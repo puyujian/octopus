@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"github.com/bestruirui/octopus/internal/apperror"
+	"github.com/bestruirui/octopus/internal/helper"
 	"github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/op"
 	"github.com/bestruirui/octopus/internal/server/middleware"
@@ -150,6 +151,12 @@ func updateGroupPreset(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		resp.InvalidJSON(c)
 		return
+	}
+	if req.ParamOverride != nil {
+		if err := helper.ValidateGroupParamOverride(*req.ParamOverride); err != nil {
+			resp.ErrorWithAppError(c, http.StatusBadRequest, apperror.New(apperror.CodeCommonValidationFailed, err.Error()).WithStatus(http.StatusBadRequest))
+			return
+		}
 	}
 	if req.MatchRegex != nil && *req.MatchRegex != "" {
 		if _, err := regexp2.Compile(*req.MatchRegex, regexp2.ECMAScript); err != nil {

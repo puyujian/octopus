@@ -60,6 +60,7 @@ export interface RelayLog {
     channel: number;             // 实际使用的渠道ID
     channel_name: string;        // 渠道名称
     actual_model_name: string;   // 实际使用模型名称
+    reasoning_effort?: string | null; // 最终发送到上游的思考强度/配置
     input_tokens: number;        // 输入Token
     transport_input_tokens?: number | null; // 实际发送到上游请求体的 Token 估算
     bill_input_tokens?: number | null; // 按常规输入价格计费的 Token
@@ -78,6 +79,7 @@ export interface RelayLog {
     ws_mode?: RelayLogWSMode | null; // 上游 WebSocket 会话模式
     ws_exec_mode?: RelayLogWSExecMode | null; // 上游 WebSocket 事件处理方式
     ws_recovery?: RelayLogWSRecovery | null; // 本次请求触发的恢复动作
+    tps?: number | null;         // 生成阶段 Token/s
 }
 
 export type LogStatusFilter = 'all' | 'success' | 'error';

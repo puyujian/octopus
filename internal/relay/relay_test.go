@@ -911,6 +911,70 @@ func TestHandlerAppliesChannelParamOverride(t *testing.T) {
 	}
 }
 
+func TestHandlerAppliesGroupParamOverrideAfterChannelOverride(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := setupRelayTestDB(t)
+
+	var capturedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		capturedBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream request body failed: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_group_override","object":"chat.completion","created":1,"model":"group-override-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"}}]}`))
+	}))
+	defer server.Close()
+
+	channelOverride := `{"temperature":0.2,"nested":{"channel":true}}`
+	groupOverride := `{"temperature":0.9,"nested":{"group":true}}`
+	channel := &model.Channel{
+		Name:          "relay-group-param-override",
+		Type:          outbound.OutboundTypeOpenAIChat,
+		Enabled:       true,
+		BaseUrls:      []model.BaseUrl{{URL: server.URL + "/v1"}},
+		Model:         "group-override-model",
+		Keys:          []model.ChannelKey{{Enabled: true, ChannelKey: "group-override-key"}},
+		ParamOverride: &channelOverride,
+	}
+	if err := op.ChannelCreate(channel, ctx); err != nil {
+		t.Fatalf("ChannelCreate failed: %v", err)
+	}
+	group := &model.Group{Name: "relay-group-param-override-group", Mode: model.GroupModeFailover, ParamOverride: &groupOverride}
+	if err := op.GroupCreate(group, ctx); err != nil {
+		t.Fatalf("GroupCreate failed: %v", err)
+	}
+	if err := op.GroupItemAdd(&model.GroupItem{GroupID: group.ID, ChannelID: channel.ID, ModelName: "group-override-model", Priority: 1, Weight: 1}, ctx); err != nil {
+		t.Fatalf("GroupItemAdd failed: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"relay-group-param-override-group","messages":[{"role":"user","content":"hello"}],"temperature":1,"nested":{"original":true}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	Handler(inbound.InboundTypeOpenAIChat, c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected relay handler to succeed, got status %d body %s", recorder.Code, recorder.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(capturedBody, &payload); err != nil {
+		t.Fatalf("unmarshal upstream request failed: %v", err)
+	}
+	if payload["temperature"] != 0.9 {
+		t.Fatalf("expected group temperature override to win, got %#v", payload["temperature"])
+	}
+	nested, ok := payload["nested"].(map[string]any)
+	if !ok || nested["channel"] != true || nested["group"] != true {
+		t.Fatalf("expected group recursive merge after channel override, got %#v", payload["nested"])
+	}
+	if _, exists := nested["original"]; exists {
+		t.Fatalf("expected channel shallow merge to replace original nested body, got %#v", nested)
+	}
+}
+
 func TestRelayMetricsUsesResponseModelForCostLookup(t *testing.T) {
 	metrics := NewRelayMetrics(0, "alias-model", nil, &transformerModel.InternalLLMRequest{Model: "alias-model"})
 	metrics.StartTime = time.Now()

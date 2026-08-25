@@ -49,12 +49,13 @@ function EditDialogContent({ group, displayMembers, isSubmitting, onSubmit }: Ed
                     <MorphingDialogClose className="relative right-0 top-0" />
                 </header>
             </MorphingDialogTitle>
-            <MorphingDialogDescription className="flex-1 min-h-0 overflow-hidden flex flex-col">
+            <MorphingDialogDescription className="flex-none overflow-visible flex flex-col md:flex-1 md:min-h-0 md:overflow-hidden">
                 <GroupEditor
                     key={`edit-group-${group.id}`}
                     initial={{
                         name: group.name,
                         match_regex: group.match_regex ?? '',
+                        param_override: group.param_override ?? '',
                         mode: group.mode,
                         first_token_time_out: group.first_token_time_out ?? 0,
                         session_keep_time: group.session_keep_time ?? 0,
@@ -260,12 +261,14 @@ export function GroupCard({ group }: { group: Group }) {
         const payload: GroupUpdateRequest = { id: group.id };
         const nextName = values.name.trim();
         const nextRegex = (values.match_regex ?? '').trim();
+        const nextParamOverride = (values.param_override ?? '').trim();
         const nextFirstTokenTimeOut = values.first_token_time_out ?? 0;
         const nextSessionKeepTime = values.session_keep_time ?? 0;
 
         if (nextName && nextName !== group.name) payload.name = nextName;
         if (values.mode !== group.mode) payload.mode = values.mode;
         if (nextRegex !== (group.match_regex ?? '')) payload.match_regex = nextRegex;
+        if (nextParamOverride !== (group.param_override ?? '')) payload.param_override = nextParamOverride;
         if (nextFirstTokenTimeOut !== (group.first_token_time_out ?? 0)) payload.first_token_time_out = nextFirstTokenTimeOut;
         if (nextSessionKeepTime !== (group.session_keep_time ?? 0)) payload.session_keep_time = nextSessionKeepTime;
         if (values.retry_enabled !== (group.retry_enabled ?? false)) payload.retry_enabled = values.retry_enabled;
@@ -286,7 +289,7 @@ export function GroupCard({ group }: { group: Group }) {
             },
             onError,
         });
-    }, [group.first_token_time_out, group.session_keep_time, group.retry_enabled, group.max_retries, group.id, group.items, group.match_regex, group.mode, group.name, onSuccess, onError, updateGroup]);
+    }, [group.first_token_time_out, group.session_keep_time, group.retry_enabled, group.max_retries, group.param_override, group.id, group.items, group.match_regex, group.mode, group.name, onSuccess, onError, updateGroup]);
 
     return (
         <article className="relative group/card flex flex-col rounded-3xl border border-border bg-card text-card-foreground p-4 custom-shadow">
@@ -326,7 +329,7 @@ export function GroupCard({ group }: { group: Group }) {
                         </MorphingDialogTrigger>
 
                         <MorphingDialogContainer>
-                            <MorphingDialogContent className="relative w-screen max-w-full md:max-w-4xl bg-card text-card-foreground px-4 py-3 sm:px-6 sm:py-4 rounded-2xl sm:rounded-3xl h-[calc(100dvh-1rem)] sm:h-[calc(100vh-2rem)] flex flex-col overflow-hidden">
+                            <MorphingDialogContent className="relative w-screen max-w-full md:max-w-4xl bg-card text-card-foreground px-4 py-3 sm:px-6 sm:py-4 rounded-2xl sm:rounded-3xl h-auto max-h-[calc(100dvh-1rem)] overflow-y-auto overscroll-contain md:h-[calc(100vh-2rem)] md:max-h-none md:overflow-hidden flex flex-col">
                                 <EditDialogContent
                                     group={group}
                                     displayMembers={displayMembers}

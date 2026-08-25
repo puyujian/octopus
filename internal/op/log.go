@@ -302,6 +302,7 @@ func RelayLogAdd(ctx context.Context, relayLog model.RelayLog) error {
 		return err
 	}
 	relayLog.ID = snowflake.GenerateID()
+	relayLog.PopulateDerivedMetrics()
 	notifySubscribers(relayLog)
 	appendRelayLogRecent(relayLog)
 
@@ -610,6 +611,7 @@ func RelayLogListWithFilter(ctx context.Context, filter RelayLogListFilter) (Rel
 		}
 	}
 
+	populateDerivedRelayLogs(logs)
 	return RelayLogListResult{Logs: logs, Total: total, SearchMode: relayLogSearchMode(filter), Warning: warning}, nil
 }
 
@@ -652,6 +654,7 @@ func relayLogListCursor(ctx context.Context, filter RelayLogListFilter, cachedLo
 		last := logs[len(logs)-1]
 		nextCursor = &RelayLogCursor{Time: last.Time, ID: last.ID}
 	}
+	populateDerivedRelayLogs(logs)
 	return RelayLogListResult{Logs: logs, HasMore: hasMore, NextCursor: nextCursor}, nil
 }
 
@@ -693,6 +696,7 @@ func selectRelayLogListFields(query *gorm.DB, includeContent bool) *gorm.DB {
 		"channel_id",
 		"channel_name",
 		"actual_model_name",
+		"reasoning_effort",
 		"input_tokens",
 		"transport_input_tokens",
 		"bill_input_tokens",
@@ -748,7 +752,14 @@ func RelayLogGet(ctx context.Context, id int64) (*model.RelayLog, error) {
 	if err := db.GetDB().WithContext(ctx).First(&entry, "id = ?", id).Error; err != nil {
 		return nil, err
 	}
+	entry.PopulateDerivedMetrics()
 	return &entry, nil
+}
+
+func populateDerivedRelayLogs(logs []model.RelayLog) {
+	for i := range logs {
+		logs[i].PopulateDerivedMetrics()
+	}
 }
 
 func relayLogCachedMatches(filter RelayLogListFilter, channelSet map[int]struct{}, keyword string, enabled bool, light bool) []model.RelayLog {

@@ -179,7 +179,7 @@ func ImagesHandler(endpoint string, c *gin.Context) {
 		span := iter.StartAttempt(channel.ID, usedKey.ID, channel.Name)
 
 		// 尝试一次转发
-		statusCode, written, usage, upstreamCT, fwdErr := imagesAttempt(ctx, endpoint, c, bc, isMultipart, boundary, jsonPayload, stream, channel, usedKey.ChannelKey, group.FirstTokenTimeOut, metrics, item.ModelName, hb)
+		statusCode, written, usage, upstreamCT, fwdErr := imagesAttempt(ctx, endpoint, c, bc, isMultipart, boundary, jsonPayload, stream, channel, usedKey.ChannelKey, group.FirstTokenTimeOut, group.ParamOverride, metrics, item.ModelName, hb)
 
 		// 更新 channel key 状态
 		usedKey.StatusCode = statusCode
@@ -292,6 +292,12 @@ func (m *imagesRelayMetrics) Save(ctx context.Context, success bool, err error, 
 
 func (m *imagesRelayMetrics) SaveWithChannelStats(ctx context.Context, success bool, err error, attempts []model.ChannelAttempt, updateChannelStats bool) {
 	duration := time.Since(m.StartTime)
+	ftut := int64(0)
+	if !m.FirstToken.IsZero() {
+		ftut = m.FirstToken.Sub(m.StartTime).Milliseconds()
+	}
+	tpsLog := model.RelayLog{OutputTokens: int(m.Stats.OutputToken), Ftut: int(ftut), UseTime: int(duration.Milliseconds())}
+	tpsLog.PopulateDerivedMetrics()
 
 	globalStats := model.StatsMetrics{
 		WaitTime:    duration.Milliseconds(),
@@ -328,6 +334,7 @@ func (m *imagesRelayMetrics) SaveWithChannelStats(ctx context.Context, success b
 			"duration_ms", duration.Milliseconds(),
 			"input_token", m.Stats.InputToken,
 			"output_token", m.Stats.OutputToken,
+			"tps", tpsLog.TPS,
 			"input_cost", m.Stats.InputCost,
 			"output_cost", m.Stats.OutputCost,
 			"total_cost", m.Stats.InputCost + m.Stats.OutputCost,
@@ -382,6 +389,7 @@ func (m *imagesRelayMetrics) saveLog(ctx context.Context, success bool, err erro
 		relayLog.Error = err.Error()
 	}
 	relayLog.Success = success
+	relayLog.PopulateDerivedMetrics()
 
 	if logErr := op.RelayLogAdd(ctx, relayLog); logErr != nil {
 		log.Warnf("failed to save relay log: %v", logErr)
@@ -538,6 +546,7 @@ func imagesAttempt(
 	channel *model.Channel,
 	channelKey string,
 	firstTokenTimeOutSec int,
+	groupOverride *string,
 	metrics *imagesRelayMetrics,
 	actualModel string,
 	hb *earlyHeartbeat,
@@ -588,6 +597,10 @@ func imagesAttempt(
 		b, err := json.Marshal(jsonPayload)
 		if err != nil {
 			return 0, false, nil, "", fmt.Errorf("failed to marshal json: %w", err)
+		}
+		b, err = helper.ApplyJSONParamOverrides(b, channel.ParamOverride, groupOverride)
+		if err != nil {
+			return 0, false, nil, "", fmt.Errorf("failed to apply parameter override: %w", err)
 		}
 		bodyReader = bytes.NewReader(b)
 		contentType = "application/json"

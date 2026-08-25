@@ -29,12 +29,13 @@ type RelayMetrics struct {
 	InternalResponse *transformerModel.InternalLLMResponse
 
 	// 统计指标
-	ActualModel string
-	Stats       model.StatsMetrics
-	UsedWS      bool
-	WSMode      *model.RelayLogWSMode
-	WSExecMode  *model.RelayLogWSExecMode
-	WSRecovery  *model.RelayLogWSRecovery
+	ActualModel     string
+	Stats           model.StatsMetrics
+	ReasoningEffort string
+	UsedWS          bool
+	WSMode          *model.RelayLogWSMode
+	WSExecMode      *model.RelayLogWSExecMode
+	WSRecovery      *model.RelayLogWSRecovery
 
 	TransportInputTokens *int
 	BillInputTokens      *int
@@ -62,6 +63,7 @@ func (m *RelayMetrics) SetTransportRequestPayload(payload []byte, modelName stri
 	}
 	count := tokenizer.CountTokens(string(payload), modelName)
 	m.TransportInputTokens = intPtr(count)
+	m.ReasoningEffort = extractReasoningEffort(payload)
 }
 
 func (m *RelayMetrics) SetWSMode(mode model.RelayLogWSMode) {
@@ -133,6 +135,12 @@ func (m *RelayMetrics) Save(ctx context.Context, success bool, err error, attemp
 
 func (m *RelayMetrics) SaveWithChannelStats(ctx context.Context, success bool, err error, attempts []model.ChannelAttempt, updateChannelStats bool) {
 	duration := time.Since(m.StartTime)
+	ftut := int64(0)
+	if !m.FirstTokenTime.IsZero() {
+		ftut = m.FirstTokenTime.Sub(m.StartTime).Milliseconds()
+	}
+	tpsLog := model.RelayLog{OutputTokens: int(m.Stats.OutputToken), Ftut: int(ftut), UseTime: int(duration.Milliseconds())}
+	tpsLog.PopulateDerivedMetrics()
 
 	globalStats := model.StatsMetrics{
 		WaitTime:    duration.Milliseconds(),
@@ -185,6 +193,8 @@ func (m *RelayMetrics) SaveWithChannelStats(ctx context.Context, success bool, e
 			"duration_ms", duration.Milliseconds(),
 			"input_token", m.Stats.InputToken,
 			"output_token", m.Stats.OutputToken,
+			"reasoning_effort", m.ReasoningEffort,
+			"tps", tpsLog.TPS,
 			"input_cost", m.Stats.InputCost,
 			"output_cost", m.Stats.OutputCost,
 			"total_cost", m.Stats.InputCost + m.Stats.OutputCost,
@@ -229,6 +239,7 @@ func (m *RelayMetrics) saveLog(ctx context.Context, success bool, err error, dur
 		ChannelName:      channelName,
 		ChannelId:        channelID,
 		ActualModelName:  actualModel,
+		ReasoningEffort:  m.ReasoningEffort,
 		UseTime:          int(duration.Milliseconds()),
 		Attempts:         attempts,
 		TotalAttempts:    len(attempts),
@@ -279,6 +290,7 @@ func (m *RelayMetrics) saveLog(ctx context.Context, success bool, err error, dur
 		relayLog.Error = err.Error()
 	}
 	relayLog.Success = success
+	relayLog.PopulateDerivedMetrics()
 
 	if logErr := op.RelayLogAdd(ctx, relayLog); logErr != nil {
 		log.Warnf("failed to save relay log: %v", logErr)

@@ -3,6 +3,7 @@ package op
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/bestruirui/octopus/internal/db"
 	"github.com/bestruirui/octopus/internal/model"
@@ -61,6 +62,15 @@ func GroupGetEnabledMap(name string, ctx context.Context) (model.Group, error) {
 }
 
 func GroupCreate(group *model.Group, ctx context.Context) error {
+	if group == nil {
+		return fmt.Errorf("group is nil")
+	}
+	if group.ParamOverride != nil {
+		if err := ValidateGroupParamOverride(*group.ParamOverride); err != nil {
+			return err
+		}
+		group.ParamOverride = normalizeParamOverride(group.ParamOverride)
+	}
 	if err := db.GetDB().WithContext(ctx).Create(group).Error; err != nil {
 		return err
 	}
@@ -118,6 +128,14 @@ func GroupUpdate(req *model.GroupUpdateRequest, ctx context.Context) (*model.Gro
 		}
 		selectFields = append(selectFields, "max_retries")
 		updates.MaxRetries = v
+	}
+	if req.ParamOverride != nil {
+		if err := ValidateGroupParamOverride(*req.ParamOverride); err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+		selectFields = append(selectFields, "param_override")
+		updates.ParamOverride = normalizeParamOverride(req.ParamOverride)
 	}
 
 	if len(selectFields) > 0 {
@@ -212,7 +230,7 @@ func groupUpdateAffectedChannelIDs(oldGroup model.Group, req *model.GroupUpdateR
 			ids = append(ids, item.ChannelID)
 		}
 	}
-	if req.RetryEnabled != nil || req.MaxRetries != nil {
+	if req.RetryEnabled != nil || req.MaxRetries != nil || req.ParamOverride != nil {
 		for _, item := range oldGroup.Items {
 			ids = append(ids, item.ChannelID)
 		}
@@ -227,6 +245,17 @@ func groupUpdateAffectedChannelIDs(oldGroup model.Group, req *model.GroupUpdateR
 		ids = append(ids, item.ChannelID)
 	}
 	return ids
+}
+
+func normalizeParamOverride(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*value)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
 }
 
 func GroupDel(id int, ctx context.Context) error {

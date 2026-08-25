@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bestruirui/octopus/internal/helper"
 	dbmodel "github.com/bestruirui/octopus/internal/model"
 	transformerModel "github.com/bestruirui/octopus/internal/transformer/model"
 	openaiOutbound "github.com/bestruirui/octopus/internal/transformer/outbound/openai"
@@ -69,7 +70,7 @@ func (ra *relayAttempt) forwardViaWSPassthrough(ctx context.Context) (int, error
 	payload, err := ra.buildWSPassthroughRequestPayload()
 	if err != nil {
 		wsUpstreamPool.Put(pc)
-		return -1, nil
+		return 0, err
 	}
 	ra.metrics.SetTransportRequestPayload(payload, ra.internalRequest.Model)
 	if err := wsUpstreamPool.SendRaw(ctx, pc, payload); err != nil {
@@ -158,13 +159,17 @@ func (ra *relayAttempt) retryViaFreshUpstreamWSPassthrough(ctx context.Context, 
 
 func (ra *relayAttempt) buildWSPassthroughRequestPayload() ([]byte, error) {
 	body := ra.rawBody
+	var err error
 	if len(body) == 0 {
 		responsesReq := openaiOutbound.ConvertToResponsesRequest(ra.internalRequest)
-		var err error
 		body, err = json.Marshal(responsesReq)
 		if err != nil {
 			return nil, err
 		}
+	}
+	body, err = helper.ApplyJSONParamOverrides(body, ra.channel.ParamOverride, ra.groupParamOverride)
+	if err != nil {
+		return nil, fmt.Errorf("failed to apply parameter override: %w", err)
 	}
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {

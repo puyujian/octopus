@@ -20,6 +20,7 @@ type Group struct {
 	SessionKeepTime   int         `json:"session_keep_time"`                  // 会话保持时间(秒) 0 为禁用
 	RetryEnabled      bool        `json:"retry_enabled" gorm:"default:false"` // 启用同通道重试+透传429/503
 	MaxRetries        int         `json:"max_retries" gorm:"default:3"`       // 同通道最大重试次数(RetryEnabled启用时生效)
+	ParamOverride     *string     `json:"param_override,omitempty"`           // 分组级 JSON 参数强制覆盖
 	Pinned            bool        `json:"pinned" gorm:"default:false;index"`  // 置顶
 	PinnedAt          *time.Time  `json:"pinned_at,omitempty"`                // 置顶时间，置顶时写入，取消置顶时置空
 	ActivePresetID    *int        `json:"active_preset_id,omitempty"`         // 当前激活的预设ID，仅 UI 标记，不参与路由
@@ -47,6 +48,7 @@ type GroupPreset struct {
 	SessionKeepTime   int               `json:"session_keep_time"`
 	RetryEnabled      bool              `json:"retry_enabled"`
 	MaxRetries        int               `json:"max_retries"`
+	ParamOverride     *string           `json:"param_override,omitempty"` // 分组级 JSON 参数强制覆盖
 	Items             []GroupPresetItem `json:"items" gorm:"serializer:json;type:text"`
 	CreatedAt         time.Time         `json:"created_at"`
 	UpdatedAt         time.Time         `json:"updated_at"`
@@ -71,6 +73,7 @@ type GroupUpdateRequest struct {
 	SessionKeepTime   *int                     `json:"session_keep_time,omitempty"`    // 仅在会话保持时间变更时发送(秒)
 	RetryEnabled      *bool                    `json:"retry_enabled,omitempty"`        // 启用同通道重试+透传429/503
 	MaxRetries        *int                     `json:"max_retries,omitempty"`          // 同通道最大重试次数
+	ParamOverride     *string                  `json:"param_override,omitempty"`       // 分组级 JSON 参数强制覆盖，空字符串清除
 	ItemsToAdd        []GroupItemAddRequest    `json:"items_to_add,omitempty"`         // 新增的 items
 	ItemsToUpdate     []GroupItemUpdateRequest `json:"items_to_update,omitempty"`      // 更新的 items (priority 变更)
 	ItemsToDelete     []int                    `json:"items_to_delete,omitempty"`      // 删除的 item IDs
@@ -112,6 +115,7 @@ type GroupPresetUpdateRequest struct {
 	SessionKeepTime   *int               `json:"session_keep_time,omitempty"`
 	RetryEnabled      *bool              `json:"retry_enabled,omitempty"`
 	MaxRetries        *int               `json:"max_retries,omitempty"`
+	ParamOverride     *string            `json:"param_override,omitempty"`
 	Items             *[]GroupPresetItem `json:"items,omitempty"`
 }
 

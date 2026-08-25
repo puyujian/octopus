@@ -177,3 +177,26 @@ func ValidateJSONOverrideObject(value string) error {
 	}
 	return nil
 }
+
+// ValidateGroupParamOverride validates a group-level override and rejects
+// fields that are owned by routing or transport layers.
+func ValidateGroupParamOverride(value string) error {
+	if err := ValidateJSONOverrideObject(value); err != nil {
+		return err
+	}
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &decoded); err != nil {
+		return err
+	}
+	for key := range decoded {
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "model", "stream", "type":
+			return fmt.Errorf("param_override cannot override protected field %q", key)
+		}
+	}
+	return nil
+}

@@ -165,7 +165,7 @@ func HandleResponsesCompact(c *gin.Context) {
 				}
 			}
 
-			statusCode, retryAfter, attemptErr = forwardResponsesCompact(c, metrics, iter, channel, usedKey, body)
+			statusCode, retryAfter, attemptErr = forwardResponsesCompact(c, metrics, iter, channel, usedKey, body, group.ParamOverride)
 			if attemptErr == nil {
 				success = true
 				break
@@ -225,14 +225,20 @@ func supportsResponsesCompact(channelType outbound.OutboundType) bool {
 	}
 }
 
-func forwardResponsesCompact(c *gin.Context, metrics *RelayMetrics, iter *balancer.Iterator, channel *dbmodel.Channel, usedKey dbmodel.ChannelKey, requestBody []byte) (int, time.Duration, error) {
+func forwardResponsesCompact(c *gin.Context, metrics *RelayMetrics, iter *balancer.Iterator, channel *dbmodel.Channel, usedKey dbmodel.ChannelKey, requestBody []byte, groupOverride *string) (int, time.Duration, error) {
 	span := iter.StartAttempt(channel.ID, usedKey.ID, channel.Name)
 	request, err := buildResponsesCompactRequest(c.Request.Context(), channel, usedKey.ChannelKey, requestBody)
 	if err != nil {
 		span.End(dbmodel.AttemptFailed, 0, err.Error())
 		return 0, 0, fmt.Errorf("failed to create compact request: %w", err)
 	}
-	metrics.SetTransportRequestPayload(requestBody, metrics.RequestModel)
+	if err := helper.ApplyParamOverrides(request, channel.ParamOverride, groupOverride); err != nil {
+		span.End(dbmodel.AttemptFailed, 0, err.Error())
+		return 0, 0, fmt.Errorf("failed to apply parameter override: %w", err)
+	}
+	if payload, readErr := readOutboundRequestBody(request); readErr == nil {
+		metrics.SetTransportRequestPayload(payload, metrics.RequestModel)
+	}
 	copyProxyHeaders(c.Request.Header, channel, request.Header)
 
 	response, err := sendCompactRequest(channel, request)

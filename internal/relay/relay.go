@@ -146,17 +146,18 @@ func Handler(inboundType inbound.InboundType, c *gin.Context) {
 
 	// 请求级上下文
 	req := &relayRequest{
-		c:               c,
-		inAdapter:       inAdapter,
-		internalRequest: internalRequest,
-		metrics:         metrics,
-		apiKeyID:        apiKeyID,
-		requestModel:    requestModel,
-		groupID:         group.ID,
-		groupSessionTTL: group.SessionKeepTime,
-		iter:            iter,
-		rawBody:         rawBody,
-		heartbeat:       hb,
+		c:                  c,
+		inAdapter:          inAdapter,
+		internalRequest:    internalRequest,
+		metrics:            metrics,
+		apiKeyID:           apiKeyID,
+		requestModel:       requestModel,
+		groupID:            group.ID,
+		groupSessionTTL:    group.SessionKeepTime,
+		groupParamOverride: group.ParamOverride,
+		iter:               iter,
+		rawBody:            rawBody,
+		heartbeat:          hb,
 	}
 
 	var lastErr error
@@ -569,6 +570,11 @@ func (ra *relayAttempt) forwardViaWS(ctx context.Context) (int, error) {
 		wsUpstreamPool.Put(pc)
 		return -1, nil // fall through to HTTP
 	}
+	reqBody, err = helper.ApplyJSONParamOverrides(reqBody, ra.channel.ParamOverride, ra.groupParamOverride)
+	if err != nil {
+		wsUpstreamPool.Put(pc)
+		return 0, fmt.Errorf("failed to apply parameter override: %w", err)
+	}
 	ra.metrics.SetTransportRequestPayload(reqBody, ra.internalRequest.Model)
 
 	// Send response.create message
@@ -717,11 +723,11 @@ func (ra *relayAttempt) handleWSStreamResponseV2(ctx context.Context, reader *ws
 
 	// Create StreamProcessor
 	processor := stream.NewStreamProcessor(stream.StreamConfig{
-		Source:               stream.NewWSSource(reader),
-		Transform:            transform,
-		Writer:               ra.getStreamWriter(),
-		Context:              ctx,
-		FirstTokenTimeout:    firstTokenTimeout,
+		Source:              stream.NewWSSource(reader),
+		Transform:           transform,
+		Writer:              ra.getStreamWriter(),
+		Context:             ctx,
+		FirstTokenTimeout:   firstTokenTimeout,
 		HeartbeatInterval:   streamHeartbeatInterval(),
 		FirstEventValidator: ra.firstEventValidator(),
 		OnFirstToken: func() {
@@ -951,9 +957,10 @@ func (ra *relayAttempt) getStreamWriter() StreamWriter {
 	return ra.c.Writer
 }
 
-// applyParamOverride merges channel-level JSON request overrides and records the final upstream payload.
+// applyParamOverride applies channel-level overrides followed by the group's
+// recursive force-override and records the final upstream payload.
 func (ra *relayAttempt) applyParamOverride(outboundRequest *http.Request) error {
-	if err := helper.ApplyParamOverride(outboundRequest, ra.channel.ParamOverride); err != nil {
+	if err := helper.ApplyParamOverrides(outboundRequest, ra.channel.ParamOverride, ra.groupParamOverride); err != nil {
 		return err
 	}
 	if requestBody, readErr := readOutboundRequestBody(outboundRequest); readErr == nil {
@@ -1093,11 +1100,11 @@ func (ra *relayAttempt) handleStreamResponseV2(ctx context.Context, response *ht
 
 	// Create StreamProcessor
 	processor := stream.NewStreamProcessor(stream.StreamConfig{
-		Source:               stream.NewSSESource(response.Body, maxSSEEventSize),
-		Transform:            transform,
-		Writer:               ra.getStreamWriter(),
-		Context:              ctx,
-		FirstTokenTimeout:    firstTokenTimeout,
+		Source:              stream.NewSSESource(response.Body, maxSSEEventSize),
+		Transform:           transform,
+		Writer:              ra.getStreamWriter(),
+		Context:             ctx,
+		FirstTokenTimeout:   firstTokenTimeout,
 		HeartbeatInterval:   streamHeartbeatInterval(),
 		FirstEventValidator: ra.firstEventValidator(),
 		OnFirstToken: func() {
@@ -1155,15 +1162,15 @@ func (ra *relayAttempt) handleStreamResponsePassthroughV2(ctx context.Context, r
 
 	// Create StreamProcessor
 	processor := stream.NewStreamProcessor(stream.StreamConfig{
-		Source:               stream.NewRawSource(response.Body, 32*1024),
-		Transform:            nil, // Passthrough: no transformation
-		Writer:               ra.getStreamWriter(),
-		Context:              ctx,
-		FirstTokenTimeout:    firstTokenTimeout,
+		Source:              stream.NewRawSource(response.Body, 32*1024),
+		Transform:           nil, // Passthrough: no transformation
+		Writer:              ra.getStreamWriter(),
+		Context:             ctx,
+		FirstTokenTimeout:   firstTokenTimeout,
 		HeartbeatInterval:   streamHeartbeatInterval(),
 		FirstEventValidator: ra.firstEventValidator(),
-		BufferRawStream:      true,
-		TerminalEvents:       cfg.TerminalEvents,
+		BufferRawStream:     true,
+		TerminalEvents:      cfg.TerminalEvents,
 		OnFirstToken: func() {
 			ra.metrics.SetFirstTokenTime(time.Now())
 			ra.stopFirstTokenTimer()

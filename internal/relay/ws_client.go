@@ -428,17 +428,18 @@ func newWSRelayRequest(
 	}
 
 	return &relayRequest{
-		c:               nil,
-		ctx:             ctx,
-		inAdapter:       inAdapter,
-		internalRequest: executionRequest,
-		metrics:         NewRelayMetrics(apiKeyID, requestModel, rawBody, metricsRequest),
-		apiKeyID:        apiKeyID,
-		requestModel:    requestModel,
-		groupID:         group.ID,
-		groupSessionTTL: group.SessionKeepTime,
-		iter:            iter,
-		streamWriter:    NewWSStreamWriter(ctx, conn),
+		c:                  nil,
+		ctx:                ctx,
+		inAdapter:          inAdapter,
+		internalRequest:    executionRequest,
+		metrics:            NewRelayMetrics(apiKeyID, requestModel, rawBody, metricsRequest),
+		apiKeyID:           apiKeyID,
+		requestModel:       requestModel,
+		groupID:            group.ID,
+		groupSessionTTL:    group.SessionKeepTime,
+		groupParamOverride: group.ParamOverride,
+		iter:               iter,
+		streamWriter:       NewWSStreamWriter(ctx, conn),
 	}, &group, nil
 }
 

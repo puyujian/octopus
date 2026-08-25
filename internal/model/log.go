@@ -57,6 +57,7 @@ type RelayLog struct {
 	ChannelId            int                 `json:"channel" gorm:"index"`                     // 实际使用的渠道ID
 	ChannelName          string              `json:"channel_name"`                             // 渠道名称
 	ActualModelName      string              `json:"actual_model_name"`                        // 实际使用模型名称
+	ReasoningEffort      string              `json:"reasoning_effort,omitempty"`               // 最终发送到上游的思考强度/配置
 	InputTokens          int                 `json:"input_tokens"`                             // 输入Token
 	TransportInputTokens *int                `json:"transport_input_tokens,omitempty"`         // 实际发送到上游请求体的 Token 估算
 	BillInputTokens      *int                `json:"bill_input_tokens,omitempty"`              // 按常规输入价格计费的 Token
@@ -76,4 +77,29 @@ type RelayLog struct {
 	WSMode               *RelayLogWSMode     `json:"ws_mode,omitempty"`                        // 上游 WebSocket 会话模式
 	WSExecMode           *RelayLogWSExecMode `json:"ws_exec_mode,omitempty"`                   // 上游 WebSocket 事件处理方式
 	WSRecovery           *RelayLogWSRecovery `json:"ws_recovery,omitempty"`                    // 本次请求触发的恢复动作
+	TPS                  *float64            `json:"tps,omitempty" gorm:"-"`                   // 生成阶段 Token/s，按现有耗时字段动态计算
+}
+
+// PopulateDerivedMetrics calculates values that can be derived from persisted
+// log fields. TPS deliberately is not stored in the database so historical
+// logs become immediately compatible with the same calculation.
+func (l *RelayLog) PopulateDerivedMetrics() {
+	if l == nil || l.OutputTokens <= 0 {
+		if l != nil {
+			l.TPS = nil
+		}
+		return
+	}
+
+	generationMS := l.UseTime
+	if l.Ftut > 0 && l.UseTime > l.Ftut {
+		generationMS = l.UseTime - l.Ftut
+	}
+	if generationMS <= 0 {
+		l.TPS = nil
+		return
+	}
+
+	tps := float64(l.OutputTokens) * 1000 / float64(generationMS)
+	l.TPS = &tps
 }

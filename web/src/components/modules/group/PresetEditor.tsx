@@ -74,6 +74,7 @@ export function PresetEditorContent({ preset }: PresetEditorContentProps) {
                     name: values.name,
                     mode: values.mode,
                     match_regex: values.match_regex,
+                    param_override: values.param_override,
                     first_token_time_out: values.first_token_time_out,
                     session_keep_time: values.session_keep_time,
                     retry_enabled: values.retry_enabled,
@@ -110,13 +111,14 @@ export function PresetEditorContent({ preset }: PresetEditorContentProps) {
             </MorphingDialogTitle>
             <MorphingDialogDescription
                 disableLayoutAnimation
-                className="flex-1 min-h-0 overflow-hidden flex flex-col"
+                className="flex-none overflow-visible flex flex-col md:flex-1 md:min-h-0 md:overflow-hidden"
             >
                 <GroupEditor
                     key={`preset-${preset.id}`}
                     initial={{
                         name: preset.name,
                         match_regex: preset.match_regex ?? '',
+                        param_override: preset.param_override ?? '',
                         mode: preset.mode,
                         first_token_time_out: preset.first_token_time_out ?? 0,
                         session_keep_time: preset.session_keep_time ?? 0,

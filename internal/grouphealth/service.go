@@ -160,7 +160,7 @@ func (s *Service) RunGroupHealth(ctx context.Context, groupID int, probeModes ..
 			continue
 		}
 
-		result := s.prober.RunCandidate(ctx, *channel, usedKey, item.ModelName)
+		result := s.prober.RunCandidateWithGroupOverride(ctx, *channel, usedKey, item.ModelName, group.ParamOverride)
 		attemptedCount++
 		attempt := model.GroupHealthAttempt{
 			GroupItemID:  item.ID,

@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
-import { Clock, Zap, AlertCircle, ArrowDownToLine, ArrowUpFromLine, DollarSign, ArrowRight, ArrowDown, Send, MessageSquare, Loader2, RotateCw, ChevronDown, ChevronUp, Pin, KeyRound, CircleOff, Link } from 'lucide-react';
+import { Clock, Zap, Brain, Gauge, AlertCircle, ArrowDownToLine, ArrowUpFromLine, DollarSign, ArrowRight, ArrowDown, Send, MessageSquare, Loader2, RotateCw, ChevronDown, ChevronUp, Pin, KeyRound, CircleOff, Link } from 'lucide-react';
 import { useTranslations } from 'next-intl';
 import { motion, AnimatePresence } from 'motion/react';
 import JsonView from '@uiw/react-json-view';
@@ -62,6 +62,10 @@ function formatDurationCompact(ms: number): string {
     if (s < 10) return `${s.toFixed(2)}s`;
     if (s < 100) return `${s.toFixed(1)}s`;
     return `${Math.round(s)}s`;
+}
+
+function formatTPS(value: number | null | undefined): string {
+    return value != null && Number.isFinite(value) ? value.toFixed(2) : '—';
 }
 
 function sanitizeErrorMessage(raw: string | undefined | null): string {
@@ -675,7 +679,7 @@ export function LogCard({ log, siteTargets }: { log: RelayLog; siteTargets: LogS
                                 </div>
                                 <WSModeBadge log={log} />
                             </div>
-                            <div className="grid grid-cols-2 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.2fr)_minmax(0,1.2fr)_minmax(0,1.2fr)_minmax(0,1fr)] gap-x-4 gap-y-2 text-xs tabular-nums text-muted-foreground">
+                            <div className="grid grid-cols-2 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.2fr)_minmax(0,1.2fr)_minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)] gap-x-4 gap-y-2 text-xs tabular-nums text-muted-foreground">
                                 <div className="flex items-center gap-1.5">
                                     <Clock className="size-3.5 shrink-0" style={{ color: brandColor }} />
                                     <span>{formatTime(log.time)}</span>
@@ -710,6 +714,14 @@ export function LogCard({ log, siteTargets }: { log: RelayLog; siteTargets: LogS
                                 <div className="flex items-center gap-1.5">
                                     <ArrowUpFromLine className="size-3.5 shrink-0 text-purple-500" />
                                     <span>{t('output')} {log.output_tokens.toLocaleString()}</span>
+                                </div>
+                                <div className="flex items-center gap-1.5">
+                                    <Brain className="size-3.5 shrink-0 text-indigo-500" />
+                                    <span>{t('reasoningEffort')} {log.reasoning_effort || '—'}</span>
+                                </div>
+                                <div className="flex items-center gap-1.5">
+                                    <Gauge className="size-3.5 shrink-0 text-cyan-500" />
+                                    <span>{t('tps')} {formatTPS(log.tps)}</span>
                                 </div>
                                 <div className="flex items-center gap-1.5">
                                     <DollarSign className="size-3.5 shrink-0 text-emerald-500" />
@@ -985,6 +997,14 @@ export function LogCard({ log, siteTargets }: { log: RelayLog; siteTargets: LogS
                             <div className="flex items-center gap-1.5">
                                 <Zap className="size-3.5 text-amber-500" />
                                 <span>{t('duration')}: {formatDurationCompact(log.ftut)} / {formatDurationCompact(log.use_time)}</span>
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                                <Brain className="size-3.5 text-indigo-500" />
+                                <span>{t('reasoningEffort')}: {log.reasoning_effort || '—'}</span>
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                                <Gauge className="size-3.5 text-cyan-500" />
+                                <span>{t('tps')}: {formatTPS(log.tps)}</span>
                             </div>
                             <div className="flex items-center gap-1.5">
                                 <DollarSign className="size-3.5 text-emerald-500" />

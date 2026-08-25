@@ -24,6 +24,7 @@ import { HelpCircle } from 'lucide-react';
 export type GroupEditorValues = {
     name: string;
     match_regex: string;
+    param_override: string;
     mode: GroupMode;
     first_token_time_out: number;
     session_keep_time: number;
@@ -31,6 +32,172 @@ export type GroupEditorValues = {
     max_retries: number;
     members: SelectedMember[];
 };
+
+type ParamOverrideRow = {
+    id: string;
+    key: string;
+    value: string;
+};
+
+type ParamOverrideParseResult = {
+    rows: ParamOverrideRow[];
+    error: 'invalid' | 'objectOnly' | '';
+};
+
+type ParamOverrideSerializeResult = {
+    value: string;
+    error: 'nameRequired' | 'protected' | 'duplicate' | 'pathConflict' | '';
+};
+
+const protectedParamOverrideKeys = new Set(['model', 'stream', 'type']);
+const commonParamOverrideKeys = [
+    'temperature',
+    'top_p',
+    'max_tokens',
+    'max_completion_tokens',
+    'reasoning_effort',
+    'enable_thinking',
+    'thinking.budget_tokens',
+    'reasoning.effort',
+];
+
+let paramOverrideRowSequence = 0;
+
+function createParamOverrideRow(key = '', value = ''): ParamOverrideRow {
+    paramOverrideRowSequence += 1;
+    return { id: `param-override-${paramOverrideRowSequence}`, key, value };
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isAutoParsedLiteral(value: string): boolean {
+    if (value === 'true' || value === 'false' || value === 'null') return true;
+    if (!/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(value)) return false;
+    const parsed = Number(value);
+    return Number.isFinite(parsed);
+}
+
+function formatParamOverrideValue(value: unknown): string {
+    if (value === null) return 'null';
+    if (typeof value === 'boolean' || typeof value === 'number') return String(value);
+    if (typeof value === 'string') {
+        // Quote strings that would otherwise be auto-detected as another type
+        // so editing an existing override does not silently change its type.
+        return isAutoParsedLiteral(value) ? JSON.stringify(value) : value;
+    }
+    return JSON.stringify(value);
+}
+
+function flattenParamOverrideObject(
+    value: Record<string, unknown>,
+    prefix = '',
+    rows: ParamOverrideRow[] = [],
+): ParamOverrideRow[] {
+    Object.entries(value).forEach(([key, nestedValue]) => {
+        const path = prefix ? `${prefix}.${key}` : key;
+        if (isPlainRecord(nestedValue) && Object.keys(nestedValue).length > 0) {
+            flattenParamOverrideObject(nestedValue, path, rows);
+            return;
+        }
+        rows.push(createParamOverrideRow(path, formatParamOverrideValue(nestedValue)));
+    });
+    return rows;
+}
+
+function parseParamOverride(value: string): ParamOverrideParseResult {
+    const trimmed = value.trim();
+    if (!trimmed) return { rows: [], error: '' };
+
+    try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        if (!isPlainRecord(parsed)) return { rows: [], error: 'objectOnly' };
+        return { rows: flattenParamOverrideObject(parsed), error: '' };
+    } catch {
+        return { rows: [], error: 'invalid' };
+    }
+}
+
+function parseParamOverrideValue(rawValue: string): unknown {
+    const trimmed = rawValue.trim();
+    if (trimmed === '') return '';
+    if (trimmed === 'true') return true;
+    if (trimmed === 'false') return false;
+    if (trimmed === 'null') return null;
+    if (isAutoParsedLiteral(trimmed)) return Number(trimmed);
+
+    // Complex values remain optional, but can still be entered in a row when
+    // an API parameter needs an array or an object rather than a scalar.
+    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+        try {
+            const parsed = JSON.parse(trimmed) as unknown;
+            if (Array.isArray(parsed) || isPlainRecord(parsed)) return parsed;
+        } catch {
+            // Treat malformed JSON-looking input as a normal string.
+        }
+    }
+
+    if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+        try {
+            const parsed = JSON.parse(trimmed) as unknown;
+            if (typeof parsed === 'string') return parsed;
+        } catch {
+            // Treat malformed quoted input as a normal string.
+        }
+    }
+    return rawValue;
+}
+
+function setParamOverridePath(
+    target: Record<string, unknown>,
+    segments: string[],
+    value: unknown,
+): 'duplicate' | 'pathConflict' | '' {
+    let current = target;
+    for (let index = 0; index < segments.length; index += 1) {
+        const segment = segments[index];
+        const isLeaf = index === segments.length - 1;
+        if (isLeaf) {
+            if (Object.prototype.hasOwnProperty.call(current, segment)) return 'duplicate';
+            current[segment] = value;
+            return '';
+        }
+
+        if (Object.prototype.hasOwnProperty.call(current, segment)) {
+            const nested = current[segment];
+            if (!isPlainRecord(nested)) return 'pathConflict';
+            current = nested;
+        } else {
+            const nested: Record<string, unknown> = {};
+            current[segment] = nested;
+            current = nested;
+        }
+    }
+    return '';
+}
+
+function serializeParamOverride(rows: ParamOverrideRow[]): ParamOverrideSerializeResult {
+    const result: Record<string, unknown> = {};
+    const activeRows = rows.filter((row) => row.key.trim() || row.value.trim());
+
+    for (const row of activeRows) {
+        const key = row.key.trim();
+        if (!key) return { value: '', error: 'nameRequired' };
+        const segments = key.split('.').map((segment) => segment.trim());
+        if (segments.some((segment) => !segment)) return { value: '', error: 'nameRequired' };
+        if (protectedParamOverrideKeys.has(segments[0].toLowerCase())) {
+            return { value: '', error: 'protected' };
+        }
+        const error = setParamOverridePath(result, segments, parseParamOverrideValue(row.value));
+        if (error) return { value: '', error };
+    }
+
+    return {
+        value: Object.keys(result).length > 0 ? JSON.stringify(result) : '',
+        error: '',
+    };
+}
 
 function ModelPickerSection({
     modelChannels,
@@ -284,6 +451,12 @@ export function GroupEditor({
 
     const [groupName, setGroupName] = useState(initial?.name ?? '');
     const [matchRegex, setMatchRegex] = useState(initial?.match_regex ?? '');
+    const [paramOverrideRows, setParamOverrideRows] = useState<ParamOverrideRow[]>(() => (
+        parseParamOverride(initial?.param_override ?? '').rows
+    ));
+    const [paramOverrideLoadError, setParamOverrideLoadError] = useState<ParamOverrideParseResult['error']>(() => (
+        parseParamOverride(initial?.param_override ?? '').error
+    ));
     const [mode, setMode] = useState<GroupMode>((initial?.mode ?? 1) as GroupMode);
     const [firstTokenTimeOut, setFirstTokenTimeOut] = useState<number>(initial?.first_token_time_out ?? 0);
     const [sessionKeepTime, setSessionKeepTime] = useState<number>(initial?.session_keep_time ?? 0);
@@ -328,11 +501,6 @@ export function GroupEditor({
         });
     }, []);
 
-    const handleAddMemberMobile = useCallback((channel: LLMChannel) => {
-        handleAddMember(channel);
-        setMobileTab('sort');
-    }, [handleAddMember]);
-
     const autoAddDisabled = useMemo(() => {
         if ((!regexKey && !groupKey) || regexError || matchedModelChannels.length === 0) return true;
         const existing = new Set(selectedMembers.map((m) => m.id));
@@ -367,7 +535,46 @@ export function GroupEditor({
         setRemovingIds(new Set());
     }, []);
 
-    const isValid = groupKey.length > 0 && selectedMembers.length > 0 && !regexError;
+    const handleAddParamOverrideRow = useCallback(() => {
+        setParamOverrideLoadError('');
+        setParamOverrideRows((prev) => [...prev, createParamOverrideRow()]);
+    }, []);
+
+    const handleUpdateParamOverrideRow = useCallback((id: string, field: 'key' | 'value', value: string) => {
+        setParamOverrideLoadError('');
+        setParamOverrideRows((prev) => prev.map((row) => (
+            row.id === id ? { ...row, [field]: value } : row
+        )));
+    }, []);
+
+    const handleRemoveParamOverrideRow = useCallback((id: string) => {
+        setParamOverrideLoadError('');
+        setParamOverrideRows((prev) => prev.filter((row) => row.id !== id));
+    }, []);
+
+    const serializedParamOverride = useMemo(
+        () => serializeParamOverride(paramOverrideRows),
+        [paramOverrideRows],
+    );
+
+    const paramOverrideError = useMemo(() => {
+        if (paramOverrideLoadError === 'invalid') return t('form.paramOverrideInvalid');
+        if (paramOverrideLoadError === 'objectOnly') return t('form.paramOverrideObjectOnly');
+        switch (serializedParamOverride.error) {
+            case 'nameRequired':
+                return t('form.paramOverrideNameRequired');
+            case 'protected':
+                return t('form.paramOverrideProtected');
+            case 'duplicate':
+                return t('form.paramOverrideDuplicate');
+            case 'pathConflict':
+                return t('form.paramOverridePathConflict');
+            default:
+                return '';
+        }
+    }, [paramOverrideLoadError, serializedParamOverride.error, t]);
+
+    const isValid = groupKey.length > 0 && selectedMembers.length > 0 && !regexError && !paramOverrideError;
 
     const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
@@ -375,6 +582,7 @@ export function GroupEditor({
         onSubmit({
             name: groupName,
             match_regex: regexKey,
+            param_override: serializedParamOverride.value,
             mode,
             first_token_time_out: firstTokenTimeOut,
             session_keep_time: sessionKeepTime,
@@ -386,9 +594,9 @@ export function GroupEditor({
 
 
     return (
-        <form onSubmit={handleSubmit} className="flex flex-col h-full min-h-0 ">
-            <div className="flex-1 min-h-0 overflow-hidden px-1">
-                <FieldGroup className="gap-4 flex flex-col min-h-0 h-full">
+        <form onSubmit={handleSubmit} className="flex min-h-0 flex-col md:h-full md:overflow-hidden">
+            <div className="flex-none overflow-visible px-1 md:flex-1 md:min-h-0 md:overflow-hidden">
+                <FieldGroup className="flex flex-col gap-4 md:h-full md:min-h-0">
                     <div className="grid grid-cols-2 md:grid-cols-2 lg:grid-cols-4 gap-4">
                         <Field>
                             <FieldLabel htmlFor="group-name">{nameLabel ?? t('form.name')}</FieldLabel>
@@ -484,6 +692,69 @@ export function GroupEditor({
                         </Field>
                     </div>
 
+                    <Field className="shrink-0">
+                        <div className="flex items-center justify-between gap-2">
+                            <FieldLabel htmlFor="group-param-override-key">{t('form.paramOverride')}</FieldLabel>
+                            <button
+                                type="button"
+                                onClick={handleAddParamOverrideRow}
+                                className="flex items-center gap-1 rounded-lg px-2 py-1 text-xs font-medium text-primary transition-colors hover:bg-primary/10"
+                            >
+                                <Plus className="size-3.5" />
+                                {t('form.paramOverrideAdd')}
+                            </button>
+                        </div>
+                        <div className="rounded-xl border border-input bg-background p-2">
+                            {paramOverrideRows.length === 0 ? (
+                                <p className="px-1 py-2 text-xs text-muted-foreground">
+                                    {t('form.paramOverrideEmpty')}
+                                </p>
+                            ) : (
+                                <div className="space-y-2">
+                                    <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2rem] gap-2 px-1 text-[11px] font-medium text-muted-foreground">
+                                        <span>{t('form.paramOverrideName')}</span>
+                                        <span>{t('form.paramOverrideValue')}</span>
+                                        <span className="sr-only">{t('form.paramOverrideRemove')}</span>
+                                    </div>
+                                    {paramOverrideRows.map((row) => (
+                                        <div key={row.id} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2rem] items-center gap-2">
+                                            <Input
+                                                id={row.id + '-key'}
+                                                list="group-param-override-key-options"
+                                                value={row.key}
+                                                onChange={(event) => handleUpdateParamOverrideRow(row.id, 'key', event.target.value)}
+                                                placeholder={t('form.paramOverrideNamePlaceholder')}
+                                                aria-label={t('form.paramOverrideName')}
+                                                className="h-8 rounded-lg text-xs"
+                                            />
+                                            <Input
+                                                id={row.id + '-value'}
+                                                value={row.value}
+                                                onChange={(event) => handleUpdateParamOverrideRow(row.id, 'value', event.target.value)}
+                                                placeholder={t('form.paramOverrideValuePlaceholder')}
+                                                aria-label={t('form.paramOverrideValue')}
+                                                className="h-8 rounded-lg text-xs"
+                                            />
+                                            <button
+                                                type="button"
+                                                onClick={() => handleRemoveParamOverrideRow(row.id)}
+                                                className="flex size-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
+                                                aria-label={t('form.paramOverrideRemove')}
+                                            >
+                                                <Trash2 className="size-3.5" />
+                                            </button>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                            <datalist id="group-param-override-key-options">
+                                {commonParamOverrideKeys.map((key) => <option key={key} value={key} />)}
+                            </datalist>
+                        </div>
+                        <p className="text-xs text-muted-foreground">{t('form.paramOverrideHint')}</p>
+                        {paramOverrideError && <p className="text-xs text-destructive">{paramOverrideError}</p>}
+                    </Field>
+
                     {/* Mode + Retry Toggle */}
                     <div className="flex flex-wrap items-center gap-2">
                         <div className="flex gap-1 flex-1 min-w-[200px]">
@@ -547,9 +818,9 @@ export function GroupEditor({
                         )}
                     </div>
 
-                    <div className="flex-1 min-h-0">
+                    <div className="flex-none min-h-0 md:flex-1">
                         {/* Mobile: Tab switch */}
-                        <div className="flex h-full min-h-0 flex-col md:hidden">
+                        <div className="flex h-[min(55vh,32rem)] min-h-[20rem] flex-col md:hidden">
                             <div className="flex p-1 bg-muted rounded-xl mb-2 shrink-0 gap-1">
                                 <button
                                     type="button"
@@ -584,7 +855,7 @@ export function GroupEditor({
                                     <ModelPickerSection
                                         modelChannels={modelChannels}
                                         selectedMembers={selectedMembers}
-                                        onAdd={handleAddMemberMobile}
+                                        onAdd={handleAddMember}
                                         onAutoAdd={handleAutoAdd}
                                         autoAddDisabled={autoAddDisabled}
                                     />

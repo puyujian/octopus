@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"github.com/bestruirui/octopus/internal/apperror"
+	"github.com/bestruirui/octopus/internal/helper"
 	"github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/op"
 	"github.com/bestruirui/octopus/internal/server/middleware"
@@ -58,6 +59,12 @@ func createGroup(c *gin.Context) {
 			return
 		}
 	}
+	if group.ParamOverride != nil {
+		if err := helper.ValidateGroupParamOverride(*group.ParamOverride); err != nil {
+			resp.ErrorWithAppError(c, http.StatusBadRequest, apperror.New(apperror.CodeCommonValidationFailed, err.Error()).WithStatus(http.StatusBadRequest))
+			return
+		}
+	}
 	if err := op.GroupCreate(&group, c.Request.Context()); err != nil {
 		resp.ErrorWithAppError(c, http.StatusInternalServerError, groupError(codeGroupCreateFailed, "group create failed", err))
 		return
@@ -74,6 +81,12 @@ func updateGroup(c *gin.Context) {
 	if req.MatchRegex != nil {
 		_, err := regexp2.Compile(*req.MatchRegex, regexp2.ECMAScript)
 		if err != nil {
+			resp.ErrorWithAppError(c, http.StatusBadRequest, apperror.New(apperror.CodeCommonValidationFailed, err.Error()).WithStatus(http.StatusBadRequest))
+			return
+		}
+	}
+	if req.ParamOverride != nil {
+		if err := helper.ValidateGroupParamOverride(*req.ParamOverride); err != nil {
 			resp.ErrorWithAppError(c, http.StatusBadRequest, apperror.New(apperror.CodeCommonValidationFailed, err.Error()).WithStatus(http.StatusBadRequest))
 			return
 		}

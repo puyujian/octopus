@@ -1,0 +1,107 @@
+name: Docker
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker:
+    name: Build and push multi-arch image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Build frontend
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          NEXT_PUBLIC_APP_VERSION="$(git describe --tags --abbrev=0 2>/dev/null || echo 'dev')" pnpm build
+
+      - name: Embed frontend into static
+        run: |
+          rm -rf static/out
+          mv web/out static/out
+
+      - name: Build binaries for docker
+        run: |
+          set -e
+          mkdir -p build/bin build/docker/linux/amd64 build/docker/linux/arm64
+          BUILD_TIME="$(TZ='Asia/Shanghai' date +'%F %T %z')"
+          GIT_VERSION="$(git describe --tags --abbrev=0 2>/dev/null || echo 'dev')"
+          COMMIT_ID="$(git rev-parse --short HEAD)"
+          LDFLAGS="-X 'github.com/bestruirui/octopus/internal/conf.Version=${GIT_VERSION}' \
+                   -X 'github.com/bestruirui/octopus/internal/conf.BuildTime=${BUILD_TIME}' \
+                   -X 'github.com/bestruirui/octopus/internal/conf.Author=hureru' \
+                   -X 'github.com/bestruirui/octopus/internal/conf.Commit=${COMMIT_ID}' \
+                   -s -w"
+
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o build/bin/octopus-linux-x86_64 -ldflags="${LDFLAGS}" -tags=jsoniter ./
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o build/bin/octopus-linux-arm64  -ldflags="${LDFLAGS}" -tags=jsoniter ./
+
+          cp build/bin/octopus-linux-x86_64 build/docker/linux/amd64/octopus
+          cp build/bin/octopus-linux-arm64  build/docker/linux/arm64/octopus
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest
+            type=sha,prefix=sha-
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (Alpine)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./scripts/dockerfiles/Dockerfile.alpine
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            TARGETPLATFORM

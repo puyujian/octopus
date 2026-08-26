@@ -108,8 +108,18 @@ func TestExcludeAndRecoverFailedGroupItem(t *testing.T) {
 	if !recovered.Restored || !recovered.Probe.Success || recovered.ActiveItemCount != 1 {
 		t.Fatalf("unexpected recovery: %#v", recovered)
 	}
-	if _, err := service.ExcludeAttempt(ctx, group.ID, attemptID, true); err != nil {
-		t.Fatalf("exclude before force restore: %v", err)
+	view, err = service.GetGroupHealthViewByID(ctx, group.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := view.Latest.Attempts[0]; got.Status != model.GroupHealthAttemptStatusSuccess || got.HTTPStatus != http.StatusOK || got.ErrorMessage != "" || got.MembershipState != model.GroupHealthMembershipStateActive {
+		t.Fatalf("successful recovery left a stale failed attempt: %#v", got)
+	}
+	if _, err := service.ExcludeAttempt(ctx, group.ID, attemptID, true); err == nil {
+		t.Fatal("expected recovered attempt to be ineligible for exclusion")
+	}
+	if _, _, err := op.GroupHealthExcludeItem(ctx, group.ID, item.ID, attemptID, true); err != nil {
+		t.Fatalf("prepare force restore: %v", err)
 	}
 	forced, err := service.RestoreItem(ctx, group.ID, item.ID, true)
 	if err != nil || !forced.Restored || forced.ActiveItemCount != 1 {
@@ -185,6 +195,11 @@ func TestBatchExcludeFailuresAndRestoreOnlyHealthyItems(t *testing.T) {
 	}
 	if view.ActiveItemCount != 2 || len(view.ExcludedItems) != 1 || view.ExcludedItems[0].ChannelID != channels[1].ID {
 		t.Fatalf("only the still-failing item should remain excluded: %#v", view)
+	}
+	for _, attempt := range view.Latest.Attempts {
+		if attempt.ChannelID == channels[0].ID && (attempt.Status != model.GroupHealthAttemptStatusSuccess || attempt.MembershipState != model.GroupHealthMembershipStateActive || attempt.ErrorMessage != "") {
+			t.Fatalf("batch recovery left a stale failed attempt: %#v", attempt)
+		}
 	}
 }
 

@@ -439,7 +439,7 @@ func (s *Service) RestoreItem(ctx context.Context, groupID, itemID int, force bo
 	if !probe.Success {
 		return result, nil
 	}
-	_, count, err := op.GroupHealthRestoreItem(ctx, groupID, itemID)
+	_, count, err := op.GroupHealthRestoreItemAfterProbe(ctx, groupID, itemID, result.Probe)
 	if err != nil {
 		return nil, err
 	}
@@ -519,7 +519,13 @@ func (s *Service) ProbeAndRestoreExcluded(ctx context.Context, groupID int) (*mo
 		}
 	}
 	if len(restoreIDs) > 0 {
-		_, activeCount, restoreErr := op.GroupHealthRestoreItems(ctx, groupID, restoreIDs)
+		probeByItem := make(map[int]model.GroupHealthRecoveryProbe, len(restoreIDs))
+		for i := range batch.Results {
+			if batch.Results[i].Probe.Success {
+				probeByItem[batch.Results[i].ItemID] = batch.Results[i].Probe
+			}
+		}
+		_, activeCount, restoreErr := op.GroupHealthRestoreItemsAfterProbe(ctx, groupID, restoreIDs, probeByItem)
 		if restoreErr != nil {
 			return nil, restoreErr
 		}

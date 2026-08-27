@@ -238,9 +238,9 @@ export function GroupHealthBadge({ groupId }: { groupId?: number }) {
     return (
         <Dialog open={open} onOpenChange={setOpen}>
             <Card className="mb-3 gap-0 rounded-xl border-border/70 bg-background/80 py-0 shadow-none">
-                <CardContent className="flex items-center justify-between gap-2 px-3 py-1.5">
+                <CardContent className="flex flex-col gap-2 px-3 py-2">
                     <DialogTrigger asChild>
-                        <button type="button" className="grid min-w-0 flex-1 grid-cols-[auto_auto_minmax(0,1fr)] items-center gap-x-2 gap-y-0.5 text-left">
+                        <button type="button" className="grid w-full min-w-0 grid-cols-[auto_auto_minmax(0,1fr)] items-center gap-x-2 gap-y-0.5 text-left">
                             <span className={cn('row-span-2 size-2 rounded-full self-center', statusDotTone(latest?.status))} />
                             <span className="text-sm font-medium leading-5 text-foreground">{t('title')}</span>
                             <span className="min-w-0 truncate text-xs leading-5 text-muted-foreground">
@@ -261,28 +261,30 @@ export function GroupHealthBadge({ groupId }: { groupId?: number }) {
                             </span>
                         </button>
                     </DialogTrigger>
-                    <Button
-                        type="button"
-                        size="sm"
-                        variant="outline"
-                        className="h-7 rounded-lg px-2 text-xs"
-                        disabled={isRunPendingForGroup || isRunning}
-                        onClick={() => runGroupHealth.mutate({ groupId })}
-                    >
-                        {isRunning || isStandardRunPending ? <LoaderCircle className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
-                        {t('run')}
-                    </Button>
-                    <Button
-                        type="button"
-                        size="sm"
-                        variant="outline"
-                        className="h-7 rounded-lg px-2 text-xs"
-                        disabled={isRunPendingForGroup || isRunning}
-                        onClick={() => runGroupHealth.mutate({ groupId, probeMode: 'full' })}
-                    >
-                        {isFullRunPending ? <LoaderCircle className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
-                        {t('runFull')}
-                    </Button>
+                    <div className="grid w-full grid-cols-2 gap-2">
+                        <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            className="h-7 w-full rounded-lg px-2 text-xs"
+                            disabled={isRunPendingForGroup || isRunning}
+                            onClick={() => runGroupHealth.mutate({ groupId })}
+                        >
+                            {isRunning || isStandardRunPending ? <LoaderCircle className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
+                            {t('run')}
+                        </Button>
+                        <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            className="h-7 w-full rounded-lg px-2 text-xs"
+                            disabled={isRunPendingForGroup || isRunning}
+                            onClick={() => runGroupHealth.mutate({ groupId, probeMode: 'full' })}
+                        >
+                            {isFullRunPending ? <LoaderCircle className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
+                            {t('runFull')}
+                        </Button>
+                    </div>
                 </CardContent>
             </Card>
 

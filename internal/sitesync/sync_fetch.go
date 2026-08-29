@@ -40,7 +40,7 @@ func fetchManagementTokens(ctx context.Context, siteRecord *model.Site, account 
 		groupName := model.NormalizeSiteGroupName(groupKey, firstNonEmptyString(jsonString(item["group_name"]), jsonString(item["group"]), jsonString(item["token_group"])))
 		tokens = append(tokens, model.SiteToken{Name: firstNonEmptyString(strings.TrimSpace(jsonString(item["name"])), fmt.Sprintf("token-%d", index+1)), Token: tokenValue, GroupKey: groupKey, GroupName: groupName, Enabled: parseEnabledFlag(item["status"]), Source: "sync", IsDefault: index == 0})
 	}
-	return tokens, nil
+	return autoCompleteFetchedSiteTokens(ctx, siteRecord, account, tokens, parseRemoteTokensForAutoCompletion(payload)), nil
 }
 
 func fetchManagementGroups(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string) ([]model.SiteUserGroup, error) {
@@ -90,7 +90,8 @@ func fetchSub2APITokens(ctx context.Context, siteRecord *model.Site, account *mo
 		items := parseTokenItemsFromAny(data)
 		tokens := buildSub2APITokensFromItems(items)
 		if len(tokens) > 0 {
-			return tokens, nil
+			remoteTokens := parseRemoteTokensForAutoCompletion(map[string]any{"data": items})
+			return autoCompleteFetchedSiteTokens(ctx, siteRecord, account, tokens, remoteTokens), nil
 		}
 	}
 	if firstErr != nil {

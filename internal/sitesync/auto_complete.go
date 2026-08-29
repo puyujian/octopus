@@ -8,6 +8,7 @@ import (
 
 	"github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/op"
+	"github.com/bestruirui/octopus/internal/utils/log"
 )
 
 type siteRemoteToken struct {
@@ -16,6 +17,94 @@ type siteRemoteToken struct {
 	Token     string
 	GroupKey  string
 	GroupName string
+}
+
+// autoCompleteFetchedSiteTokens resolves masked keys while a site sync is
+// still in memory. This lets the same sync use the recovered key for model
+// discovery and projection instead of waiting for a separate manual action.
+func autoCompleteFetchedSiteTokens(
+	ctx context.Context,
+	siteRecord *model.Site,
+	account *model.SiteAccount,
+	tokens []model.SiteToken,
+	remoteTokens []siteRemoteToken,
+) []model.SiteToken {
+	attempted := 0
+	completed := 0
+	reused := 0
+	for i := range tokens {
+		if !model.IsMaskedSiteTokenValue(tokens[i].Token) {
+			continue
+		}
+		if fullToken, ok := matchStoredReadyTokenForAutoCompletion(tokens[i], account.Tokens); ok {
+			tokens[i].Token = fullToken
+			tokens[i].ValueStatus = model.SiteTokenValueStatusReady
+			reused++
+			continue
+		}
+		attempted++
+
+		remoteToken, ok := matchRemoteTokenForAutoCompletion(tokens[i], remoteTokens)
+		if !ok || remoteToken.ID <= 0 {
+			continue
+		}
+		fullToken, err := fetchRemoteTokenKeyForAutoCompletion(ctx, siteRecord, account, remoteToken)
+		if err != nil || model.IsMaskedSiteTokenValue(fullToken) || !model.SiteMaskedTokenMatches(fullToken, tokens[i].Token) {
+			continue
+		}
+
+		tokens[i].Token = strings.TrimSpace(fullToken)
+		tokens[i].ValueStatus = model.SiteTokenValueStatusReady
+		completed++
+	}
+
+	if completed > 0 {
+		log.Infow(
+			"sitesync.key_auto_complete.completed",
+			"site_id", siteRecord.ID,
+			"account_id", account.ID,
+			"attempted", attempted,
+			"completed", completed,
+			"reused", reused,
+		)
+	} else if attempted > 0 {
+		log.Debugw(
+			"sitesync.key_auto_complete.pending",
+			"site_id", siteRecord.ID,
+			"account_id", account.ID,
+			"attempted", attempted,
+		)
+	}
+	return tokens
+}
+
+func matchStoredReadyTokenForAutoCompletion(incoming model.SiteToken, stored []model.SiteToken) (string, bool) {
+	groupKey := model.NormalizeSiteGroupKey(incoming.GroupKey)
+	name := strings.TrimSpace(incoming.Name)
+	matches := make([]string, 0, 2)
+	for _, candidate := range stored {
+		if !model.IsReadySiteToken(candidate) || model.IsMaskedSiteTokenValue(candidate.Token) {
+			continue
+		}
+		if model.NormalizeSiteGroupKey(candidate.GroupKey) != groupKey {
+			continue
+		}
+		if name != "" && !strings.EqualFold(strings.TrimSpace(candidate.Name), name) {
+			continue
+		}
+		fullToken := strings.TrimSpace(candidate.Token)
+		if !model.SiteMaskedTokenMatches(fullToken, incoming.Token) {
+			continue
+		}
+		matches = append(matches, fullToken)
+		if len(matches) > 1 {
+			return "", false
+		}
+	}
+	if len(matches) != 1 {
+		return "", false
+	}
+	return matches[0], true
 }
 
 // AutoCompleteSiteSourceKeys resolves masked upstream keys with the site's own

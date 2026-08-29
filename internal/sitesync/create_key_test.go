@@ -16,6 +16,7 @@ func TestCreateAccountTokenCreatesManagedKeyAndSyncsAccount(t *testing.T) {
 	ctx := setupProjectTestDB(t)
 
 	var createdBody map[string]any
+	keyDetailRequests := 0
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -44,7 +45,15 @@ func TestCreateAccountTokenCreatesManagedKeyAndSyncsAccount(t *testing.T) {
 				_, _ = w.Write([]byte(`{"success":false,"message":"无权进行此操作，未提供 New-Api-User"}`))
 				return
 			}
-			_, _ = w.Write([]byte(`{"data":{"items":[{"name":"vip-created","key":"managed-created-key","group":"vip","status":1}]}}`))
+			_, _ = w.Write([]byte(`{"data":{"items":[{"id":1,"name":"vip-created","key":"mana***********-key","group":"vip","status":1}]}}`))
+		case r.URL.Path == "/api/token/1/key":
+			if r.Header.Get("Authorization") != "Bearer test-access-token" || r.Header.Get("New-API-User") != "11494" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"success":false,"message":"无权进行此操作，未提供 New-Api-User"}`))
+				return
+			}
+			keyDetailRequests++
+			_, _ = w.Write([]byte(`{"success":true,"data":{"key":"managed-created-key"}}`))
 		case r.URL.Path == "/api/user/self/groups":
 			if r.Header.Get("Authorization") != "Bearer test-access-token" || r.Header.Get("New-API-User") != "11494" {
 				w.WriteHeader(http.StatusUnauthorized)
@@ -94,6 +103,9 @@ func TestCreateAccountTokenCreatesManagedKeyAndSyncsAccount(t *testing.T) {
 	if result == nil || result.TokenCount != 1 {
 		t.Fatalf("unexpected sync result: %+v", result)
 	}
+	if keyDetailRequests != 1 {
+		t.Fatalf("expected quick creation sync to auto-complete the masked key once, got %d requests", keyDetailRequests)
+	}
 	if createdBody["group"] != "vip" {
 		t.Fatalf("expected created group to be vip, got %#v", createdBody["group"])
 	}
@@ -109,7 +121,7 @@ func TestCreateAccountTokenCreatesManagedKeyAndSyncsAccount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SiteAccountGet failed: %v", err)
 	}
-	if len(reloaded.Tokens) != 1 || reloaded.Tokens[0].GroupKey != "vip" || reloaded.Tokens[0].Token != "managed-created-key" {
+	if len(reloaded.Tokens) != 1 || reloaded.Tokens[0].GroupKey != "vip" || reloaded.Tokens[0].Token != "managed-created-key" || reloaded.Tokens[0].ValueStatus != model.SiteTokenValueStatusReady {
 		t.Fatalf("unexpected synced tokens: %+v", reloaded.Tokens)
 	}
 	if len(reloaded.UserGroups) != 1 || reloaded.UserGroups[0].GroupKey != "vip" {

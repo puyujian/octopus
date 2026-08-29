@@ -216,7 +216,8 @@ func fetchAnyRouterManagementTokens(ctx context.Context, siteRecord *model.Site,
 		return nil, err
 	}
 	if tokens := buildSiteTokensFromPayload(payload); len(tokens) > 0 {
-		return tokens, nil
+		remoteTokens := parseRemoteTokensForAutoCompletion(payload)
+		return autoCompleteFetchedSiteTokens(ctx, siteRecord, account, tokens, remoteTokens), nil
 	}
 
 	cookieTokens, cookieErr := fetchAnyRouterTokensByCookie(ctx, siteRecord, account, accessToken, userID)
@@ -523,7 +524,8 @@ func fetchAnyRouterTokensByCookie(ctx context.Context, siteRecord *model.Site, a
 				continue
 			}
 			if tokens := buildSiteTokensFromPayload(payload); len(tokens) > 0 {
-				return tokens, nil
+				remoteTokens := parseRemoteTokensForAutoCompletion(payload)
+				return autoCompleteFetchedSiteTokens(ctx, siteRecord, account, tokens, remoteTokens), nil
 			}
 		}
 	}

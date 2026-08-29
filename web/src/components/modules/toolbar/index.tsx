@@ -7,7 +7,6 @@ import {
     ArrowUpAZ,
     ArrowUpNarrowWide,
     Clock3,
-    KeyRound,
     LayoutGrid,
     List,
     Network,
@@ -37,8 +36,6 @@ import { useSiteUIStore } from '@/components/modules/site/ui-store';
 import { useLogUIStore } from '@/components/modules/log/ui-store';
 import { LogFilterPopover } from '@/components/modules/log/FilterPopover';
 import { useProxyPoolDialogStore } from '@/components/modules/proxy-pool/dialog-store';
-import { useCompletionStore } from '@/components/modules/site-channel/completion-store';
-import { useChannelTabStore } from '@/components/modules/channel/tab-store';
 import { useTranslations } from 'next-intl';
 import { useSearchStore } from './search-store';
 import { ToolbarMenu, type ToolbarAction } from './ToolbarMenu';
@@ -120,11 +117,6 @@ export function Toolbar() {
     // Proxy pool
     const openProxyPool = useProxyPoolDialogStore((s) => s.open);
 
-    // Completion (for channel site tab)
-    const activeChannelTab = useChannelTabStore((s) => s.activeTab);
-    const completionPendingCount = useCompletionStore((s) => s.pendingCount);
-    const openCompletionDialog = useCompletionStore((s) => s.openDialog);
-
     const [expandedSearchItem, setExpandedSearchItem] = useState<ToolbarPage | null>(null);
     const [viewOptionsOpen, setViewOptionsOpen] = useState(false);
     const [createDialogOpen, setCreateDialogOpen] = useState(false);
@@ -164,18 +156,6 @@ export function Toolbar() {
 
         // 渠道页面按钮
         if (toolbarItem === 'channel') {
-            // 站点渠道 tab 显示统一补全按钮
-            if (activeChannelTab === 'site' && completionPendingCount > 0) {
-                result.push({
-                    id: 'completion',
-                    icon: <KeyRound className="size-4" />,
-                    label: '统一补全 Key',
-                    onClick: openCompletionDialog,
-                    badge: completionPendingCount,
-                    priority: 'large', // xl以上可见
-                });
-            }
-
             result.push({
                 id: 'create-channel',
                 icon: <Plus className="size-4" />,
@@ -231,12 +211,9 @@ export function Toolbar() {
         return result;
     }, [
         toolbarItem,
-        activeChannelTab,
-        completionPendingCount,
         isLogRefreshing,
         openProxyPool,
         requestOpenCreateSite,
-        openCompletionDialog,
         requestLogRefresh,
         tProxyPool,
     ]);

@@ -8,7 +8,6 @@ import dayjs from 'dayjs';
 import relativeTime from 'dayjs/plugin/relativeTime';
 import 'dayjs/locale/zh-cn';
 import 'dayjs/locale/zh-tw';
-import { useCompletionStore } from './completion-store';
 import {
     ArrowUpDown,
     Check,
@@ -89,7 +88,6 @@ import {
     useSiteChannelList,
     useUpdateSiteProjectedChannelSettings,
     useUpdateSiteGroupProjection,
-    useAutoCompleteSiteSourceKeys,
     useUpdateSiteSourceKeys,
     useUpdateSiteChannelModelDisabled,
     useUpdateSiteChannelModelRoutes,
@@ -105,13 +103,11 @@ import { translateSiteMessage } from '../site/site-message';
 import {
     SITE_GROUP_FILTER_ALL,
     createGroupFilter,
-    type PendingCompletionSite,
     type SiteChannelGroupFilter,
     type SiteSourceKeyFormItem,
     type SiteModelView,
     buildSourceKeyFormItems,
     buildSourceKeyUpdatePayload,
-    collectPendingCompletionSites,
     filterGroups,
     flattenAccountModels,
     formatHistoryTime,
@@ -136,276 +132,6 @@ import {
 } from './ui-store';
 
 type SiteChannelPendingJump = PendingJump & { target: SiteChannelJumpTarget };
-type UnifiedCompletionErrorState = Record<string, string>;
-
-function makeAccountKey(siteId: number, accountId: number) {
-    return `${siteId}:${accountId}`;
-}
-
-function UnifiedCompletionDialog({
-    open,
-    onOpenChange,
-    sites,
-}: {
-    open: boolean;
-    onOpenChange: (open: boolean) => void;
-    sites: PendingCompletionSite[];
-}) {
-    const t = useTranslations();
-    const locale = useSettingStore((state) => state.locale);
-    const autoCompleteSourceKeys = useAutoCompleteSiteSourceKeys();
-    const [savingAccounts, setSavingAccounts] = useState<Record<string, boolean>>({});
-    const [accountErrors, setAccountErrors] = useState<UnifiedCompletionErrorState>({});
-    const [completedAccounts, setCompletedAccounts] = useState<Record<string, boolean>>({});
-    const autoStartedAccountsRef = useRef<Set<string>>(new Set());
-
-    const totalPendingCount = useMemo(
-        () => sites.reduce((sum, site) => sum + site.pending_count, 0),
-        [sites],
-    );
-
-    useEffect(() => {
-        if (!open) return;
-        if (totalPendingCount > 0) return;
-        onOpenChange(false);
-    }, [open, totalPendingCount, onOpenChange]);
-
-    useEffect(() => {
-        setSavingAccounts((current) => {
-            const validKeys = new Set<string>();
-            for (const site of sites) {
-                for (const account of site.accounts) {
-                    validKeys.add(makeAccountKey(site.site_id, account.account_id));
-                }
-            }
-
-            let changed = false;
-            const next: Record<string, boolean> = {};
-            for (const [key, value] of Object.entries(current)) {
-                if (!validKeys.has(key)) {
-                    changed = true;
-                    continue;
-                }
-                next[key] = value;
-            }
-            return changed ? next : current;
-        });
-
-        setAccountErrors((current) => {
-            const validKeys = new Set<string>();
-            for (const site of sites) {
-                for (const account of site.accounts) {
-                    validKeys.add(makeAccountKey(site.site_id, account.account_id));
-                }
-            }
-
-            let changed = false;
-            const next: UnifiedCompletionErrorState = {};
-            for (const [key, value] of Object.entries(current)) {
-                if (!validKeys.has(key)) {
-                    changed = true;
-                    continue;
-                }
-                next[key] = value;
-            }
-            return changed ? next : current;
-        });
-
-        setCompletedAccounts((current) => {
-            const validKeys = new Set<string>();
-            for (const site of sites) {
-                for (const account of site.accounts) {
-                    validKeys.add(makeAccountKey(site.site_id, account.account_id));
-                }
-            }
-
-            let changed = false;
-            const next: Record<string, boolean> = {};
-            for (const [key, value] of Object.entries(current)) {
-                if (!validKeys.has(key)) {
-                    changed = true;
-                    continue;
-                }
-                next[key] = value;
-            }
-            return changed ? next : current;
-        });
-    }, [sites]);
-
-    const handleAutoCompleteAccount = useCallback(async (site: PendingCompletionSite, accountId: number) => {
-        const account = site.accounts.find((item) => item.account_id === accountId);
-        if (!account) return;
-
-        const accountKey = makeAccountKey(site.site_id, accountId);
-
-        setSavingAccounts((current) => ({ ...current, [accountKey]: true }));
-        setAccountErrors((current) => ({ ...current, [accountKey]: '' }));
-
-        try {
-            const result = await autoCompleteSourceKeys.mutateAsync({
-                siteId: site.site_id,
-                accountId,
-            });
-            if (result.completed_count > 0) {
-                setCompletedAccounts((current) => ({ ...current, [accountKey]: true }));
-                toast.success(`账号「${account.account_name}」已自动补全 ${result.completed_count} 个 Key`);
-            } else {
-                setAccountErrors((current) => ({ ...current, [accountKey]: result.message }));
-            }
-        } catch (error) {
-            setAccountErrors((current) => ({
-                ...current,
-                [accountKey]: translateSiteMessage(locale, getErrorMessage(error, `账号「${account.account_name}」自动补全失败`), t),
-            }));
-        } finally {
-            setSavingAccounts((current) => ({ ...current, [accountKey]: false }));
-        }
-    }, [autoCompleteSourceKeys, locale, t]);
-
-    useEffect(() => {
-        if (!open) {
-            autoStartedAccountsRef.current.clear();
-            return;
-        }
-        for (const site of sites) {
-            for (const account of site.accounts) {
-                const accountKey = makeAccountKey(site.site_id, account.account_id);
-                if (autoStartedAccountsRef.current.has(accountKey)) continue;
-                autoStartedAccountsRef.current.add(accountKey);
-                void handleAutoCompleteAccount(site, account.account_id);
-            }
-        }
-    }, [open, sites, handleAutoCompleteAccount]);
-
-    return (
-        <Dialog open={open} onOpenChange={onOpenChange}>
-            <DialogContent className="max-w-[min(92vw,72rem)] rounded-[2rem] p-0 sm:max-w-[min(92vw,72rem)]">
-                <div className="flex max-h-[88vh] flex-col overflow-hidden">
-                    <DialogHeader className="gap-3 border-b border-border/70 px-5 py-4 text-left sm:px-6">
-                        <DialogTitle className="flex items-center gap-2 text-xl">
-                            <KeyRound className="size-5 text-primary" />
-                            统一补全 Key
-                            <Badge variant="outline" className="h-6 px-2 text-[11px]">{totalPendingCount} 项</Badge>
-                        </DialogTitle>
-                        <DialogDescription>
-                            打开此窗口后会使用站点账号的登录凭据自动读取并保存完整 Key；无需手动粘贴。
-                        </DialogDescription>
-                        <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-100">
-                            建议一个站点下每个分组只保留一个 Key，只创建自己需要分组的 Key，这样同步和投影会更干净。
-                        </div>
-                    </DialogHeader>
-
-                    <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5 sm:px-6">
-                        <div className="space-y-4">
-                            {sites.map((site) => {
-                                return (
-                                    <section key={site.site_id} className="rounded-3xl border border-border/70 bg-card/70 p-4">
-                                        <div className="flex flex-col gap-3 border-b border-border/60 pb-4 md:flex-row md:items-start md:justify-between">
-                                            <div className="min-w-0 space-y-2">
-                                                <div className="flex flex-wrap items-center gap-2">
-                                                    <div className="truncate text-lg font-semibold text-foreground">{site.site_name}</div>
-                                                    <Badge variant="outline" className="h-6 px-2 text-[11px]">
-                                                        {platformLabel(site.platform)}
-                                                    </Badge>
-                                                    <Badge variant="outline" className="h-6 px-2 text-[11px] border-amber-500/30 bg-amber-500/10 text-amber-800 dark:text-amber-200">
-                                                        待补全 {site.pending_count}
-                                                    </Badge>
-                                                </div>
-                                                <div className="text-xs text-muted-foreground">
-                                                    自动读取使用当前账号的站点登录凭据，完整 Key 只在服务端处理。
-                                                </div>
-                                            </div>
-                                            <div className="text-xs text-muted-foreground">
-                                                如自动读取失败，请检查站点账号权限或重新同步。
-                                            </div>
-                                        </div>
-
-                                        <div className="mt-4 space-y-3">
-                                            {site.accounts.map((account) => {
-                                                const accountKey = makeAccountKey(site.site_id, account.account_id);
-                                                const isSaving = Boolean(savingAccounts[accountKey]);
-                                                const accountError = accountErrors[accountKey];
-                                                const isCompleted = Boolean(completedAccounts[accountKey]);
-
-                                                return (
-                                                    <div key={account.account_id} className="rounded-2xl border border-border/60 bg-background/70 p-4">
-                                                        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-                                                            <div>
-                                                                <div className="flex flex-wrap items-center gap-2">
-                                                                    <div className="text-sm font-semibold text-foreground">{account.account_name}</div>
-                                                                    <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
-                                                                        待补全 {account.items.length}
-                                                                    </Badge>
-                                                                    {isCompleted ? (
-                                                                        <Badge variant="outline" className="h-5 px-1.5 text-[10px] border-primary/30 bg-primary/10 text-primary">
-                                                                            自动完成
-                                                                        </Badge>
-                                                                    ) : null}
-                                                                </div>
-                                                                <div className="mt-1 text-xs text-muted-foreground">
-                                                                    自动从站点管理接口获取完整 Key，保存后会自动启用并重新参与投影。
-                                                                </div>
-                                                            </div>
-                                                            <Button
-                                                                type="button"
-                                                                className="rounded-2xl"
-                                                                onClick={() => void handleAutoCompleteAccount(site, account.account_id)}
-                                                                disabled={isSaving}
-                                                            >
-                                                                <RefreshCw className={cn('size-4', isSaving && 'animate-spin')} />
-                                                                {isSaving ? '自动读取中...' : isCompleted ? '重新尝试' : '自动补全本账号'}
-                                                            </Button>
-                                                        </div>
-
-                                                        {accountError ? (
-                                                            <div className="mt-3 rounded-2xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-                                                                {accountError}
-                                                            </div>
-                                                        ) : null}
-
-                                                        <div className="mt-4 space-y-3">
-                                                            {account.items.map((item) => (
-                                                                <div key={item.key_id} className="rounded-2xl border border-border/60 bg-card/80 p-3">
-                                                                    <div className="grid gap-3 lg:grid-cols-[minmax(0,15rem)_minmax(0,14rem)_1fr]">
-                                                                        <div className="space-y-1">
-                                                                            <div className="text-xs text-muted-foreground">分组</div>
-                                                                            <div className="truncate text-sm font-medium text-foreground">{item.group_name || item.group_key}</div>
-                                                                            <div className="text-[11px] text-muted-foreground">{item.group_key}</div>
-                                                                        </div>
-                                                                        <div className="space-y-1">
-                                                                            <div className="text-xs text-muted-foreground">Key</div>
-                                                                            <div className="truncate text-sm font-medium text-foreground">{item.key_name || `站点 Key #${item.key_id}`}</div>
-                                                                            <div className="text-[11px] text-muted-foreground">当前值：{item.token_masked || item.token}</div>
-                                                                        </div>
-                                                                        <div className="flex items-end text-xs text-muted-foreground">
-                                                                            <div className="rounded-2xl border border-primary/20 bg-primary/5 px-3 py-2">
-                                                                                {isSaving ? '正在从站点读取完整 Key…' : isCompleted ? '已自动获取并恢复启用' : '等待自动读取'}
-                                                                            </div>
-                                                                        </div>
-                                                                    </div>
-                                                                </div>
-                                                            ))}
-                                                        </div>
-                                                    </div>
-                                                );
-                                            })}
-                                        </div>
-                                    </section>
-                                );
-                            })}
-                        </div>
-                    </div>
-
-                    <DialogFooter className="border-t border-border/70 px-5 py-4 sm:px-6">
-                        <Button type="button" variant="outline" className="rounded-2xl" onClick={() => onOpenChange(false)}>
-                            关闭
-                        </Button>
-                    </DialogFooter>
-                </div>
-            </DialogContent>
-        </Dialog>
-    );
-}
 
 function getBaseGroupKey(groupKey: string) {
     return groupKey.split('::', 1)[0] || groupKey;
@@ -1901,7 +1627,7 @@ function SiteAccountPanel({
                                                     {group.models.length} 模型 · Key {group.enabled_key_count}/{group.key_count}
                                                     {group.projection_disabled ? ' · 不投影' : ''}
                                                     {group.projection_suspended ? ' · 已暂停' : STALE_MODEL_SYNC_STATUSES.includes(group.model_sync_status) ? ' · 沿用历史' : ''}
-                                                    {group.masked_pending_key_count > 0 ? ` · 待补全 ${group.masked_pending_key_count}` : ''}
+                                                    {group.masked_pending_key_count > 0 ? ` · 待自动补全 ${group.masked_pending_key_count}` : ''}
                                                     {group.has_projected_channel ? ` · 投影 ${group.projected_keys.length}` : ''}
                                                 </div>
                                             </div>
@@ -2119,7 +1845,7 @@ function SiteAccountPanel({
                                 className="inline-flex h-8 items-center gap-2 rounded-full border border-amber-500/30 bg-amber-500/10 px-3 text-xs font-medium text-amber-800 transition hover:bg-amber-500/15 dark:text-amber-200"
                             >
                                 <CircleAlert className="size-3.5" />
-                                待补全文明文 Key
+                                待自动补全 Key
                             </button>
                         ) : null}
 
@@ -2206,7 +1932,7 @@ function SiteAccountPanel({
                     <DialogHeader>
                         <DialogTitle className="text-lg font-semibold">快捷创建站点 Key</DialogTitle>
                         <DialogDescription>
-                            为分组 {creatingGroup?.group_name || creatingGroup?.group_key || '-'} 在账号 {account.account_name} 下创建新 Key，并在创建后立即同步当前卡片。
+                            为分组 {creatingGroup?.group_name || creatingGroup?.group_key || '-'} 在账号 {account.account_name} 下创建新 Key，自动读取完整 Key，并立即同步当前卡片。
                         </DialogDescription>
                     </DialogHeader>
 
@@ -2395,7 +2121,7 @@ function SiteAccountPanel({
                                     <div className="flex items-center justify-between gap-2">
                                         <div className="text-xs text-muted-foreground">
                                             {item.id ? `站点 Key #${item.id}` : '新站点 Key'}
-                                            {item.value_status === 'masked_pending' ? ' · 待补全' : ''}
+                                            {item.value_status === 'masked_pending' ? ' · 待自动补全' : ''}
                                         </div>
                                         <Button
                                             type="button"
@@ -3026,62 +2752,6 @@ function SiteCardJumpWatcher({
     return null;
 }
 
-export function SiteChannelCompletionAction() {
-    const { data } = useSiteChannelList();
-    const [completionDialogOpen, setCompletionDialogOpen] = useState(false);
-
-    const pendingCompletionSites = useMemo(
-        () => collectPendingCompletionSites(data ?? []),
-        [data],
-    );
-    const totalPendingCompletionCount = useMemo(
-        () => pendingCompletionSites.reduce((sum, site) => sum + site.pending_count, 0),
-        [pendingCompletionSites],
-    );
-    const effectiveCompletionDialogOpen = completionDialogOpen && totalPendingCompletionCount > 0;
-
-    if (totalPendingCompletionCount === 0) return null;
-
-    return (
-        <>
-            <Button
-                type="button"
-                variant="outline"
-                className="h-10 rounded-2xl px-3"
-                onClick={() => setCompletionDialogOpen(true)}
-            >
-                <KeyRound className="size-4 text-primary" />
-                统一补全 Key
-                <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
-                    {totalPendingCompletionCount}
-                </Badge>
-            </Button>
-            <UnifiedCompletionDialog
-                open={effectiveCompletionDialogOpen}
-                onOpenChange={setCompletionDialogOpen}
-                sites={pendingCompletionSites}
-            />
-        </>
-    );
-}
-
-// 新增：用于在 SiteChannelSection 中同步状态到 store
-export function useCompletionStateSync() {
-    const { data } = useSiteChannelList();
-
-    const pendingCompletionSites = useMemo(
-        () => collectPendingCompletionSites(data ?? []),
-        [data],
-    );
-
-    const totalPendingCompletionCount = useMemo(
-        () => pendingCompletionSites.reduce((sum, site) => sum + site.pending_count, 0),
-        [pendingCompletionSites],
-    );
-
-    return { pendingCompletionSites, totalPendingCompletionCount };
-}
-
 export function SiteChannelSection({
     searchTerm,
     sortField,
@@ -3101,20 +2771,6 @@ export function SiteChannelSection({
     const requestJump = useJumpStore((state) => state.requestJump);
     const [highlightedSiteId, setHighlightedSiteId] = useState<number | null>(null);
     const siteCardRefs = useRef<Map<number, HTMLDivElement>>(new Map());
-
-    // 同步补全状态到 store，并暴露对话框控制
-    const { pendingCompletionSites, totalPendingCompletionCount } = useCompletionStateSync();
-    const setPendingCount = useCompletionStore((s) => s.setPendingCount);
-    const completionDialogOpen = useCompletionStore((s) => s.dialogOpen);
-    const setCompletionDialogOpen = useCompletionStore((s) => s.setDialogOpen);
-
-    useEffect(() => {
-        setPendingCount(totalPendingCompletionCount);
-        // 待补全清零时主动关闭对话框，避免残留的 open 状态在新任务到来时自动重开
-        if (totalPendingCompletionCount === 0) {
-            setCompletionDialogOpen(false);
-        }
-    }, [totalPendingCompletionCount, setPendingCount, setCompletionDialogOpen]);
 
     const pendingSiteChannelJump = pendingJump && isSiteChannelJumpTarget(pendingJump.target)
         ? pendingJump as SiteChannelPendingJump
@@ -3196,26 +2852,17 @@ export function SiteChannelSection({
         );
     }
 
-    return (
-        <>
-            {cards.length > 0 && (
-                <SiteChannelGrid
-                    cards={cards}
-                    layout={layout}
-                    pendingSiteChannelJump={pendingSiteChannelJump}
-                    highlightedSiteId={highlightedSiteId}
-                    registerCardRef={registerCardRef}
-                    clearPending={clearPending}
-                    requestJump={requestJump}
-                />
-            )}
-            <UnifiedCompletionDialog
-                open={completionDialogOpen && totalPendingCompletionCount > 0}
-                onOpenChange={setCompletionDialogOpen}
-                sites={pendingCompletionSites}
-            />
-        </>
-    );
+    return cards.length > 0 ? (
+        <SiteChannelGrid
+            cards={cards}
+            layout={layout}
+            pendingSiteChannelJump={pendingSiteChannelJump}
+            highlightedSiteId={highlightedSiteId}
+            registerCardRef={registerCardRef}
+            clearPending={clearPending}
+            requestJump={requestJump}
+        />
+    ) : null;
 }
 
 function SiteChannelGrid({

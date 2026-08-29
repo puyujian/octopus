@@ -84,6 +84,10 @@ func CreateAccountToken(ctx context.Context, accountID int, req model.SiteChanne
 	return sitesync.CreateAccountToken(ctx, accountID, req)
 }
 
+func CreatePendingAccountTokens(ctx context.Context, siteID int, accountID int) (*model.SiteChannelPendingKeyCreateResult, error) {
+	return sitesync.CreatePendingAccountTokens(ctx, siteID, accountID)
+}
+
 func AutoCompleteSiteSourceKeys(ctx context.Context, siteID int, accountID int) (*model.SiteSourceKeyAutoCompletionResult, error) {
 	return sitesync.AutoCompleteSiteSourceKeys(ctx, siteID, accountID)
 }

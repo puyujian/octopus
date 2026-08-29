@@ -153,6 +153,26 @@ type SiteChannelKeyCreateRequest struct {
 	Name     string `json:"name,omitempty"`
 }
 
+type SiteChannelPendingKeyCreateItem struct {
+	GroupKey  string `json:"group_key"`
+	GroupName string `json:"group_name"`
+	Status    string `json:"status"`
+	Message   string `json:"message"`
+}
+
+type SiteChannelPendingKeyCreateResult struct {
+	SiteID         int                               `json:"site_id"`
+	AccountID      int                               `json:"account_id"`
+	AttemptedCount int                               `json:"attempted_count"`
+	CreatedCount   int                               `json:"created_count"`
+	ExistingCount  int                               `json:"existing_count"`
+	FailedCount    int                               `json:"failed_count"`
+	PendingCount   int                               `json:"pending_count"`
+	SyncStatus     string                            `json:"sync_status"`
+	SyncMessage    string                            `json:"sync_message,omitempty"`
+	Results        []SiteChannelPendingKeyCreateItem `json:"results"`
+}
+
 type SiteProjectedKeyAddRequest struct {
 	Enabled    bool   `json:"enabled"`
 	ChannelKey string `json:"channel_key" binding:"required"`

@@ -78,10 +78,12 @@ import {
     type SiteChannelAccount,
     type SiteChannelCard,
     type SiteChannelGroup,
+    type SiteChannelPendingKeyCreateResult,
     type SiteModelDisableUpdateRequest,
     type SiteModelRouteType,
     type SiteModelRouteUpdateRequest,
     useCreateSiteChannelKey,
+    useCreatePendingSiteChannelKeys,
     useAddSiteManualModels,
     useDeleteSiteManualModel,
     useResetSiteChannelModelRoutes,
@@ -958,6 +960,8 @@ function SiteAccountPanel({
     const [sourceKeyForm, setSourceKeyForm] = useState<SiteSourceKeyFormItem[]>([]);
     const [visibleSourceKeyRows, setVisibleSourceKeyRows] = useState<Record<string, boolean>>({});
     const [quickCreateName, setQuickCreateName] = useState('');
+    const [bulkCreateOpen, setBulkCreateOpen] = useState(false);
+    const [bulkCreateResult, setBulkCreateResult] = useState<SiteChannelPendingKeyCreateResult | null>(null);
     const [highlightedModelKey, setHighlightedModelKey] = useState<string | null>(null);
     const [modelSearchTerm, setModelSearchTerm] = useState('');
     const [bulkMoveTarget, setBulkMoveTarget] = useState<SiteModelRouteType>('openai_chat');
@@ -973,6 +977,7 @@ function SiteAccountPanel({
     const setTableSort = useSiteChannelPanelViewStore((state) => state.setTableSort);
 
     const createKeyMutation = useCreateSiteChannelKey(siteId, account.account_id);
+    const createPendingKeysMutation = useCreatePendingSiteChannelKeys(siteId, account.account_id);
     const sourceKeyMutation = useUpdateSiteSourceKeys(siteId, account.account_id);
     const advancedMutation = useUpdateSiteProjectedChannelSettings(siteId, account.account_id);
     const groupProjectionMutation = useUpdateSiteGroupProjection(siteId, account.account_id);
@@ -1207,8 +1212,39 @@ function SiteAccountPanel({
     }, [pendingModelKeys, disabledMutation, siteId, account.account_id, translateSiteError]);
 
     const handleOpenCreateKey = (group: SiteChannelGroup) => {
+        if (createPendingKeysMutation.isPending) return;
         setCreatingGroup(group);
         setQuickCreateName('');
+    };
+
+    const handleOpenBulkCreate = () => {
+        if (createKeyMutation.isPending || createPendingKeysMutation.isPending) return;
+        setBulkCreateResult(null);
+        setBulkCreateOpen(true);
+    };
+
+    const handleCloseBulkCreate = () => {
+        if (createPendingKeysMutation.isPending) return;
+        setBulkCreateOpen(false);
+        setBulkCreateResult(null);
+    };
+
+    const handleCreatePendingKeys = () => {
+        if (pendingKeyGroups.length === 0 || createPendingKeysMutation.isPending) return;
+
+        createPendingKeysMutation.mutate(undefined, {
+            onSuccess: (result) => {
+                setBulkCreateResult(result);
+                if (result.failed_count === 0 && result.sync_status !== 'failed') {
+                    toast.success(`待建 Key 处理完成：新建 ${result.created_count} 个${result.existing_count > 0 ? `，同步已有 ${result.existing_count} 个` : ''}`);
+                    return;
+                }
+                toast.warning(`待建 Key 已处理：成功 ${result.created_count + result.existing_count} 个，失败 ${result.failed_count} 个`);
+            },
+            onError: (error) => {
+                toast.error(translateSiteError(error, '一键创建待建 Key 失败'));
+            },
+        });
     };
 
     const handleToggleGroupProjection = (group: SiteChannelGroup) => {
@@ -1506,10 +1542,7 @@ function SiteAccountPanel({
     const activeGroupSuspensionReason = activeGroup?.projection_suspend_reason || activeGroup?.model_sync_message || '';
     const activeGroupStaleReason = activeGroup?.model_sync_message || '';
     const activeQuickFilterCount = panelPreferences.quickFilters.length;
-    const pendingKeyGroups = useMemo(
-        () => visibleGroups.filter((group) => !group.has_keys),
-        [visibleGroups],
-    );
+    const pendingKeyGroups = account.groups.filter((group) => !group.has_keys);
     const projectedGroups = useMemo(
         () => visibleGroups.filter((group) => group.has_projected_channel),
         [visibleGroups],
@@ -1814,7 +1847,17 @@ function SiteAccountPanel({
                                 </PopoverTrigger>
                                 <PopoverContent align="start" className="w-72 rounded-2xl border border-amber-500/30 bg-card p-3 shadow-xl">
                                     <div className="space-y-2">
-                                        <div className="text-xs font-medium text-muted-foreground">未创建 Key 的分组</div>
+                                        <Button
+                                            type="button"
+                                            size="sm"
+                                            className="w-full rounded-xl"
+                                            onClick={handleOpenBulkCreate}
+                                            disabled={createKeyMutation.isPending || createPendingKeysMutation.isPending}
+                                        >
+                                            <KeyRound className="size-3.5" />
+                                            {createPendingKeysMutation.isPending ? '批量创建中...' : `一键创建全部 ${pendingKeyGroups.length} 组`}
+                                        </Button>
+                                        <div className="border-t border-border/60 pt-2 text-xs font-medium text-muted-foreground">未创建 Key 的分组</div>
                                         <div className="flex flex-wrap gap-2">
                                             {pendingKeyGroups.map((group) => (
                                                 <Button
@@ -1824,7 +1867,7 @@ function SiteAccountPanel({
                                                     size="sm"
                                                     className="rounded-full border-amber-500/30 bg-white/60 text-amber-800 hover:bg-white dark:bg-background/40 dark:text-amber-200"
                                                     onClick={() => handleOpenCreateKey(group)}
-                                                    disabled={createKeyMutation.isPending}
+                                                    disabled={createKeyMutation.isPending || createPendingKeysMutation.isPending}
                                                 >
                                                     {group.group_name || group.group_key}
                                                     <span className="text-[10px] text-amber-700/80 dark:text-amber-200/80">
@@ -1972,6 +2015,106 @@ function SiteAccountPanel({
                             <RefreshCw className={cn('size-4', createKeyMutation.isPending && 'animate-spin')} />
                             {createKeyMutation.isPending ? '创建并同步中...' : '创建并同步 Key'}
                         </Button>
+                    </DialogFooter>
+                </DialogContent>
+            </Dialog>
+
+            <Dialog open={bulkCreateOpen} onOpenChange={(open) => !open && handleCloseBulkCreate()}>
+                <DialogContent className="rounded-3xl sm:max-w-lg">
+                    <DialogHeader>
+                        <DialogTitle className="text-lg font-semibold">
+                            {bulkCreateResult ? '待建 Key 处理结果' : '确认一键创建待建 Key'}
+                        </DialogTitle>
+                        <DialogDescription>
+                            {bulkCreateResult
+                                ? `账号 ${account.account_name} 已完成本次批量处理。`
+                                : `将为账号 ${account.account_name} 下全部 ${pendingKeyGroups.length} 个待建分组创建 Key。`}
+                        </DialogDescription>
+                    </DialogHeader>
+
+                    {bulkCreateResult ? (
+                        <div className="space-y-3">
+                            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                                <div className="rounded-2xl border border-border/70 bg-muted/30 p-3 text-center">
+                                    <div className="text-lg font-semibold text-foreground">{bulkCreateResult.created_count}</div>
+                                    <div className="text-[11px] text-muted-foreground">新建</div>
+                                </div>
+                                <div className="rounded-2xl border border-border/70 bg-muted/30 p-3 text-center">
+                                    <div className="text-lg font-semibold text-foreground">{bulkCreateResult.existing_count}</div>
+                                    <div className="text-[11px] text-muted-foreground">已有</div>
+                                </div>
+                                <div className="rounded-2xl border border-border/70 bg-muted/30 p-3 text-center">
+                                    <div className="text-lg font-semibold text-destructive">{bulkCreateResult.failed_count}</div>
+                                    <div className="text-[11px] text-muted-foreground">失败</div>
+                                </div>
+                                <div className="rounded-2xl border border-border/70 bg-muted/30 p-3 text-center">
+                                    <div className="text-lg font-semibold text-amber-700 dark:text-amber-300">{bulkCreateResult.pending_count}</div>
+                                    <div className="text-[11px] text-muted-foreground">仍待建</div>
+                                </div>
+                            </div>
+                            <div className="max-h-64 space-y-2 overflow-y-auto pr-1">
+                                {bulkCreateResult.results.map((item) => (
+                                    <div key={item.group_key} className="rounded-2xl border border-border/70 bg-muted/20 px-3 py-2">
+                                        <div className="flex items-center justify-between gap-3">
+                                            <span className="text-sm font-medium text-foreground">{item.group_name || item.group_key}</span>
+                                            <Badge variant={item.status === 'failed' ? 'destructive' : 'secondary'}>
+                                                {item.status === 'created' ? '已创建' : item.status === 'existing' ? '上游已有' : '失败'}
+                                            </Badge>
+                                        </div>
+                                        <div className="mt-1 break-words text-xs text-muted-foreground">{item.message}</div>
+                                    </div>
+                                ))}
+                            </div>
+                            {bulkCreateResult.sync_status === 'failed' ? (
+                                <div className="rounded-2xl border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                                    Key 创建结果已保留，但账号同步未完全成功：{bulkCreateResult.sync_message || '请稍后重新同步账号'}
+                                </div>
+                            ) : null}
+                        </div>
+                    ) : (
+                        <div className="space-y-3">
+                            <div className="max-h-56 overflow-y-auto rounded-2xl border border-amber-500/25 bg-amber-500/5 p-3">
+                                <div className="flex flex-wrap gap-2">
+                                    {pendingKeyGroups.map((group) => (
+                                        <Badge key={group.group_key} variant="secondary" className="rounded-full">
+                                            {group.group_name || group.group_key}
+                                        </Badge>
+                                    ))}
+                                </div>
+                            </div>
+                            <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
+                                已成功创建的上游 Key 不会因其他分组失败而回滚；失败项会在结果中单独列出。
+                            </div>
+                        </div>
+                    )}
+
+                    <DialogFooter>
+                        {bulkCreateResult ? (
+                            <Button type="button" className="rounded-2xl" onClick={handleCloseBulkCreate}>
+                                完成
+                            </Button>
+                        ) : (
+                            <>
+                                <Button
+                                    type="button"
+                                    variant="outline"
+                                    className="rounded-2xl"
+                                    onClick={handleCloseBulkCreate}
+                                    disabled={createPendingKeysMutation.isPending}
+                                >
+                                    取消
+                                </Button>
+                                <Button
+                                    type="button"
+                                    className="rounded-2xl"
+                                    onClick={handleCreatePendingKeys}
+                                    disabled={createPendingKeysMutation.isPending || pendingKeyGroups.length === 0}
+                                >
+                                    <RefreshCw className={cn('size-4', createPendingKeysMutation.isPending && 'animate-spin')} />
+                                    {createPendingKeysMutation.isPending ? '创建并同步中...' : `确认创建 ${pendingKeyGroups.length} 个 Key`}
+                                </Button>
+                            </>
+                        )}
                     </DialogFooter>
                 </DialogContent>
             </Dialog>

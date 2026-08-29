@@ -383,6 +383,26 @@ export type SiteChannelKeyCreateRequest = {
     name?: string;
 };
 
+export type SiteChannelPendingKeyCreateItem = {
+    group_key: string;
+    group_name: string;
+    status: 'created' | 'existing' | 'failed';
+    message: string;
+};
+
+export type SiteChannelPendingKeyCreateResult = {
+    site_id: number;
+    account_id: number;
+    attempted_count: number;
+    created_count: number;
+    existing_count: number;
+    failed_count: number;
+    pending_count: number;
+    sync_status: 'not_needed' | 'success' | 'failed';
+    sync_message?: string;
+    results: SiteChannelPendingKeyCreateItem[];
+};
+
 export type SiteSourceKeyAddRequest = {
     enabled: boolean;
     token: string;
@@ -485,6 +505,21 @@ export function useCreateSiteChannelKey(siteId: number, accountId: number) {
         },
         onError: (error) => {
             logger.error('site channel key create failed:', error);
+        },
+    });
+}
+
+export function useCreatePendingSiteChannelKeys(siteId: number, accountId: number) {
+    const queryClient = useQueryClient();
+
+    return useMutation({
+        mutationFn: async () =>
+            apiClient.post<SiteChannelPendingKeyCreateResult>(getAccountPath(siteId, accountId, '/keys/create-pending'), {}),
+        onSuccess: () => {
+            invalidateSiteChannelAndRelated(queryClient);
+        },
+        onError: (error) => {
+            logger.error('site channel pending keys create failed:', error);
         },
     });
 }

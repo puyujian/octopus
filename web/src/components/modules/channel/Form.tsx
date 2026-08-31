@@ -54,6 +54,7 @@ export interface ChannelFormProps {
     onCancel?: () => void;
     cancelText?: string;
     idPrefix?: string;
+    stickyActions?: boolean;
 }
 
 import {
@@ -73,6 +74,7 @@ export function ChannelForm({
     onCancel,
     cancelText,
     idPrefix = 'channel',
+    stickyActions = false,
 }: ChannelFormProps) {
     const t = useTranslations('channel.form');
 
@@ -224,7 +226,8 @@ export function ChannelForm({
     };
 
     return (
-        <form onSubmit={onSubmit} className="space-y-4 px-1">
+        <form onSubmit={onSubmit} className={stickyActions ? 'flex h-full min-h-0 flex-col' : 'space-y-4 px-1 pb-2'}>
+            <div className={stickyActions ? 'min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain px-1 pb-4' : 'space-y-4'}>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="space-y-2">
                     <label htmlFor={`${idPrefix}-name`} className="text-sm font-medium text-card-foreground">
@@ -281,7 +284,7 @@ export function ChannelForm({
                 </div>
                 <div className="space-y-2">
                     {(formData.base_urls ?? []).map((u, idx) => (
-                        <div key={`baseurl-${idx}`} className="flex items-center gap-2">
+                        <div key={`baseurl-${idx}`} className="flex min-w-0 items-center gap-2">
                             <Input
                                 id={`${idPrefix}-base-${idx}`}
                                 type="url"
@@ -325,25 +328,26 @@ export function ChannelForm({
                 </div>
                 <div className="space-y-2">
                     {(formData.keys ?? []).map((k, idx) => (
-                        <div key={k.id ?? `new-${idx}`} className="flex items-center gap-2">
+                        <div key={k.id ?? `new-${idx}`} className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto_auto] gap-2 sm:flex sm:items-center">
                             <Input
                                 type="text"
                                 value={k.channel_key}
                                 onChange={(e) => handleUpdateKey(idx, { channel_key: e.target.value })}
                                 placeholder={t('apiKey')}
                                 required={idx === 0}
-                                className="rounded-xl flex-1"
+                                className="col-span-2 col-start-1 row-start-1 min-w-0 rounded-xl sm:flex-1"
                             />
                             <Input
                                 type="text"
                                 value={k.remark ?? ''}
                                 onChange={(e) => handleUpdateKey(idx, { remark: e.target.value })}
                                 placeholder={t('remark')}
-                                className="rounded-xl w-32"
+                                className="col-span-2 col-start-1 row-start-2 min-w-0 rounded-xl sm:w-32"
                             />
                             <Switch
                                 checked={k.enabled}
                                 onCheckedChange={(checked) => handleUpdateKey(idx, { enabled: checked })}
+                                className="col-start-3 row-start-2 justify-self-center"
                             />
                             <Button
                                 type="button"
@@ -351,7 +355,7 @@ export function ChannelForm({
                                 size="sm"
                                 onClick={() => handleRemoveKey(idx)}
                                 disabled={(formData.keys ?? []).length <= 1}
-                                className="h-8 w-8 p-0 rounded-xl text-muted-foreground hover:text-destructive hover:bg-transparent disabled:opacity-40"
+                                className="col-start-3 row-start-1 h-9 w-9 justify-self-end rounded-xl p-0 text-muted-foreground hover:bg-transparent hover:text-destructive disabled:opacity-40 sm:h-8 sm:w-8"
                                 title="Remove"
                             >
                                 <X className="h-4 w-4" />
@@ -422,7 +426,7 @@ export function ChannelForm({
                             </Button>
                         )}
                     </div>
-                    <div className="rounded-xl border border-border bg-muted/30 p-2.5 max-h-40 min-h-12 overflow-y-auto">
+                    <div className="max-h-40 min-h-12 overflow-y-auto rounded-xl border border-border bg-muted/30 p-2.5 overscroll-contain">
                         {(autoModels.length + customModels.length) > 0 ? (
                             <div className="flex flex-wrap gap-1.5">
                                 {autoModels.map((model) => (
@@ -519,20 +523,20 @@ export function ChannelForm({
                             </div>
                             <div className="space-y-2">
                                 {(formData.custom_header ?? []).map((h, idx) => (
-                                    <div key={`hdr-${idx}`} className="flex items-center gap-2">
+                                    <div key={`hdr-${idx}`} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] items-center gap-2">
                                         <Input
                                             type="text"
                                             value={h.header_key}
                                             onChange={(e) => handleUpdateHeader(idx, { header_key: e.target.value })}
                                             placeholder={t('customHeaderKey')}
-                                            className="rounded-xl flex-1"
+                                            className="min-w-0 rounded-xl"
                                         />
                                         <Input
                                             type="text"
                                             value={h.header_value}
                                             onChange={(e) => handleUpdateHeader(idx, { header_value: e.target.value })}
                                             placeholder={t('customHeaderValue')}
-                                            className="rounded-xl flex-1"
+                                            className="min-w-0 rounded-xl"
                                         />
                                         <Button
                                             type="button"
@@ -599,7 +603,9 @@ export function ChannelForm({
                 </div>
             </div>
 
-            <div className={`flex flex-col gap-3 pt-2 ${onCancel ? 'sm:flex-row' : ''}`}>
+            </div>
+
+            <div className={`flex flex-col gap-2 ${stickyActions ? 'shrink-0 border-t border-border/70 bg-card/95 px-1 pb-[max(0.5rem,env(safe-area-inset-bottom))] pt-3 backdrop-blur' : 'pt-2'} ${onCancel ? 'sm:flex-row' : ''}`}>
                 {onCancel && cancelText && (
                     <Button
                         type="button"

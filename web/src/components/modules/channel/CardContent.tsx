@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
     Trash2,
     CheckCircle2,
@@ -18,7 +18,6 @@ import {
     MorphingDialogClose,
     useMorphingDialog,
 } from '@/components/ui/morphing-dialog';
-import { Tabs, TabsContents, TabsContent } from '@/components/animate-ui/primitives/animate/tabs';
 import { type StatsMetricsFormatted } from '@/api/endpoints/stats';
 import { useTranslations } from 'next-intl';
 import { toast } from '@/components/common/Toast';
@@ -28,6 +27,7 @@ import { formatMoney } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
 import { useJumpStore } from '@/stores/jump';
+import { ChannelModelHealthPanel } from './ModelHealth';
 
 export function CardContent({ channel, stats }: { channel: Channel; stats: StatsMetricsFormatted }) {
     const { setIsOpen } = useMorphingDialog();
@@ -65,6 +65,7 @@ export function CardContent({ channel, stats }: { channel: Channel; stats: Stats
     });
     const t = useTranslations('channel.detail');
     const tProxy = useTranslations('proxyPool');
+    const channelModels = useMemo(() => Array.from(new Set([...(channel.model || '').split(','), ...(channel.custom_model || '').split(',')].map((value) => value.trim()).filter(Boolean))), [channel.model, channel.custom_model]);
 
     const currentView = isEditing ? 'editing' : 'viewing';
 
@@ -189,19 +190,26 @@ export function CardContent({ channel, stats }: { channel: Channel; stats: Stats
     };
 
     return (
-        <>
-            <MorphingDialogTitle>
-                <header className="mb-6 flex items-center justify-between">
-                    <h2 className="text-2xl font-bold text-card-foreground">
-                        {isEditing ? t('title.edit') : t('title.view')}
-                    </h2>
-                    {channel.managed ? (
-                        <Badge variant="outline" className="ml-3 border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300">
-                            站点投影
-                        </Badge>
-                    ) : null}
+        <div className="flex h-full min-h-0 flex-col">
+            <MorphingDialogTitle className="shrink-0 border-b border-border/70 bg-card/95 px-4 pb-3 pt-[max(0.75rem,env(safe-area-inset-top))] backdrop-blur sm:px-6 sm:pb-4 sm:pt-4">
+                <header className="flex min-w-0 items-center gap-3">
+                    <div className="min-w-0 flex-1">
+                        <div className="mb-0.5 flex items-center gap-2">
+                            <span className="text-xs font-medium text-muted-foreground">
+                                {isEditing ? t('title.edit') : t('title.view')}
+                            </span>
+                            {channel.managed ? (
+                                <Badge variant="outline" className="h-5 shrink-0 border-amber-500/30 bg-amber-500/10 px-1.5 text-[10px] text-amber-700 dark:text-amber-300">
+                                    站点投影
+                                </Badge>
+                            ) : null}
+                        </div>
+                        <h2 className="truncate text-xl font-bold text-card-foreground sm:text-2xl" title={channel.name}>
+                            {channel.name}
+                        </h2>
+                    </div>
                     <MorphingDialogClose
-                        className="relative top-0 right-0"
+                        className="relative right-0 top-0 grid size-10 shrink-0 place-items-center rounded-full hover:bg-muted"
                         variants={{
                             initial: { opacity: 0, scale: 0.8 },
                             animate: { opacity: 1, scale: 1 },
@@ -211,11 +219,10 @@ export function CardContent({ channel, stats }: { channel: Channel; stats: Stats
                 </header>
             </MorphingDialogTitle>
 
-            <MorphingDialogDescription>
-                <Tabs value={currentView}>
-                    <TabsContents>
-                        <TabsContent value="viewing" >
-                            <div className="max-h-[60vh] overflow-y-auto space-y-4 sm:space-y-5">
+            <MorphingDialogDescription disableLayoutAnimation className="min-h-0 flex-1 overflow-hidden">
+                {currentView === 'viewing' ? (
+                    <div className="flex h-full min-h-0 flex-col">
+                            <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain px-4 py-4 sm:space-y-5 sm:px-6 sm:py-5">
                                 {channel.managed ? (
                                     <section className="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-800 dark:text-amber-200">
                                         <div>
@@ -279,6 +286,8 @@ export function CardContent({ channel, stats }: { channel: Channel; stats: Stats
                                         </dd>
                                     </div>
                                 </dl>
+
+                                <ChannelModelHealthPanel targets={channelModels.map((modelName) => ({ channel_id: channel.id, model_name: modelName }))} />
 
                                 {/* 请求详情 */}
                                 <section className="space-y-3">
@@ -483,7 +492,7 @@ export function CardContent({ channel, stats }: { channel: Channel; stats: Stats
 
                             {/* 操作按钮 */}
                             {!channel.managed ? (
-                                <div className="grid gap-3 sm:grid-cols-2 pt-2">
+                                <div className="grid shrink-0 grid-cols-2 gap-2 border-t border-border/70 bg-card/95 px-4 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 backdrop-blur sm:gap-3 sm:px-6 sm:pb-4">
                                     <Button
                                         onClick={() => (isConfirmingDelete ? setIsConfirmingDelete(false) : setIsEditing(true))}
                                         variant={isConfirmingDelete ? 'secondary' : 'default'}
@@ -506,9 +515,9 @@ export function CardContent({ channel, stats }: { channel: Channel; stats: Stats
                                     </Button>
                                 </div>
                             ) : null}
-                        </TabsContent>
-
-                        <TabsContent value="editing">
+                    </div>
+                ) : (
+                        <div className="h-full overflow-hidden px-3 pt-4 sm:px-6 sm:pt-5">
                             <ChannelForm
                                 formData={formData}
                                 onFormDataChange={setFormData}
@@ -519,11 +528,11 @@ export function CardContent({ channel, stats }: { channel: Channel; stats: Stats
                                 onCancel={() => setIsEditing(false)}
                                 cancelText={t('actions.cancel')}
                                 idPrefix="channel"
+                                stickyActions
                             />
-                        </TabsContent>
-                    </TabsContents>
-                </Tabs>
+                        </div>
+                )}
             </MorphingDialogDescription>
-        </>
+        </div>
     );
 }

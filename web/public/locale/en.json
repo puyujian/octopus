@@ -615,6 +615,8 @@
             "addItem": "Add Model",
             "autoAdd": "Auto Add",
             "clear": "Clear",
+            "moveUp": "Move up",
+            "moveDown": "Move down",
             "selectChannel": "Channel",
             "selectModel": "Model"
         },
@@ -835,6 +837,12 @@
             "page": "Page {page}",
             "pagesRange": "Pages {from}–{to}"
         }
+    },
+    "channelModel": {
+        "title": "Model Health", "probe": "Probe", "smartGroup": "Smart group", "loading": "Loading...", "empty": "No models", "cancel": "Cancel",
+        "status": { "idle": "Not checked", "queued": "Queued", "running": "Checking", "success": "Healthy", "failed": "Failed", "stale": "Stale", "interrupted": "Interrupted" },
+        "toast": { "probeStarted": "Started probing {count} models", "probeFailed": "Failed to start probing", "groupApplied": "Added {added} models; {existing} already existed", "groupFailed": "Failed to add models" },
+        "group": { "title": "Smart group models", "description": "Healthy models are selected by default. Failed models require confirmation. Existing or excluded members are never restored automatically.", "select": "Select target group", "existing": "Already exists", "excluded": "Excluded", "create": "Create group", "unmatched": "No matching suggestion", "apply": "Add {count}", "confirmForce": "Confirm force add", "forceWarning": "{count} selected models have no recent healthy probe. Continue?", "reason": { "exact": "Exact match", "regex": "Regex match", "fuzzy": "Fuzzy match" } }
     },
     "channel": {
         "tabs": {

@@ -34,6 +34,7 @@ import {
     Trash2,
     Waypoints,
     XCircle,
+    Activity,
 } from 'lucide-react';
 
 dayjs.extend(relativeTime);
@@ -132,6 +133,8 @@ import {
     type SiteChannelTableSortField,
     useSiteChannelPanelViewStore,
 } from './ui-store';
+import { ChannelModelActionButtons, ChannelModelHealthBadge } from '@/components/modules/channel/ModelHealth';
+import { type ChannelModelHealth, useChannelModelHealth, useRunChannelModelHealth } from '@/api/endpoints/channel-model';
 
 type SiteChannelPendingJump = PendingJump & { target: SiteChannelJumpTarget };
 
@@ -141,6 +144,10 @@ function getBaseGroupKey(groupKey: string) {
 
 function makeModelKey(groupKey: string, modelName: string) {
     return `${groupKey}\u0000${modelName}`;
+}
+
+function makeChannelModelKey(channelId: number, modelName: string) {
+    return `${channelId}\u0000${modelName}`;
 }
 
 function removeKeys<T>(record: Record<string, T>, keys: string[]) {
@@ -632,6 +639,8 @@ const SiteChannelTableView = forwardRef<
         onToggleDisabled: (model: SiteModelView) => void;
         onDeleteManualModel: (model: SiteModelView) => void;
         onNavigateToChannel: (channelId: number) => void;
+        healthByTarget: Map<string, ChannelModelHealth>;
+        onProbeModel: (model: SiteModelView) => void;
     }
 >(function SiteChannelTableView({
     models,
@@ -649,6 +658,8 @@ const SiteChannelTableView = forwardRef<
     onToggleDisabled,
     onDeleteManualModel,
     onNavigateToChannel,
+    healthByTarget,
+    onProbeModel,
 }, ref) {
     'use no memo';
 
@@ -737,6 +748,9 @@ const SiteChannelTableView = forwardRef<
                         const isPending = pendingModelKeys.has(modelKey);
                         const isSelected = selectedModelKeys.has(modelKey);
                         const historyCount = getModelHistoryCount(model);
+                        const modelHealth = model.projected_channel_id
+                            ? healthByTarget.get(makeChannelModelKey(model.projected_channel_id, model.model_name))
+                            : undefined;
 
                         return (
                             <div
@@ -841,6 +855,7 @@ const SiteChannelTableView = forwardRef<
                                                 待处理
                                             </Badge>
                                         ) : null}
+                                        {model.projected_channel_id ? <ChannelModelHealthBadge health={modelHealth} /> : null}
                                     </div>
                                 </div>
                                 <div role="cell" className="min-w-0">
@@ -862,6 +877,17 @@ const SiteChannelTableView = forwardRef<
                                 </div>
                                 <div role="cell" className="min-w-0">
                                     <div className="flex justify-end gap-1">
+                                        {model.projected_channel_id ? (
+                                            <button
+                                                type="button"
+                                                onClick={() => onProbeModel(model)}
+                                                disabled={isPending || model.disabled}
+                                                className="rounded-lg p-1 text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:opacity-40"
+                                                title="模型测活"
+                                            >
+                                                <Activity className="size-4" />
+                                            </button>
+                                        ) : null}
                                         <MoveRoutePopover
                                             currentRouteType={model.route_type}
                                             disabled={isPending || model.disabled}
@@ -1020,6 +1046,20 @@ function SiteAccountPanel({
             };
         });
     }, [account, activeFilter, pendingRouteOverrides, pendingDisabledOverrides]);
+    const siteHealthTargets = useMemo(() => scopedModels
+        .filter((model) => !!model.projected_channel_id)
+        .map((model) => ({ channel_id: model.projected_channel_id!, model_name: model.model_name })), [scopedModels]);
+    const siteHealthQuery = useChannelModelHealth(siteHealthTargets);
+    const runSiteModelHealth = useRunChannelModelHealth();
+    const healthByTarget = useMemo(() => new Map((siteHealthQuery.data ?? []).map((row) => [makeChannelModelKey(row.channel_id, row.model_name), row])), [siteHealthQuery.data]);
+
+    const handleProbeModel = useCallback((model: SiteModelView) => {
+        if (!model.projected_channel_id) return;
+        runSiteModelHealth.mutate([{ channel_id: model.projected_channel_id, model_name: model.model_name }], {
+            onSuccess: () => toast.success(`已开始测活 ${model.model_name}`),
+            onError: (error) => toast.error('启动模型测活失败', { description: error.message }),
+        });
+    }, [runSiteModelHealth]);
 
     const filteredModels = useMemo(() => {
         const normalizedSearch = modelSearchTerm.trim().toLowerCase();
@@ -1938,10 +1978,15 @@ function SiteAccountPanel({
                         ) : null}
 
                         {selectedVisibleCount > 0 ? (
-                            <div className="ml-auto flex flex-wrap items-center gap-2">
-                                <span className="text-xs font-medium text-foreground">已选 {selectedVisibleCount} 个</span>
+                            <div className="ml-auto grid w-full grid-cols-2 items-center gap-2 rounded-2xl border border-border/70 bg-background/70 p-2 sm:flex sm:w-auto sm:flex-wrap sm:rounded-none sm:border-0 sm:bg-transparent sm:p-0">
+                                <div className="col-span-2 flex min-w-0 items-center justify-between gap-2 sm:contents">
+                                    <span className="text-xs font-medium text-foreground">已选 {selectedVisibleCount} 个</span>
+                                    <Button type="button" variant="ghost" size="sm" className="h-7 rounded-xl px-2 text-xs sm:order-5" onClick={() => setSelectedModelKeys(new Set())}>
+                                        清空
+                                    </Button>
+                                </div>
                                 <Select value={bulkMoveTarget} onValueChange={(value) => setBulkMoveTarget(value as SiteModelRouteType)}>
-                                    <SelectTrigger className="h-7 w-[10rem] rounded-xl text-xs">
+                                    <SelectTrigger className="h-8 w-full rounded-xl text-xs sm:h-7 sm:w-[10rem]">
                                         <SelectValue placeholder="目标端点" />
                                     </SelectTrigger>
                                     <SelectContent className="rounded-xl">
@@ -1952,18 +1997,20 @@ function SiteAccountPanel({
                                         ))}
                                     </SelectContent>
                                 </Select>
-                                <Button type="button" size="sm" className="h-7 rounded-xl px-2 text-xs" onClick={() => applyRouteChange(selectedModels, bulkMoveTarget)} disabled={hasPendingChanges}>
+                                <Button type="button" size="sm" className="h-8 w-full rounded-xl px-2 text-xs sm:h-7 sm:w-auto" onClick={() => applyRouteChange(selectedModels, bulkMoveTarget)} disabled={hasPendingChanges}>
                                     移动
                                 </Button>
-                                <Button type="button" variant="outline" size="sm" className="h-7 rounded-xl px-2 text-xs" onClick={() => applyDisabledChange(selectedModels, false)} disabled={hasPendingChanges}>
+                                <Button type="button" variant="outline" size="sm" className="h-8 w-full rounded-xl px-2 text-xs sm:h-7 sm:w-auto" onClick={() => applyDisabledChange(selectedModels, false)} disabled={hasPendingChanges}>
                                     启用
                                 </Button>
-                                <Button type="button" variant="outline" size="sm" className="h-7 rounded-xl px-2 text-xs" onClick={() => applyDisabledChange(selectedModels, true)} disabled={hasPendingChanges}>
+                                <Button type="button" variant="outline" size="sm" className="h-8 w-full rounded-xl px-2 text-xs sm:h-7 sm:w-auto" onClick={() => applyDisabledChange(selectedModels, true)} disabled={hasPendingChanges}>
                                     停用
                                 </Button>
-                                <Button type="button" variant="ghost" size="sm" className="h-7 rounded-xl px-2 text-xs" onClick={() => setSelectedModelKeys(new Set())}>
-                                    清空
-                                </Button>
+                                <ChannelModelActionButtons
+                                    compact
+                                    className="col-span-2 w-full sm:order-6 sm:w-auto"
+                                    targets={selectedModels.filter((model) => model.projected_channel_id && !model.disabled).map((model) => ({ channel_id: model.projected_channel_id!, model_name: model.model_name }))}
+                                />
                             </div>
                         ) : null}
                     </div>
@@ -2396,6 +2443,8 @@ function SiteAccountPanel({
                         onToggleDisabled={handleToggleDisabled}
                         onDeleteManualModel={handleDeleteManualModel}
                         onNavigateToChannel={onNavigateToChannel}
+                        healthByTarget={healthByTarget}
+                        onProbeModel={handleProbeModel}
                     />
                 </div>
             )}

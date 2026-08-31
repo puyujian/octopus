@@ -50,7 +50,7 @@ export function Card({ channel, stats, layout = 'grid' }: { channel: Channel; st
     return (
         <MorphingDialog>
             <MorphingDialogTrigger className="w-full">
-                <article className="flex flex-col gap-4 rounded-3xl border border-border bg-card text-card-foreground p-4 transition-all duration-300">
+                <article className="group flex cursor-pointer flex-col gap-3 rounded-3xl border border-border bg-card p-3.5 text-card-foreground transition-all duration-200 hover:-translate-y-0.5 hover:border-primary/20 hover:shadow-md active:translate-y-0 active:scale-[0.995] sm:gap-4 sm:p-4">
                     <header className="relative flex items-center justify-between gap-2">
                         <div className="min-w-0 flex-1">
                             <Tooltip side="top" sideOffset={10} align="center">
@@ -127,30 +127,39 @@ export function Card({ channel, stats, layout = 'grid' }: { channel: Channel; st
                             </div>
                         </dl>
                     ) : (
-                        <dl className="grid grid-cols-1 gap-3">
-                            <div className="flex items-center justify-between rounded-2xl border border-border/70 bg-background/80 p-2">
-                                <div className="flex items-center gap-3">
-                                    <span className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10 text-primary">
-                                        <MessageSquare className="h-5 w-5" />
-                                    </span>
-                                    <dt className="text-sm text-muted-foreground">{t('requestCount')}</dt>
-                                </div>
-                                <dd className="text-base">
+                        <dl className="grid grid-cols-2 gap-2 sm:gap-2.5">
+                            <div className="rounded-2xl border border-border/70 bg-background/80 p-2.5">
+                                <dt className="mb-1.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+                                    <MessageSquare className="size-3.5 text-primary" />
+                                    {t('requestCount')}
+                                </dt>
+                                <dd className="truncate text-sm font-semibold sm:text-base">
                                     {stats.request_count.formatted.value}
-                                    <span className="ml-1 text-xs text-muted-foreground">{stats.request_count.formatted.unit}</span>
+                                    <span className="ml-1 text-[11px] font-normal text-muted-foreground">{stats.request_count.formatted.unit}</span>
                                 </dd>
                             </div>
-
-                            <div className="flex items-center justify-between rounded-2xl border border-border/70 bg-background/80 p-2">
-                                <div className="flex items-center gap-3">
-                                    <span className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10 text-primary">
-                                        <DollarSign className="h-5 w-5" />
-                                    </span>
-                                    <dt className="text-sm text-muted-foreground">{t('totalCost')}</dt>
-                                </div>
-                                <dd className="text-base">
+                            <div className="rounded-2xl border border-border/70 bg-background/80 p-2.5">
+                                <dt className="mb-1.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+                                    <Layers className="size-3.5 text-primary" />
+                                    {tForm('model')}
+                                </dt>
+                                <dd className="text-sm font-semibold sm:text-base">{modelCount}</dd>
+                            </div>
+                            <div className="rounded-2xl border border-border/70 bg-background/80 p-2.5">
+                                <dt className="mb-1.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+                                    <Key className="size-3.5 text-primary" />
+                                    {tSections('keys')}
+                                </dt>
+                                <dd className="text-sm font-semibold sm:text-base">{enabledKeyCount}/{channel.keys.length}</dd>
+                            </div>
+                            <div className="rounded-2xl border border-border/70 bg-background/80 p-2.5">
+                                <dt className="mb-1.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+                                    <DollarSign className="size-3.5 text-primary" />
+                                    {t('totalCost')}
+                                </dt>
+                                <dd className="truncate text-sm font-semibold sm:text-base">
                                     {stats.total_cost.formatted.value}
-                                    <span className="ml-1 text-xs text-muted-foreground">{stats.total_cost.formatted.unit}</span>
+                                    <span className="ml-1 text-[11px] font-normal text-muted-foreground">{stats.total_cost.formatted.unit}</span>
                                 </dd>
                             </div>
                         </dl>
@@ -160,7 +169,7 @@ export function Card({ channel, stats, layout = 'grid' }: { channel: Channel; st
             </MorphingDialogTrigger>
 
             <MorphingDialogContainer>
-                <MorphingDialogContent className="w-full md:max-w-xl bg-card text-card-foreground px-4 py-2 rounded-3xl max-h-[90vh] overflow-y-auto">
+                <MorphingDialogContent className="h-[100dvh] w-screen max-w-none overflow-hidden rounded-none bg-card p-0 text-card-foreground sm:h-[min(92dvh,900px)] sm:w-[calc(100vw-2rem)] sm:max-w-3xl sm:rounded-3xl">
                     <CardContent channel={channel} stats={stats} />
                 </MorphingDialogContent>
             </MorphingDialogContainer>

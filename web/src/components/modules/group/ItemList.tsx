@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useId, useRef, useState } from 'react';
-import { Layers, GripVertical, X, Trash2 } from 'lucide-react';
+import { ChevronDown, ChevronUp, Layers, GripVertical, X, Trash2 } from 'lucide-react';
 import {
     DragDropContext,
     Draggable,
@@ -44,6 +44,10 @@ function MemberItem({
     index,
     showWeight = false,
     showConfirmDelete = true,
+    onMoveUp,
+    onMoveDown,
+    canMoveUp = false,
+    canMoveDown = false,
     dnd,
 }: {
     member: SelectedMember;
@@ -53,8 +57,13 @@ function MemberItem({
     index: number;
     showWeight?: boolean;
     showConfirmDelete?: boolean;
+    onMoveUp?: () => void;
+    onMoveDown?: () => void;
+    canMoveUp?: boolean;
+    canMoveDown?: boolean;
     dnd: MemberItemDnd | null;
 }) {
+    const t = useTranslations('group');
     const { Avatar: ModelAvatar } = getModelIcon(member.name);
     const [confirmDelete, setConfirmDelete] = useState(false);
     const isDisabled = member.enabled === false;
@@ -127,6 +136,31 @@ function MemberItem({
                             isDisabled && 'text-muted-foreground'
                         )}
                     />
+                )}
+
+                {onMoveUp && onMoveDown && (
+                    <div className="flex shrink-0 items-center gap-0.5">
+                        <button
+                            type="button"
+                            onClick={onMoveUp}
+                            disabled={!canMoveUp}
+                            aria-label={t('form.moveUp')}
+                            title={t('form.moveUp')}
+                            className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-25"
+                        >
+                            <ChevronUp className="size-4" />
+                        </button>
+                        <button
+                            type="button"
+                            onClick={onMoveDown}
+                            disabled={!canMoveDown}
+                            aria-label={t('form.moveDown')}
+                            title={t('form.moveDown')}
+                            className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-25"
+                        >
+                            <ChevronDown className="size-4" />
+                        </button>
+                    </div>
                 )}
 
                 {(!showConfirmDelete || !confirmDelete) && (
@@ -202,6 +236,11 @@ export interface MemberListProps {
      * Defaults to true.
      */
     enableDnd?: boolean;
+    /**
+     * Shows touch-friendly up/down controls when DnD is disabled.
+     * This keeps mobile list scrolling lightweight while still allowing reordering.
+     */
+    showMoveControls?: boolean;
 }
 
 export function MemberList({
@@ -218,6 +257,7 @@ export function MemberList({
     showConfirmDelete = true,
     layoutScope: externalLayoutScope,
     enableDnd = true,
+    showMoveControls = false,
 }: MemberListProps) {
     const internalLayoutScope = useId();
     const layoutScope = externalLayoutScope ?? internalLayoutScope;
@@ -273,6 +313,13 @@ export function MemberList({
         }
     };
 
+    const handleMove = (sourceIndex: number, destinationIndex: number) => {
+        if (destinationIndex < 0 || destinationIndex >= members.length) return;
+        const next = reorderList(members, sourceIndex, destinationIndex);
+        onReorder(next);
+        onDrop?.(next);
+    };
+
     const StaticList = () => (
         <div className="p-2 flex flex-col space-y-1.5">
             {members.map((member, index) => (
@@ -285,6 +332,10 @@ export function MemberList({
                     index={index}
                     showWeight={showWeight}
                     showConfirmDelete={showConfirmDelete}
+                    onMoveUp={showMoveControls ? () => handleMove(index, index - 1) : undefined}
+                    onMoveDown={showMoveControls ? () => handleMove(index, index + 1) : undefined}
+                    canMoveUp={index > 0}
+                    canMoveDown={index < members.length - 1}
                     dnd={null}
                 />
             ))}

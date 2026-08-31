@@ -445,6 +445,11 @@ func channelDel(id int, ctx context.Context, bypassManagedCheck bool) error {
 		return fmt.Errorf("failed to delete channel stats: %w", err)
 	}
 
+	if err := tx.Where("channel_id = ?", id).Delete(&model.ChannelModelHealth{}).Error; err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to delete channel model health: %w", err)
+	}
+
 	// 删除渠道
 	if err := tx.Delete(&model.Channel{}, id).Error; err != nil {
 		tx.Rollback()

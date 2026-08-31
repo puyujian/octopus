@@ -381,6 +381,7 @@ export function GroupCard({ group }: { group: Group }) {
                     showWeight={group.mode === GroupMode.Weighted}
                     layoutScope={`card-${group.id ?? 'unknown'}`}
                     enableDnd={!isMobile}
+                    showMoveControls={isMobile}
                 />
             </section>
 

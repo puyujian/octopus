@@ -615,6 +615,8 @@
             "addItem": "新增模型",
             "autoAdd": "自動新增",
             "clear": "清空",
+            "moveUp": "上移",
+            "moveDown": "下移",
             "selectChannel": "供應源",
             "selectModel": "模型"
         },
@@ -835,6 +837,12 @@
             "page": "第 {page} 頁",
             "pagesRange": "第 {from} ~ {to} 頁"
         }
+    },
+    "channelModel": {
+        "title": "模型測活", "probe": "測活", "smartGroup": "智慧加入分組", "loading": "載入中...", "empty": "暫無模型", "cancel": "取消",
+        "status": { "idle": "未檢查", "queued": "排隊中", "running": "檢查中", "success": "健康", "failed": "失敗", "stale": "已過期", "interrupted": "已中斷" },
+        "toast": { "probeStarted": "已開始測活 {count} 個模型", "probeFailed": "啟動測活失敗", "groupApplied": "已加入 {added} 個模型，已有 {existing} 個", "groupFailed": "加入分組失敗" },
+        "group": { "title": "智慧加入分組", "description": "健康模型預設選取；失敗模型確認後可強制加入。重複或已排除成員不會被自動恢復。", "select": "選擇目標分組", "existing": "已存在", "excluded": "已排除", "create": "新建分組", "unmatched": "暫無匹配建議", "apply": "加入 {count} 個", "confirmForce": "確認強制加入", "forceWarning": "其中 {count} 個模型未通過最近測活，確認仍要加入？", "reason": { "exact": "精確匹配", "regex": "正則匹配", "fuzzy": "模糊匹配" } }
     },
     "channel": {
         "tabs": {

@@ -1,10 +1,11 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Activity, CheckCircle2, CircleAlert, LoaderCircle, Plus, RefreshCw, Sparkles, XCircle } from 'lucide-react';
 import { useTranslations } from 'next-intl';
 import {
     type ChannelModelGroupApplyItem,
+    type ChannelModelGroupPreview,
     type ChannelModelHealth,
     type ChannelModelTarget,
     useApplyChannelModelGroups,
@@ -18,10 +19,24 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectSeparator, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { cn } from '@/lib/utils';
 
 const keyOf = (target: ChannelModelTarget) => `${target.channel_id}\u0000${target.model_name}`;
+
+type SmartGroupBucket = 'precise' | 'fuzzy' | 'create';
+
+function recommendedCandidate(item: ChannelModelGroupPreview) {
+    return item.candidates.find((candidate) => !item.existing_group_ids.includes(candidate.group_id) && !item.excluded_group_ids.includes(candidate.group_id));
+}
+
+function smartGroupBucket(item: ChannelModelGroupPreview): SmartGroupBucket {
+    const candidate = recommendedCandidate(item);
+    if (!candidate) return 'create';
+    return candidate.reason === 'fuzzy' ? 'fuzzy' : 'precise';
+}
+
+const smartGroupBucketRank: Record<SmartGroupBucket, number> = { precise: 0, fuzzy: 1, create: 2 };
 
 function statusTone(status?: ChannelModelHealth['status']) {
     switch (status) {
@@ -49,33 +64,12 @@ export function ChannelModelHealthBadge({ health }: { health?: ChannelModelHealt
 export function SmartGroupDialog({ targets, open, onOpenChange }: { targets: ChannelModelTarget[]; open: boolean; onOpenChange: (open: boolean) => void }) {
     const t = useTranslations('channelModel');
     const { data: groups = [] } = useGroupList();
-    const healthQuery = useChannelModelHealth(targets, open);
     const previewQuery = useChannelModelGroupPreview(targets, open);
-    const runHealth = useRunChannelModelHealth();
     const applyGroups = useApplyChannelModelGroups();
     const [selected, setSelected] = useState<Set<string>>(new Set());
     const [destinations, setDestinations] = useState<Record<string, string>>({});
     const [newGroupNames, setNewGroupNames] = useState<Record<string, string>>({});
     const [confirmingForce, setConfirmingForce] = useState(false);
-    const autoRunKey = useRef('');
-
-    const healthByKey = useMemo(() => new Map((healthQuery.data ?? []).map((row) => [keyOf(row), row])), [healthQuery.data]);
-
-    useEffect(() => {
-        if (!open) {
-            autoRunKey.current = '';
-            return;
-        }
-        if (!healthQuery.isFetched) return;
-        const needsProbe = targets.filter((target) => {
-            const row = healthByKey.get(keyOf(target));
-            return !row || row.status === 'stale' || row.status === 'interrupted';
-        });
-        const marker = needsProbe.map(keyOf).sort().join('|');
-        if (!marker || marker === autoRunKey.current) return;
-        autoRunKey.current = marker;
-        runHealth.mutate(needsProbe);
-    }, [open, healthQuery.isFetched, healthByKey, runHealth, targets]);
 
     useEffect(() => {
         if (!open || !previewQuery.data) return;
@@ -98,10 +92,28 @@ export function SmartGroupDialog({ targets, open, onOpenChange }: { targets: Cha
         return () => window.cancelAnimationFrame(frame);
     }, [open, previewQuery.data]);
 
-    const preview = previewQuery.data ?? [];
-    const running = preview.some((item) => item.health?.status === 'queued' || item.health?.status === 'running') || runHealth.isPending;
+    const preview = useMemo(() => previewQuery.data ?? [], [previewQuery.data]);
+    const orderedPreview = useMemo(() => [...preview].sort((left, right) => {
+        const rankDiff = smartGroupBucketRank[smartGroupBucket(left)] - smartGroupBucketRank[smartGroupBucket(right)];
+        return rankDiff || left.model_name.localeCompare(right.model_name);
+    }), [preview]);
+    const sections = useMemo(() => (['precise', 'fuzzy', 'create'] as SmartGroupBucket[]).map((bucket) => ({
+        bucket,
+        items: orderedPreview.filter((item) => smartGroupBucket(item) === bucket),
+    })), [orderedPreview]);
+    const running = preview.some((item) => item.health?.status === 'queued' || item.health?.status === 'running');
     const selectedItems = preview.filter((item) => selected.has(keyOf(item)) && destinations[keyOf(item)]);
     const forcedItems = selectedItems.filter((item) => item.health?.status !== 'success');
+
+    const selectHealthy = () => {
+        setConfirmingForce(false);
+        setSelected(new Set(preview.filter((item) => item.health?.status === 'success').map(keyOf)));
+    };
+
+    const clearSelection = () => {
+        setConfirmingForce(false);
+        setSelected(new Set());
+    };
 
     const submit = () => {
         if (forcedItems.length > 0 && !confirmingForce) {
@@ -136,68 +148,132 @@ export function SmartGroupDialog({ targets, open, onOpenChange }: { targets: Cha
                     <DialogTitle>{t('group.title')}</DialogTitle>
                     <DialogDescription>{t('group.description')}</DialogDescription>
                 </DialogHeader>
-                <div className="min-h-0 space-y-2 overflow-y-auto overscroll-contain pr-1">
-                    {preview.map((item) => {
-                        const key = keyOf(item);
-                        const destination = destinations[key] ?? '';
-                        return (
-                            <div key={key} className="rounded-2xl border border-border/70 bg-muted/20 p-3">
-                                <div className="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-2">
-                                    <input
-                                        type="checkbox"
-                                        checked={selected.has(key)}
-                                        onChange={(event) => {
-                                            setConfirmingForce(false);
-                                            setSelected((current) => {
-                                                const next = new Set(current);
-                                                if (event.target.checked) next.add(key); else next.delete(key);
-                                                return next;
-                                            });
-                                        }}
-                                        disabled={running}
-                                        className="mt-0.5 size-5 accent-primary"
-                                    />
-                                    <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                                        <span className="min-w-0 flex-1 truncate text-sm font-medium" title={item.model_name}>{item.model_name}</span>
-                                        <ChannelModelHealthBadge health={item.health} />
-                                        {item.health?.duration_ms ? <span className="text-xs tabular-nums text-muted-foreground">{item.health.duration_ms}ms</span> : null}
+                <div className="min-h-0 space-y-4 overflow-y-auto overscroll-contain pr-1">
+                    {!previewQuery.isLoading ? (
+                        <div className="space-y-2 rounded-2xl border border-border/70 bg-card p-3">
+                            <div className="grid grid-cols-3 gap-2">
+                                {sections.map(({ bucket, items }) => (
+                                    <div key={bucket} className={cn(
+                                        'rounded-xl border px-2 py-2 text-center',
+                                        bucket === 'precise' && 'border-emerald-500/25 bg-emerald-500/10',
+                                        bucket === 'fuzzy' && 'border-sky-500/25 bg-sky-500/10',
+                                        bucket === 'create' && 'border-violet-500/25 bg-violet-500/10',
+                                    )}>
+                                        <div className="text-lg font-semibold tabular-nums">{items.length}</div>
+                                        <div className="truncate text-[11px] text-muted-foreground">{t(`group.bucket.${bucket}.title`)}</div>
                                     </div>
-                                </div>
-                                {item.health?.error_message ? <div className="mt-2 break-words text-xs text-destructive">{item.health.error_message}</div> : null}
-                                <div className="mt-2 grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
-                                    <Select value={destination} onValueChange={(value) => {
-                                        setConfirmingForce(false);
-                                        setDestinations((current) => ({ ...current, [key]: value }));
-                                    }}>
-                                        <SelectTrigger className="h-9 rounded-xl"><SelectValue placeholder={t('group.select')} /></SelectTrigger>
-                                        <SelectContent className="rounded-xl">
-                                            {groups.map((group) => {
-                                                const existing = item.existing_group_ids.includes(group.id!);
-                                                const excluded = item.excluded_group_ids.includes(group.id!);
-                                                return (
-                                                    <SelectItem key={group.id} value={String(group.id)} disabled={existing || excluded}>
-                                                        {group.name}{existing ? ` · ${t('group.existing')}` : excluded ? ` · ${t('group.excluded')}` : ''}
-                                                    </SelectItem>
-                                                );
-                                            })}
-                                            <SelectItem value="new"><Plus className="mr-1 inline size-3" />{t('group.create')}</SelectItem>
-                                        </SelectContent>
-                                    </Select>
-                                    {destination === 'new' ? (
-                                        <Input className="h-9 rounded-xl" value={newGroupNames[key] ?? item.model_name} onChange={(event) => {
-                                            setConfirmingForce(false);
-                                            setNewGroupNames((current) => ({ ...current, [key]: event.target.value }));
-                                        }} />
-                                    ) : (
-                                        <div className="flex items-center text-xs text-muted-foreground">
-                                            {item.candidates[0] ? t(`group.reason.${item.candidates[0].reason}`) : t('group.unmatched')}
-                                        </div>
-                                    )}
+                                ))}
+                            </div>
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                                <span className="text-xs text-muted-foreground">{t('group.selectedCount', { count: selectedItems.length })}</span>
+                                <div className="flex gap-1.5">
+                                    <Button type="button" variant="outline" size="sm" className="h-7 rounded-lg px-2 text-xs" disabled={running} onClick={selectHealthy}>{t('group.selectHealthy')}</Button>
+                                    <Button type="button" variant="ghost" size="sm" className="h-7 rounded-lg px-2 text-xs" disabled={running || selected.size === 0} onClick={clearSelection}>{t('group.clearSelection')}</Button>
                                 </div>
                             </div>
-                        );
-                    })}
-                    {(previewQuery.isLoading || healthQuery.isLoading) && <div className="py-8 text-center text-sm text-muted-foreground">{t('loading')}</div>}
+                        </div>
+                    ) : null}
+                    {sections.map(({ bucket, items }) => items.length > 0 ? (
+                        <section key={bucket} className="space-y-2">
+                            <div className="sticky top-0 z-10 flex items-center justify-between gap-3 rounded-xl border bg-background/95 px-3 py-2 shadow-sm backdrop-blur">
+                                <div className="min-w-0">
+                                    <div className="flex items-center gap-2 text-sm font-semibold">
+                                        {t(`group.bucket.${bucket}.title`)}
+                                        <Badge variant="secondary" className="h-5 rounded-md px-1.5 text-[10px] tabular-nums">{items.length}</Badge>
+                                    </div>
+                                    <div className="truncate text-[11px] text-muted-foreground">{t(`group.bucket.${bucket}.description`)}</div>
+                                </div>
+                            </div>
+                            {items.map((item) => {
+                                const key = keyOf(item);
+                                const destination = destinations[key] ?? '';
+                                const preciseCandidates = item.candidates.filter((candidate) => candidate.reason === 'exact' || candidate.reason === 'regex');
+                                const fuzzyCandidates = item.candidates.filter((candidate) => candidate.reason === 'fuzzy');
+                                const candidateIDs = new Set(item.candidates.map((candidate) => candidate.group_id));
+                                const otherGroups = groups.filter((group) => group.id != null && !candidateIDs.has(group.id));
+                                const membershipSuffix = (groupID: number) => item.existing_group_ids.includes(groupID)
+                                    ? ` · ${t('group.existing')}`
+                                    : item.excluded_group_ids.includes(groupID) ? ` · ${t('group.excluded')}` : '';
+                                return (
+                                    <div key={key} className="rounded-2xl border border-border/70 bg-muted/20 p-3">
+                                        <div className="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-2">
+                                            <input
+                                                type="checkbox"
+                                                checked={selected.has(key)}
+                                                onChange={(event) => {
+                                                    setConfirmingForce(false);
+                                                    setSelected((current) => {
+                                                        const next = new Set(current);
+                                                        if (event.target.checked) next.add(key); else next.delete(key);
+                                                        return next;
+                                                    });
+                                                }}
+                                                disabled={running}
+                                                className="mt-0.5 size-5 accent-primary"
+                                            />
+                                            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                                                <span className="min-w-0 flex-1 truncate text-sm font-medium" title={item.model_name}>{item.model_name}</span>
+                                                <ChannelModelHealthBadge health={item.health} />
+                                                {item.health?.duration_ms ? <span className="text-xs tabular-nums text-muted-foreground">{item.health.duration_ms}ms</span> : null}
+                                            </div>
+                                        </div>
+                                        {item.health?.error_message ? <div className="mt-2 break-words text-xs text-destructive">{item.health.error_message}</div> : null}
+                                        <div className={cn('mt-2 grid gap-2', destination === 'new' && 'sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]')}>
+                                            <Select value={destination} onValueChange={(value) => {
+                                                setConfirmingForce(false);
+                                                setDestinations((current) => ({ ...current, [key]: value }));
+                                            }}>
+                                                <SelectTrigger className="h-9 w-full rounded-xl"><SelectValue placeholder={t('group.select')} /></SelectTrigger>
+                                                <SelectContent className="max-w-[calc(100vw-2rem)] rounded-xl">
+                                                    {preciseCandidates.length > 0 ? (
+                                                        <SelectGroup>
+                                                            <SelectLabel>{t('group.bucket.precise.title')}</SelectLabel>
+                                                            {preciseCandidates.map((candidate) => (
+                                                                <SelectItem key={candidate.group_id} value={String(candidate.group_id)} disabled={item.existing_group_ids.includes(candidate.group_id) || item.excluded_group_ids.includes(candidate.group_id)}>
+                                                                    {candidate.group_name} · {t(`group.reason.${candidate.reason}`)}{membershipSuffix(candidate.group_id)}
+                                                                </SelectItem>
+                                                            ))}
+                                                        </SelectGroup>
+                                                    ) : null}
+                                                    {preciseCandidates.length > 0 && fuzzyCandidates.length > 0 ? <SelectSeparator /> : null}
+                                                    {fuzzyCandidates.length > 0 ? (
+                                                        <SelectGroup>
+                                                            <SelectLabel>{t('group.bucket.fuzzy.title')}</SelectLabel>
+                                                            {fuzzyCandidates.map((candidate) => (
+                                                                <SelectItem key={candidate.group_id} value={String(candidate.group_id)} disabled={item.existing_group_ids.includes(candidate.group_id) || item.excluded_group_ids.includes(candidate.group_id)}>
+                                                                    {candidate.group_name} · {t('group.reason.fuzzy')}{membershipSuffix(candidate.group_id)}
+                                                                </SelectItem>
+                                                            ))}
+                                                        </SelectGroup>
+                                                    ) : null}
+                                                    {(preciseCandidates.length > 0 || fuzzyCandidates.length > 0) && otherGroups.length > 0 ? <SelectSeparator /> : null}
+                                                    {otherGroups.length > 0 ? (
+                                                        <SelectGroup>
+                                                            <SelectLabel>{t('group.otherGroups')}</SelectLabel>
+                                                            {otherGroups.map((group) => (
+                                                                <SelectItem key={group.id} value={String(group.id)} disabled={item.existing_group_ids.includes(group.id!) || item.excluded_group_ids.includes(group.id!)}>
+                                                                    {group.name}{membershipSuffix(group.id!)}
+                                                                </SelectItem>
+                                                            ))}
+                                                        </SelectGroup>
+                                                    ) : null}
+                                                    {(preciseCandidates.length > 0 || fuzzyCandidates.length > 0 || otherGroups.length > 0) ? <SelectSeparator /> : null}
+                                                    <SelectItem value="new"><Plus className="mr-1 inline size-3" />{t('group.create')}</SelectItem>
+                                                </SelectContent>
+                                            </Select>
+                                            {destination === 'new' ? (
+                                                <Input className="h-9 rounded-xl" value={newGroupNames[key] ?? item.model_name} onChange={(event) => {
+                                                    setConfirmingForce(false);
+                                                    setNewGroupNames((current) => ({ ...current, [key]: event.target.value }));
+                                                }} />
+                                            ) : null}
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </section>
+                    ) : null)}
+                    {previewQuery.isLoading && <div className="py-8 text-center text-sm text-muted-foreground">{t('loading')}</div>}
                 </div>
                 {confirmingForce && forcedItems.length > 0 ? (
                     <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-800 dark:text-amber-200">

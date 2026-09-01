@@ -1741,7 +1741,33 @@ func convertInputToMessages(input *ResponsesInput) ([]model.Message, error) {
 
 	// Array of items
 	messages := make([]model.Message, 0, len(input.Items))
-	for _, item := range input.Items {
+	for itemIndex := 0; itemIndex < len(input.Items); {
+		item := input.Items[itemIndex]
+
+		// Responses represents parallel function calls as consecutive output
+		// items. Chat Completions represents the same turn as one assistant
+		// message with multiple tool_calls followed by the matching tool
+		// messages. Keeping one assistant message per Responses item produces
+		// an invalid Chat history (assistant, assistant, tool, tool) that strict
+		// upstreams reject before seeing the later tool outputs.
+		if isResponsesToolCallItem(item.Type) {
+			assistant := model.Message{Role: "assistant"}
+			for itemIndex < len(input.Items) && isResponsesToolCallItem(input.Items[itemIndex].Type) {
+				toolCallMessage, err := convertItemToMessage(&input.Items[itemIndex])
+				if err != nil {
+					return nil, err
+				}
+				if toolCallMessage != nil {
+					assistant.ToolCalls = append(assistant.ToolCalls, toolCallMessage.ToolCalls...)
+				}
+				itemIndex++
+			}
+			if len(assistant.ToolCalls) > 0 {
+				messages = append(messages, assistant)
+			}
+			continue
+		}
+
 		msg, err := convertItemToMessage(&item)
 		if err != nil {
 			return nil, err
@@ -1749,9 +1775,14 @@ func convertInputToMessages(input *ResponsesInput) ([]model.Message, error) {
 		if msg != nil {
 			messages = append(messages, *msg)
 		}
+		itemIndex++
 	}
 
 	return messages, nil
+}
+
+func isResponsesToolCallItem(itemType string) bool {
+	return itemType == "function_call" || itemType == "custom_tool_call"
 }
 
 func convertItemToMessage(item *ResponsesItem) (*model.Message, error) {

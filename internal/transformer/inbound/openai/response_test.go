@@ -1,8 +1,12 @@
 package openai
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"testing"
+
+	openaiOutbound "github.com/bestruirui/octopus/internal/transformer/outbound/openai"
 )
 
 func TestConvertToInternalRequestPreservesRawInputItems(t *testing.T) {
@@ -30,6 +34,111 @@ func TestConvertToInternalRequestPreservesRawInputItems(t *testing.T) {
 	}
 	if internalReq.TransformOptions.ArrayInputs == nil || !*internalReq.TransformOptions.ArrayInputs {
 		t.Fatalf("expected array input flag to stay true")
+	}
+}
+
+func TestConvertToInternalRequestGroupsParallelFunctionCalls(t *testing.T) {
+	req := &ResponsesRequest{
+		Model: "gpt-4o",
+		Input: ResponsesInput{Items: []ResponsesItem{
+			{
+				Type: "message",
+				Role: "user",
+				Content: &ResponsesInput{Items: []ResponsesItem{{
+					Type: "input_text",
+					Text: stringPtr("run both"),
+				}}},
+			},
+			{Type: "function_call", CallID: "call_a", Name: "first", Arguments: `{}`},
+			{Type: "function_call", CallID: "call_b", Name: "second", Arguments: `{}`},
+			{Type: "function_call_output", CallID: "call_a", Output: &ResponsesInput{Text: stringPtr("ok-a")}},
+			{Type: "function_call_output", CallID: "call_b", Output: &ResponsesInput{Text: stringPtr("ok-b")}},
+			{Type: "function_call", CallID: "call_c", Name: "third", Arguments: `{}`},
+			{Type: "function_call_output", CallID: "call_c", Output: &ResponsesInput{Text: stringPtr("ok-c")}},
+		}},
+	}
+
+	internalReq, err := convertToInternalRequest(req)
+	if err != nil {
+		t.Fatalf("convertToInternalRequest failed: %v", err)
+	}
+	if len(internalReq.Messages) != 6 {
+		t.Fatalf("expected two separate tool-call rounds, got %#v", internalReq.Messages)
+	}
+	assistant := internalReq.Messages[1]
+	if assistant.Role != "assistant" || len(assistant.ToolCalls) != 2 {
+		t.Fatalf("expected one assistant turn with two tool calls, got %#v", assistant)
+	}
+	if assistant.ToolCalls[0].ID != "call_a" || assistant.ToolCalls[1].ID != "call_b" {
+		t.Fatalf("parallel tool call IDs were not preserved: %#v", assistant.ToolCalls)
+	}
+	for index, wantID := range []string{"call_a", "call_b"} {
+		toolMessage := internalReq.Messages[index+2]
+		if toolMessage.Role != "tool" || toolMessage.ToolCallID == nil || *toolMessage.ToolCallID != wantID {
+			t.Fatalf("tool output %d does not match %s: %#v", index, wantID, toolMessage)
+		}
+	}
+	secondAssistant := internalReq.Messages[4]
+	if secondAssistant.Role != "assistant" || len(secondAssistant.ToolCalls) != 1 || secondAssistant.ToolCalls[0].ID != "call_c" {
+		t.Fatalf("expected the next tool-call round to stay separate, got %#v", secondAssistant)
+	}
+	if secondTool := internalReq.Messages[5]; secondTool.Role != "tool" || secondTool.ToolCallID == nil || *secondTool.ToolCallID != "call_c" {
+		t.Fatalf("expected the second-round tool output to stay matched, got %#v", secondTool)
+	}
+}
+
+func TestResponsesParallelFunctionCallsProduceValidChatWireOrder(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-4o",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"run both"}]},
+			{"type":"function_call","call_id":"call_a","name":"first","arguments":"{}"},
+			{"type":"function_call","call_id":"call_b","name":"second","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_a","output":"ok-a"},
+			{"type":"function_call_output","call_id":"call_b","output":"ok-b"}
+		],
+		"stream":false
+	}`)
+
+	internalReq, err := (&ResponseInbound{}).TransformRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("transform Responses request failed: %v", err)
+	}
+	httpReq, err := (&openaiOutbound.ChatOutbound{}).TransformRequest(
+		context.Background(), internalReq, "https://api.example.com/v1", "test-key",
+	)
+	if err != nil {
+		t.Fatalf("transform Chat request failed: %v", err)
+	}
+	wireBody, err := io.ReadAll(httpReq.Body)
+	if err != nil {
+		t.Fatalf("read Chat request failed: %v", err)
+	}
+
+	var payload struct {
+		Messages []struct {
+			Role       string `json:"role"`
+			ToolCallID string `json:"tool_call_id"`
+			ToolCalls  []struct {
+				ID string `json:"id"`
+			} `json:"tool_calls"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(wireBody, &payload); err != nil {
+		t.Fatalf("decode Chat request failed: %v; body=%s", err, wireBody)
+	}
+	if len(payload.Messages) != 4 {
+		t.Fatalf("expected four Chat messages, got %#v", payload.Messages)
+	}
+	if payload.Messages[1].Role != "assistant" || len(payload.Messages[1].ToolCalls) != 2 {
+		t.Fatalf("expected grouped assistant tool calls on the wire, got %#v", payload.Messages[1])
+	}
+	if payload.Messages[1].ToolCalls[0].ID != "call_a" || payload.Messages[1].ToolCalls[1].ID != "call_b" {
+		t.Fatalf("unexpected wire tool calls: %#v", payload.Messages[1].ToolCalls)
+	}
+	if payload.Messages[2].Role != "tool" || payload.Messages[2].ToolCallID != "call_a" ||
+		payload.Messages[3].Role != "tool" || payload.Messages[3].ToolCallID != "call_b" {
+		t.Fatalf("tool results are not immediately after their assistant turn: %#v", payload.Messages)
 	}
 }
 

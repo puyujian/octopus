@@ -868,57 +868,89 @@ func (ra *relayAttempt) handleResponsePassthrough(ctx context.Context, response 
 // forwardViaHTTPStandard 是 forwardViaHTTP 的原路径（直通判定失败时的兜底）。
 // 留作显式出口，避免 passthrough 失败时的递归。
 func (ra *relayAttempt) forwardViaHTTPStandard(ctx context.Context) (int, error) {
-	outboundRequest, err := ra.outAdapter.TransformRequest(
-		ctx,
-		ra.internalRequest,
-		ra.channel.GetBaseUrl(),
-		ra.usedKey.ChannelKey,
-	)
-	if err != nil {
-		log.Warnf("failed to create request: %v", err)
-		return 0, fmt.Errorf("failed to create request: %w", err)
-	}
-	if err := ra.applyParamOverride(outboundRequest); err != nil {
-		return 0, err
+	wireRequest := ra.internalRequest
+	developerRoleDowngraded := false
+	if ra.channel.Type == outbound.OutboundTypeOpenAIChat &&
+		channelModelRequiresSystemRole(ra.channel.ID, ra.internalRequest.Model) {
+		wireRequest, developerRoleDowngraded = requestWithDeveloperRoleDowngraded(ra.internalRequest)
 	}
 
-	// 复制请求头
-	ra.copyHeaders(outboundRequest)
-	if ra.channel.Type == outbound.OutboundTypeOpenAIResponse {
-		outboundRequest.Header.Set("Content-Type", "application/json")
-	}
-
-	// 发送请求
-	response, err := ra.sendRequest(outboundRequest)
-	if err != nil {
-		return 0, fmt.Errorf("failed to send request: %w", err)
-	}
-	defer response.Body.Close()
-
-	// 检查响应状态
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		ra.retryAfter = parseRetryAfter(response.Header.Get("Retry-After"))
-		body, err := io.ReadAll(response.Body)
+	for {
+		outboundRequest, err := ra.outAdapter.TransformRequest(
+			ctx,
+			wireRequest,
+			ra.channel.GetBaseUrl(),
+			ra.usedKey.ChannelKey,
+		)
 		if err != nil {
-			return response.StatusCode, fmt.Errorf("failed to read response body: %w", err)
+			log.Warnf("failed to create request: %v", err)
+			return 0, fmt.Errorf("failed to create request: %w", err)
 		}
-		statusCode := normalizeUpstreamStatusCode(response.StatusCode, string(body))
-		log.Warnf("upstream error from channel %s: status=%d, body=%s", ra.channel.Name, response.StatusCode, string(body))
-		return statusCode, fmt.Errorf("upstream error: %d: %s", response.StatusCode, string(body))
-	}
+		if err := ra.applyParamOverride(outboundRequest); err != nil {
+			return 0, err
+		}
 
-	// 处理响应
-	if ra.internalRequest.Stream != nil && *ra.internalRequest.Stream {
-		// Use V2 StreamProcessor-based implementation
-		if err := ra.handleStreamResponseV2(ctx, response); err != nil {
+		// 复制请求头
+		ra.copyHeaders(outboundRequest)
+		if ra.channel.Type == outbound.OutboundTypeOpenAIResponse {
+			outboundRequest.Header.Set("Content-Type", "application/json")
+		}
+
+		// 发送请求
+		response, err := ra.sendRequest(outboundRequest)
+		if err != nil {
+			return 0, fmt.Errorf("failed to send request: %w", err)
+		}
+
+		// 检查响应状态
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			ra.retryAfter = parseRetryAfter(response.Header.Get("Retry-After"))
+			body, readErr := io.ReadAll(response.Body)
+			closeErr := response.Body.Close()
+			if readErr != nil {
+				return response.StatusCode, fmt.Errorf("failed to read response body: %w", readErr)
+			}
+			if closeErr != nil {
+				log.Debugf("failed to close rejected response body: %v", closeErr)
+			}
+
+			if !developerRoleDowngraded &&
+				ra.channel.Type == outbound.OutboundTypeOpenAIChat &&
+				upstreamRejectsDeveloperRole(response.StatusCode, body) {
+				downgradedRequest, changed := requestWithDeveloperRoleDowngraded(ra.internalRequest)
+				if changed {
+					rememberChannelModelRequiresSystemRole(ra.channel.ID, ra.internalRequest.Model)
+					ra.outAdapter = outbound.Get(ra.channel.Type)
+					if ra.outAdapter == nil {
+						return response.StatusCode, fmt.Errorf("developer role compatibility retry has no outbound adapter for channel type %d", ra.channel.Type)
+					}
+					ra.retryAfter = 0
+					wireRequest = downgradedRequest
+					developerRoleDowngraded = true
+					log.Warnf("channel %s rejected developer role for model %s; retrying once with system role", ra.channel.Name, ra.internalRequest.Model)
+					continue
+				}
+			}
+
+			statusCode := normalizeUpstreamStatusCode(response.StatusCode, string(body))
+			log.Warnf("upstream error from channel %s: status=%d, body=%s", ra.channel.Name, response.StatusCode, string(body))
+			return statusCode, fmt.Errorf("upstream error: %d: %s", response.StatusCode, string(body))
+		}
+
+		defer response.Body.Close()
+		// 处理响应
+		if ra.internalRequest.Stream != nil && *ra.internalRequest.Stream {
+			// Use V2 StreamProcessor-based implementation
+			if err := ra.handleStreamResponseV2(ctx, response); err != nil {
+				return 0, err
+			}
+			return response.StatusCode, nil
+		}
+		if err := ra.handleResponse(ctx, response); err != nil {
 			return 0, err
 		}
 		return response.StatusCode, nil
 	}
-	if err := ra.handleResponse(ctx, response); err != nil {
-		return 0, err
-	}
-	return response.StatusCode, nil
 }
 
 func defaultWSModeForRequest(req *model.InternalLLMRequest) dbmodel.RelayLogWSMode {

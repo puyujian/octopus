@@ -79,8 +79,49 @@ type Channel struct {
 	ChannelProxy  *string               `json:"-" gorm:"column:channel_proxy"`
 	Stats         *StatsChannel         `json:"stats,omitempty" gorm:"foreignKey:ChannelID"`
 	MatchRegex    *string               `json:"match_regex"`
+	ModelRoutes   ChannelModelRoutes    `json:"model_routes" gorm:"serializer:json;type:text"`
 	Managed       bool                  `json:"managed" gorm:"-"`
 	ManagedSource *ManagedChannelSource `json:"managed_source,omitempty" gorm:"-"`
+}
+
+// ChannelModelRoutes stores only sparse routing state. Inferred routes are
+// deliberately not persisted so channels with thousands of models do not
+// duplicate their model list in JSON.
+type ChannelModelRoutes struct {
+	FallbackType outbound.OutboundType            `json:"fallback_type"`
+	Overrides    map[string]outbound.OutboundType `json:"overrides,omitempty"`
+	Learned      map[string]outbound.OutboundType `json:"learned,omitempty"`
+}
+
+func NormalizeChannelModelRouteKey(modelName string) string {
+	return strings.ToLower(strings.TrimSpace(modelName))
+}
+
+func (r ChannelModelRoutes) Normalize() ChannelModelRoutes {
+	if !r.FallbackType.IsConcrete() {
+		r.FallbackType = outbound.OutboundTypeOpenAIChat
+	}
+	r.Overrides = normalizeChannelModelRouteMap(r.Overrides)
+	r.Learned = normalizeChannelModelRouteMap(r.Learned)
+	return r
+}
+
+func normalizeChannelModelRouteMap(values map[string]outbound.OutboundType) map[string]outbound.OutboundType {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make(map[string]outbound.OutboundType, len(values))
+	for modelName, routeType := range values {
+		key := NormalizeChannelModelRouteKey(modelName)
+		if key == "" || !routeType.IsConcrete() {
+			continue
+		}
+		result[key] = routeType
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }
 
 func (c *Channel) UnmarshalJSON(data []byte) error {
@@ -137,23 +178,25 @@ type ChannelKeySelectOptions struct {
 
 // ChannelUpdateRequest 渠道更新请求 - 仅包含变更的数据
 type ChannelUpdateRequest struct {
-	ID            int                    `json:"id" binding:"required"`
-	Name          *string                `json:"name,omitempty"`
-	Type          *outbound.OutboundType `json:"type,omitempty"`
-	Enabled       *bool                  `json:"enabled,omitempty"`
-	BaseUrls      *[]BaseUrl             `json:"base_urls,omitempty"`
-	Model         *string                `json:"model,omitempty"`
-	CustomModel   *string                `json:"custom_model,omitempty"`
-	ProxyMode     *ProxyUsageMode        `json:"proxy_mode,omitempty"`
-	ProxyConfigID *int                   `json:"proxy_config_id,omitempty"`
-	Proxy         *bool                  `json:"-"`
-	AutoSync      *bool                  `json:"auto_sync,omitempty"`
-	AutoGroup     *AutoGroupType         `json:"auto_group,omitempty"`
-	CustomHeader  *[]CustomHeader        `json:"custom_header,omitempty"`
-	WSMode        *ChannelWSMode         `json:"ws_mode,omitempty"`
-	ChannelProxy  *string                `json:"-"`
-	ParamOverride *string                `json:"param_override,omitempty"`
-	MatchRegex    *string                `json:"match_regex,omitempty"`
+	ID                 int                    `json:"id" binding:"required"`
+	Name               *string                `json:"name,omitempty"`
+	Type               *outbound.OutboundType `json:"type,omitempty"`
+	Enabled            *bool                  `json:"enabled,omitempty"`
+	BaseUrls           *[]BaseUrl             `json:"base_urls,omitempty"`
+	Model              *string                `json:"model,omitempty"`
+	CustomModel        *string                `json:"custom_model,omitempty"`
+	ProxyMode          *ProxyUsageMode        `json:"proxy_mode,omitempty"`
+	ProxyConfigID      *int                   `json:"proxy_config_id,omitempty"`
+	Proxy              *bool                  `json:"-"`
+	AutoSync           *bool                  `json:"auto_sync,omitempty"`
+	AutoGroup          *AutoGroupType         `json:"auto_group,omitempty"`
+	CustomHeader       *[]CustomHeader        `json:"custom_header,omitempty"`
+	WSMode             *ChannelWSMode         `json:"ws_mode,omitempty"`
+	ChannelProxy       *string                `json:"-"`
+	ParamOverride      *string                `json:"param_override,omitempty"`
+	MatchRegex         *string                `json:"match_regex,omitempty"`
+	ModelRoutes        *ChannelModelRoutes    `json:"model_routes,omitempty"`
+	ResetLearnedModels []string               `json:"reset_learned_models,omitempty"`
 
 	KeysToAdd    []ChannelKeyAddRequest    `json:"keys_to_add,omitempty"`
 	KeysToUpdate []ChannelKeyUpdateRequest `json:"keys_to_update,omitempty"`

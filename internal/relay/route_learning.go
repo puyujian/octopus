@@ -9,6 +9,7 @@ import (
 	"github.com/bestruirui/octopus/internal/op"
 	sitesvc "github.com/bestruirui/octopus/internal/site"
 	"github.com/bestruirui/octopus/internal/transformer/inbound"
+	"github.com/bestruirui/octopus/internal/transformer/outbound"
 	"github.com/bestruirui/octopus/internal/utils/log"
 	"github.com/bestruirui/octopus/internal/utils/safe"
 )
@@ -28,6 +29,26 @@ func detectRouteMismatchTarget(inboundType inbound.InboundType, err error) (mode
 	default:
 		return "", false
 	}
+}
+
+func detectProtocolFallback(statusCode int, inboundType inbound.InboundType, err error) (outbound.OutboundType, bool) {
+	if target, ok := detectRouteMismatchTarget(inboundType, err); ok {
+		return target.ToOutboundType(), true
+	}
+	if statusCode != 404 && statusCode != 405 {
+		return 0, false
+	}
+	if err == nil {
+		return outbound.OutboundTypeAuto, true
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "invalid url") ||
+		strings.Contains(message, "not found") ||
+		strings.Contains(message, "unsupported endpoint") ||
+		strings.Contains(message, "method not allowed") {
+		return outbound.OutboundTypeAuto, true
+	}
+	return 0, false
 }
 
 func maybeLearnManagedRoute(ctx context.Context, channelID int, modelName string, inboundType inbound.InboundType, err error) {

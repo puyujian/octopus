@@ -15,6 +15,11 @@ var protectedGroupOverrideKeys = map[string]struct{}{
 	"type":   {},
 }
 
+// semanticGroupOverrideKey is an Octopus-owned namespace. Values below this
+// key are applied to the normalized request before the provider transformer
+// runs, so users do not need to know each upstream protocol's wire names.
+const semanticGroupOverrideKey = "$octopus"
+
 // ValidateJSONOverrideObject validates the JSON shape used by parameter
 // overrides. Empty values mean "clear the override" and are valid.
 func ValidateJSONOverrideObject(value string) error {
@@ -49,6 +54,11 @@ func ValidateGroupParamOverride(value string) error {
 	for key := range decoded {
 		if _, protected := protectedGroupOverrideKeys[strings.ToLower(strings.TrimSpace(key))]; protected {
 			return fmt.Errorf("param_override cannot override protected field %q", key)
+		}
+	}
+	if semantic, ok := decoded[semanticGroupOverrideKey]; ok {
+		if err := validateSemanticGroupOverride(semantic); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -171,6 +181,13 @@ func ApplyJSONParamOverride(body []byte, override *string, deep, protect bool) (
 				return body, false, fmt.Errorf("param_override cannot override protected field %q", key)
 			}
 		}
+		// The semantic namespace is consumed before provider transformation.
+		// Never forward it as a literal upstream parameter from legacy/special
+		// relay paths that only perform wire-level JSON merging.
+		delete(overrideMap, semanticGroupOverrideKey)
+	}
+	if len(overrideMap) == 0 {
+		return body, false, nil
 	}
 
 	if err := mergeJSONObjects(bodyMap, overrideMap, deep, protect); err != nil {

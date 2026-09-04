@@ -106,7 +106,7 @@ func jsonBudget(raw json.RawMessage) string {
 func normalizeReasoningValue(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	switch value {
-	case "minimal", "low", "medium", "high", "none", "adaptive":
+	case "minimal", "low", "medium", "high", "max", "none", "adaptive":
 		return value
 	default:
 		return value

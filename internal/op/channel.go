@@ -21,6 +21,7 @@ var channelCache = cache.New[int, model.Channel](16)
 var channelKeyCache = cache.New[int, model.ChannelKey](16)
 var channelKeyCacheNeedUpdate = make(map[int]struct{})
 var channelKeyCacheNeedUpdateLock sync.Mutex
+var channelModelRoutesLock sync.Mutex
 
 func ChannelList(ctx context.Context) ([]model.Channel, error) {
 	channels := make([]model.Channel, 0, channelCache.Len())
@@ -43,12 +44,18 @@ func normalizeChannelProxyFields(channel *model.Channel) {
 	}
 	channel.Proxy = channel.ProxyMode != model.ProxyUsageModeDirect
 	channel.ChannelProxy = nil
+	channel.ModelRoutes = channel.ModelRoutes.Normalize()
 }
 
 func ChannelCreate(channel *model.Channel, ctx context.Context) error {
 	if channel == nil {
 		return fmt.Errorf("channel is nil")
 	}
+	if !channel.Type.Valid() {
+		return fmt.Errorf("invalid channel type: %d", channel.Type)
+	}
+	channel.ModelRoutes.Learned = nil
+	channel.ModelRoutes = channel.ModelRoutes.Normalize()
 	if channel.ProxyMode == "" {
 		channel.ProxyMode = model.ProxyUsageModeDirect
 	}
@@ -183,6 +190,10 @@ func ChannelUpdate(req *model.ChannelUpdateRequest, ctx context.Context) (*model
 
 	var selectFields []string
 	updates := model.Channel{ID: req.ID}
+	if req.Type != nil && !req.Type.Valid() {
+		tx.Rollback()
+		return nil, fmt.Errorf("invalid channel type: %d", *req.Type)
+	}
 
 	if req.Name != nil {
 		selectFields = append(selectFields, "name")
@@ -191,6 +202,39 @@ func ChannelUpdate(req *model.ChannelUpdateRequest, ctx context.Context) (*model
 	if req.Type != nil {
 		selectFields = append(selectFields, "type")
 		updates.Type = *req.Type
+	}
+
+	routesTouched := req.ModelRoutes != nil || len(req.ResetLearnedModels) > 0 || req.BaseUrls != nil || req.Model != nil || req.CustomModel != nil
+	if req.Type != nil && *req.Type == model2.OutboundTypeAuto && existingChannel.Type != model2.OutboundTypeAuto {
+		routesTouched = true
+	}
+	if routesTouched {
+		routes := existingChannel.ModelRoutes.Normalize()
+		if req.Type != nil && *req.Type == model2.OutboundTypeAuto && existingChannel.Type.IsConcrete() && req.ModelRoutes == nil {
+			routes.FallbackType = existingChannel.Type
+		}
+		if req.ModelRoutes != nil {
+			incoming := req.ModelRoutes.Normalize()
+			routes.FallbackType = incoming.FallbackType
+			routes.Overrides = incoming.Overrides
+		}
+		if req.BaseUrls != nil {
+			routes.Learned = nil
+		}
+		for _, modelName := range req.ResetLearnedModels {
+			delete(routes.Learned, model.NormalizeChannelModelRouteKey(modelName))
+		}
+		effectiveModel := existingChannel.Model
+		if req.Model != nil {
+			effectiveModel = *req.Model
+		}
+		effectiveCustomModel := existingChannel.CustomModel
+		if req.CustomModel != nil {
+			effectiveCustomModel = *req.CustomModel
+		}
+		routes = pruneChannelModelRoutes(routes, xstrings.SplitTrimCompact(",", effectiveModel, effectiveCustomModel))
+		selectFields = append(selectFields, "model_routes")
+		updates.ModelRoutes = routes.Normalize()
 	}
 	if req.Enabled != nil {
 		selectFields = append(selectFields, "enabled")
@@ -347,6 +391,62 @@ func ChannelUpdate(req *model.ChannelUpdateRequest, ctx context.Context) (*model
 	channelCache.Set(req.ID, channel)
 	resetBalancerStateForChannel(req.ID)
 	return &channel, nil
+}
+
+func pruneChannelModelRoutes(routes model.ChannelModelRoutes, modelNames []string) model.ChannelModelRoutes {
+	configured := make(map[string]struct{}, len(modelNames))
+	for _, modelName := range modelNames {
+		if key := model.NormalizeChannelModelRouteKey(modelName); key != "" {
+			configured[key] = struct{}{}
+		}
+	}
+	for key := range routes.Overrides {
+		if _, ok := configured[key]; !ok {
+			delete(routes.Overrides, key)
+		}
+	}
+	for key := range routes.Learned {
+		if _, ok := configured[key]; !ok {
+			delete(routes.Learned, key)
+		}
+	}
+	return routes.Normalize()
+}
+
+// ChannelModelRouteLearn atomically merges one runtime-learned route without
+// overwriting manual overrides or concurrent learning for another model.
+func ChannelModelRouteLearn(channelID int, modelName string, routeType model2.OutboundType, ctx context.Context) error {
+	key := model.NormalizeChannelModelRouteKey(modelName)
+	if channelID <= 0 || key == "" || !routeType.IsConcrete() {
+		return fmt.Errorf("invalid learned channel model route")
+	}
+	channelModelRoutesLock.Lock()
+	defer channelModelRoutesLock.Unlock()
+
+	var channel model.Channel
+	if err := db.GetDB().WithContext(ctx).First(&channel, channelID).Error; err != nil {
+		return err
+	}
+	if channel.Type != model2.OutboundTypeAuto {
+		return nil
+	}
+	routes := channel.ModelRoutes.Normalize()
+	if _, overridden := routes.Overrides[key]; overridden {
+		return nil
+	}
+	if routes.Learned == nil {
+		routes.Learned = make(map[string]model2.OutboundType)
+	}
+	if existing, ok := routes.Learned[key]; ok && existing == routeType {
+		return nil
+	}
+	routes.Learned[key] = routeType
+	channel.ModelRoutes = routes.Normalize()
+	if err := db.GetDB().WithContext(ctx).Model(&model.Channel{}).Where("id = ?", channelID).
+		Select("model_routes").Updates(&channel).Error; err != nil {
+		return err
+	}
+	return channelRefreshCacheByID(channelID, ctx)
 }
 
 func ChannelEnabled(id int, enabled bool, ctx context.Context) error {

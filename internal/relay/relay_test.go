@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bestruirui/octopus/internal/channelroute"
 	dbpkg "github.com/bestruirui/octopus/internal/db"
 	"github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/op"
@@ -975,6 +976,139 @@ func TestHandlerAppliesGroupParamOverrideAfterChannelOverride(t *testing.T) {
 	}
 }
 
+func TestHandlerRetriesWithoutRejectedSemanticGroupParameter(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := setupRelayTestDB(t)
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream request body failed: %v", err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("decode upstream request body failed: %v", err)
+		}
+		attempt := calls.Add(1)
+		if attempt == 1 {
+			if payload["reasoning_effort"] != "high" {
+				t.Fatalf("first request should contain semantic reasoning effort: %s", body)
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"detail":"Unsupported parameter: reasoning_effort"}`))
+			return
+		}
+		if _, exists := payload["reasoning_effort"]; exists {
+			t.Fatalf("compatibility retry must remove rejected reasoning_effort: %s", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_semantic_retry","object":"chat.completion","created":1,"model":"plain-chat-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"}}]}`))
+	}))
+	defer server.Close()
+
+	// Use the historical key to prove existing saved groups are upgraded at
+	// runtime and do not require a manual edit before the fix takes effect.
+	groupOverride := `{"reasoning_effort":"high"}`
+	channel := &model.Channel{
+		Name:     "relay-semantic-param-retry",
+		Type:     outbound.OutboundTypeOpenAIChat,
+		Enabled:  true,
+		BaseUrls: []model.BaseUrl{{URL: server.URL + "/v1"}},
+		Model:    "plain-chat-model",
+		Keys:     []model.ChannelKey{{Enabled: true, ChannelKey: "semantic-retry-key"}},
+	}
+	if err := op.ChannelCreate(channel, ctx); err != nil {
+		t.Fatalf("ChannelCreate failed: %v", err)
+	}
+	group := &model.Group{Name: "relay-semantic-param-retry-group", Mode: model.GroupModeFailover, ParamOverride: &groupOverride}
+	if err := op.GroupCreate(group, ctx); err != nil {
+		t.Fatalf("GroupCreate failed: %v", err)
+	}
+	if err := op.GroupItemAdd(&model.GroupItem{GroupID: group.ID, ChannelID: channel.ID, ModelName: "plain-chat-model", Priority: 1, Weight: 1}, ctx); err != nil {
+		t.Fatalf("GroupItemAdd failed: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"relay-semantic-param-retry-group","messages":[{"role":"user","content":"hello"}]}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	Handler(inbound.InboundTypeOpenAIChat, c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected compatibility retry to succeed, got status %d body %s", recorder.Code, recorder.Body.String())
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("expected exactly two upstream calls, got %d", got)
+	}
+}
+
+func TestHandlerDowngradesRejectedSemanticReasoningMax(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := setupRelayTestDB(t)
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream request body failed: %v", err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("decode upstream request body failed: %v", err)
+		}
+		if calls.Add(1) == 1 {
+			if payload["reasoning_effort"] != "max" {
+				t.Fatalf("first request should preserve max: %s", body)
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"Unsupported value: 'max'. Supported values are: 'low', 'medium', and 'high'."}}`))
+			return
+		}
+		if payload["reasoning_effort"] != "high" {
+			t.Fatalf("compatibility retry should downgrade max to high: %s", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_semantic_max_retry","object":"chat.completion","created":1,"model":"plain-chat-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"}}]}`))
+	}))
+	defer server.Close()
+
+	groupOverride := `{"$octopus":{"reasoning_effort":"max"}}`
+	channel := &model.Channel{
+		Name:     "relay-semantic-max-retry",
+		Type:     outbound.OutboundTypeOpenAIChat,
+		Enabled:  true,
+		BaseUrls: []model.BaseUrl{{URL: server.URL + "/v1"}},
+		Model:    "plain-chat-model",
+		Keys:     []model.ChannelKey{{Enabled: true, ChannelKey: "semantic-max-retry-key"}},
+	}
+	if err := op.ChannelCreate(channel, ctx); err != nil {
+		t.Fatalf("ChannelCreate failed: %v", err)
+	}
+	group := &model.Group{Name: "relay-semantic-max-retry-group", Mode: model.GroupModeFailover, ParamOverride: &groupOverride}
+	if err := op.GroupCreate(group, ctx); err != nil {
+		t.Fatalf("GroupCreate failed: %v", err)
+	}
+	if err := op.GroupItemAdd(&model.GroupItem{GroupID: group.ID, ChannelID: channel.ID, ModelName: "plain-chat-model", Priority: 1, Weight: 1}, ctx); err != nil {
+		t.Fatalf("GroupItemAdd failed: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"relay-semantic-max-retry-group","messages":[{"role":"user","content":"hello"}]}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	Handler(inbound.InboundTypeOpenAIChat, c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected max-to-high compatibility retry to succeed, got status %d body %s", recorder.Code, recorder.Body.String())
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("expected exactly two upstream calls, got %d", got)
+	}
+}
+
 func TestRelayMetricsUsesResponseModelForCostLookup(t *testing.T) {
 	metrics := NewRelayMetrics(0, "alias-model", nil, &transformerModel.InternalLLMRequest{Model: "alias-model"})
 	metrics.StartTime = time.Now()
@@ -1884,6 +2018,88 @@ func TestHandleResponsesCompactSkipsIncompatibleChannels(t *testing.T) {
 	}
 	if logs[0].Attempts[0].Status != model.AttemptSkipped {
 		t.Fatalf("expected first attempt to skip incompatible channel, got %#v", logs[0].Attempts[0])
+	}
+}
+
+func TestHandlerAutoRouteFallsBackOnceLearnsAndReuses(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := setupRelayTestDB(t)
+
+	var messagesHits atomic.Int32
+	var chatHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/messages":
+			messagesHits.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"message":"Invalid URL (POST /v1/messages)"}}`))
+		case "/v1/chat/completions":
+			chatHits.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl_auto","object":"chat.completion","created":1,"model":"claude-auto-test","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	channel := &model.Channel{
+		Name:     "relay-auto-route-learning",
+		Type:     outbound.OutboundTypeAuto,
+		Enabled:  true,
+		BaseUrls: []model.BaseUrl{{URL: server.URL + "/v1"}},
+		Model:    "claude-auto-test",
+		Keys:     []model.ChannelKey{{Enabled: true, ChannelKey: "test-key"}},
+		ModelRoutes: model.ChannelModelRoutes{
+			FallbackType: outbound.OutboundTypeOpenAIChat,
+		},
+	}
+	if err := op.ChannelCreate(channel, ctx); err != nil {
+		t.Fatal(err)
+	}
+	group := &model.Group{Name: "relay-auto-route-group", Mode: model.GroupModeFailover}
+	if err := op.GroupCreate(group, ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := op.GroupItemAdd(&model.GroupItem{GroupID: group.ID, ChannelID: channel.ID, ModelName: "claude-auto-test", Priority: 1, Weight: 1}, ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	call := func() *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Set("api_key_id", 42)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"relay-auto-route-group","messages":[{"role":"user","content":"hello"}]}`))
+		c.Request.Header.Set("Content-Type", "application/json")
+		Handler(inbound.InboundTypeOpenAIChat, c)
+		return recorder
+	}
+
+	first := call()
+	if first.Code != http.StatusOK || !strings.Contains(first.Body.String(), `"content":"ok"`) {
+		t.Fatalf("first request failed: status=%d body=%s", first.Code, first.Body.String())
+	}
+	if messagesHits.Load() != 1 || chatHits.Load() != 1 {
+		t.Fatalf("expected one inferred and one fallback request, messages=%d chat=%d", messagesHits.Load(), chatHits.Load())
+	}
+	learned, err := op.ChannelGet(channel.ID, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if routeType, ok := learned.ModelRoutes.Learned["claude-auto-test"]; !ok || routeType != outbound.OutboundTypeOpenAIChat {
+		t.Fatalf("fallback route was not learned: %#v", learned.ModelRoutes)
+	}
+	if resolved := channelroute.Resolve(*learned, "claude-auto-test", transformerModel.APIFormatOpenAIChatCompletion); resolved.Type != outbound.OutboundTypeOpenAIChat || resolved.Source != channelroute.SourceLearned {
+		t.Fatalf("learned route did not resolve: %+v routes=%#v", resolved, learned.ModelRoutes)
+	}
+
+	second := call()
+	if second.Code != http.StatusOK {
+		t.Fatalf("second request failed: status=%d body=%s", second.Code, second.Body.String())
+	}
+	if messagesHits.Load() != 1 || chatHits.Load() != 2 {
+		t.Fatalf("second request did not reuse learned route, messages=%d chat=%d", messagesHits.Load(), chatHits.Load())
 	}
 }
 

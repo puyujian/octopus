@@ -121,6 +121,11 @@ func HandleResponsesCompact(c *gin.Context) {
 			iter.Skip(channel.ID, 0, channel.Name, "channel disabled")
 			continue
 		}
+		if channel.Type == outbound.OutboundTypeAuto {
+			effective := *channel
+			effective.Type = outbound.OutboundTypeOpenAIResponse
+			channel = &effective
+		}
 		if !supportsResponsesCompact(channel.Type) {
 			iter.Skip(channel.ID, 0, channel.Name, "channel type not compatible with responses compact")
 			continue

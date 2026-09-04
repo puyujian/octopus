@@ -18,7 +18,7 @@ func TestTransformRequestAddsVolcengineThinkingAndPartial(t *testing.T) {
 			{Role: "user", Content: model.MessageContent{Content: &content}},
 			{Role: "assistant", Content: model.MessageContent{Content: &answer}},
 		},
-		ReasoningEffort: "high",
+		ReasoningEffort: "max",
 		Metadata:        map[string]string{"must_not_forward": "true"},
 	}
 

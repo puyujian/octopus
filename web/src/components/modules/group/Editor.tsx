@@ -8,6 +8,7 @@ import { useModelChannelList, type LLMChannel } from '@/api/endpoints/model';
 import { Button } from '@/components/ui/button';
 import { Field, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import { Accordion, AccordionContent, AccordionItem } from '@/components/ui/accordion';
 import { cn } from '@/lib/utils';
@@ -35,6 +36,7 @@ export type GroupEditorValues = {
 
 type ParamOverrideRow = {
     id: string;
+    mode: 'smart' | 'raw';
     key: string;
     value: string;
 };
@@ -46,26 +48,40 @@ type ParamOverrideParseResult = {
 
 type ParamOverrideSerializeResult = {
     value: string;
-    error: 'nameRequired' | 'protected' | 'duplicate' | 'pathConflict' | '';
+    error: 'nameRequired' | 'protected' | 'reserved' | 'duplicate' | 'pathConflict' | 'invalidValue' | '';
 };
 
 const protectedParamOverrideKeys = new Set(['model', 'stream', 'type']);
-const commonParamOverrideKeys = [
-    'temperature',
-    'top_p',
-    'max_tokens',
-    'max_completion_tokens',
-    'reasoning_effort',
-    'enable_thinking',
-    'thinking.budget_tokens',
-    'reasoning.effort',
-];
+const semanticParamOverrideRoot = '$octopus';
+const smartParamOverrideKeys = ['temperature', 'top_p', 'max_output_tokens', 'reasoning_effort'] as const;
+type SmartParamOverrideKey = typeof smartParamOverrideKeys[number];
+
+const smartParamDefaultValues: Record<SmartParamOverrideKey, string> = {
+    temperature: '0.7',
+    top_p: '0.9',
+    max_output_tokens: '4096',
+    reasoning_effort: 'medium',
+};
+
+const legacySmartParamAliases: Record<string, SmartParamOverrideKey> = {
+    temperature: 'temperature',
+    top_p: 'top_p',
+    max_tokens: 'max_output_tokens',
+    max_completion_tokens: 'max_output_tokens',
+    max_output_tokens: 'max_output_tokens',
+    reasoning_effort: 'reasoning_effort',
+    'reasoning.effort': 'reasoning_effort',
+};
 
 let paramOverrideRowSequence = 0;
 
-function createParamOverrideRow(key = '', value = ''): ParamOverrideRow {
+function createParamOverrideRow(key = '', value = '', mode: ParamOverrideRow['mode'] = 'smart'): ParamOverrideRow {
     paramOverrideRowSequence += 1;
-    return { id: `param-override-${paramOverrideRowSequence}`, key, value };
+    return { id: `param-override-${paramOverrideRowSequence}`, mode, key, value };
+}
+
+function isSmartParamOverrideKey(key: string): key is SmartParamOverrideKey {
+    return (smartParamOverrideKeys as readonly string[]).includes(key);
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -94,14 +110,20 @@ function flattenParamOverrideObject(
     value: Record<string, unknown>,
     prefix = '',
     rows: ParamOverrideRow[] = [],
+    mode: ParamOverrideRow['mode'] = 'raw',
 ): ParamOverrideRow[] {
     Object.entries(value).forEach(([key, nestedValue]) => {
         const path = prefix ? `${prefix}.${key}` : key;
         if (isPlainRecord(nestedValue) && Object.keys(nestedValue).length > 0) {
-            flattenParamOverrideObject(nestedValue, path, rows);
+            flattenParamOverrideObject(nestedValue, path, rows, mode);
             return;
         }
-        rows.push(createParamOverrideRow(path, formatParamOverrideValue(nestedValue)));
+        const legacySmartKey = mode === 'raw' ? legacySmartParamAliases[path] : undefined;
+        rows.push(createParamOverrideRow(
+            legacySmartKey ?? path,
+            formatParamOverrideValue(nestedValue),
+            legacySmartKey ? 'smart' : mode,
+        ));
     });
     return rows;
 }
@@ -113,7 +135,20 @@ function parseParamOverride(value: string): ParamOverrideParseResult {
     try {
         const parsed = JSON.parse(trimmed) as unknown;
         if (!isPlainRecord(parsed)) return { rows: [], error: 'objectOnly' };
-        return { rows: flattenParamOverrideObject(parsed), error: '' };
+        const rows: ParamOverrideRow[] = [];
+        const semantic = parsed[semanticParamOverrideRoot];
+        if (semantic !== undefined) {
+            if (!isPlainRecord(semantic)) return { rows: [], error: 'objectOnly' };
+            Object.entries(semantic).forEach(([key, nestedValue]) => {
+                if (isSmartParamOverrideKey(key)) {
+                    rows.push(createParamOverrideRow(key, formatParamOverrideValue(nestedValue), 'smart'));
+                } else {
+                    rows.push(createParamOverrideRow(`${semanticParamOverrideRoot}.${key}`, formatParamOverrideValue(nestedValue), 'raw'));
+                }
+            });
+        }
+        const raw = Object.fromEntries(Object.entries(parsed).filter(([key]) => key !== semanticParamOverrideRoot));
+        return { rows: flattenParamOverrideObject(raw, '', rows, 'raw'), error: '' };
     } catch {
         return { rows: [], error: 'invalid' };
     }
@@ -179,19 +214,43 @@ function setParamOverridePath(
 
 function serializeParamOverride(rows: ParamOverrideRow[]): ParamOverrideSerializeResult {
     const result: Record<string, unknown> = {};
+    const semantic: Record<string, unknown> = {};
     const activeRows = rows.filter((row) => row.key.trim() || row.value.trim());
 
     for (const row of activeRows) {
         const key = row.key.trim();
         if (!key) return { value: '', error: 'nameRequired' };
+        if (row.mode === 'smart') {
+            if (!isSmartParamOverrideKey(key)) return { value: '', error: 'nameRequired' };
+            if (Object.prototype.hasOwnProperty.call(semantic, key)) return { value: '', error: 'duplicate' };
+            const parsedValue = parseParamOverrideValue(row.value);
+            if (key === 'reasoning_effort') {
+                if (typeof parsedValue !== 'string' || !['minimal', 'low', 'medium', 'high', 'max'].includes(parsedValue)) {
+                    return { value: '', error: 'invalidValue' };
+                }
+            } else if (typeof parsedValue !== 'number' || !Number.isFinite(parsedValue)) {
+                return { value: '', error: 'invalidValue' };
+            } else if (key === 'temperature' && (parsedValue < 0 || parsedValue > 2)) {
+                return { value: '', error: 'invalidValue' };
+            } else if (key === 'top_p' && (parsedValue < 0 || parsedValue > 1)) {
+                return { value: '', error: 'invalidValue' };
+            } else if (key === 'max_output_tokens' && (!Number.isInteger(parsedValue) || parsedValue <= 0)) {
+                return { value: '', error: 'invalidValue' };
+            }
+            semantic[key] = parsedValue;
+            continue;
+        }
         const segments = key.split('.').map((segment) => segment.trim());
         if (segments.some((segment) => !segment)) return { value: '', error: 'nameRequired' };
+        if (segments[0].toLowerCase() === semanticParamOverrideRoot) return { value: '', error: 'reserved' };
         if (protectedParamOverrideKeys.has(segments[0].toLowerCase())) {
             return { value: '', error: 'protected' };
         }
         const error = setParamOverridePath(result, segments, parseParamOverrideValue(row.value));
         if (error) return { value: '', error };
     }
+
+    if (Object.keys(semantic).length > 0) result[semanticParamOverrideRoot] = semantic;
 
     return {
         value: Object.keys(result).length > 0 ? JSON.stringify(result) : '',
@@ -537,7 +596,17 @@ export function GroupEditor({
 
     const handleAddParamOverrideRow = useCallback(() => {
         setParamOverrideLoadError('');
-        setParamOverrideRows((prev) => [...prev, createParamOverrideRow()]);
+        setParamOverrideRows((prev) => {
+            const used = new Set(prev.filter((row) => row.mode === 'smart').map((row) => row.key));
+            const nextKey = smartParamOverrideKeys.find((key) => !used.has(key));
+            if (!nextKey) return prev;
+            return [...prev, createParamOverrideRow(nextKey, smartParamDefaultValues[nextKey], 'smart')];
+        });
+    }, []);
+
+    const handleAddRawParamOverrideRow = useCallback(() => {
+        setParamOverrideLoadError('');
+        setParamOverrideRows((prev) => [...prev, createParamOverrideRow('', '', 'raw')]);
     }, []);
 
     const handleUpdateParamOverrideRow = useCallback((id: string, field: 'key' | 'value', value: string) => {
@@ -565,10 +634,14 @@ export function GroupEditor({
                 return t('form.paramOverrideNameRequired');
             case 'protected':
                 return t('form.paramOverrideProtected');
+            case 'reserved':
+                return t('form.paramOverrideReserved');
             case 'duplicate':
                 return t('form.paramOverrideDuplicate');
             case 'pathConflict':
                 return t('form.paramOverridePathConflict');
+            case 'invalidValue':
+                return t('form.paramOverrideInvalidValue');
             default:
                 return '';
         }
@@ -695,14 +768,25 @@ export function GroupEditor({
                     <Field className="shrink-0">
                         <div className="flex items-center justify-between gap-2">
                             <FieldLabel htmlFor="group-param-override-key">{t('form.paramOverride')}</FieldLabel>
-                            <button
-                                type="button"
-                                onClick={handleAddParamOverrideRow}
-                                className="flex items-center gap-1 rounded-lg px-2 py-1 text-xs font-medium text-primary transition-colors hover:bg-primary/10"
-                            >
-                                <Plus className="size-3.5" />
-                                {t('form.paramOverrideAdd')}
-                            </button>
+                            <div className="flex flex-wrap justify-end gap-1">
+                                <button
+                                    type="button"
+                                    onClick={handleAddParamOverrideRow}
+                                    disabled={smartParamOverrideKeys.every((key) => paramOverrideRows.some((row) => row.mode === 'smart' && row.key === key))}
+                                    className="flex items-center gap-1 rounded-lg px-2 py-1 text-xs font-medium text-primary transition-colors hover:bg-primary/10 disabled:pointer-events-none disabled:opacity-40"
+                                >
+                                    <Plus className="size-3.5" />
+                                    {t('form.paramOverrideAdd')}
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={handleAddRawParamOverrideRow}
+                                    className="flex items-center gap-1 rounded-lg px-2 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                                >
+                                    <Plus className="size-3.5" />
+                                    {t('form.paramOverrideAddRaw')}
+                                </button>
+                            </div>
                         </div>
                         <div className="rounded-xl border border-input bg-background p-2">
                             {paramOverrideRows.length === 0 ? (
@@ -718,23 +802,65 @@ export function GroupEditor({
                                     </div>
                                     {paramOverrideRows.map((row) => (
                                         <div key={row.id} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2rem] items-center gap-2">
-                                            <Input
-                                                id={row.id + '-key'}
-                                                list="group-param-override-key-options"
-                                                value={row.key}
-                                                onChange={(event) => handleUpdateParamOverrideRow(row.id, 'key', event.target.value)}
-                                                placeholder={t('form.paramOverrideNamePlaceholder')}
-                                                aria-label={t('form.paramOverrideName')}
-                                                className="h-8 rounded-lg text-xs"
-                                            />
-                                            <Input
-                                                id={row.id + '-value'}
-                                                value={row.value}
-                                                onChange={(event) => handleUpdateParamOverrideRow(row.id, 'value', event.target.value)}
-                                                placeholder={t('form.paramOverrideValuePlaceholder')}
-                                                aria-label={t('form.paramOverrideValue')}
-                                                className="h-8 rounded-lg text-xs"
-                                            />
+                                            {row.mode === 'smart' ? (
+                                                <Select
+                                                    value={row.key}
+                                                    onValueChange={(value) => {
+                                                        if (!isSmartParamOverrideKey(value)) return;
+                                                        handleUpdateParamOverrideRow(row.id, 'key', value);
+                                                        handleUpdateParamOverrideRow(row.id, 'value', smartParamDefaultValues[value]);
+                                                    }}
+                                                >
+                                                    <SelectTrigger id={row.id + '-key'} size="sm" className="w-full rounded-lg text-xs">
+                                                        <SelectValue />
+                                                    </SelectTrigger>
+                                                    <SelectContent align="start">
+                                                        {smartParamOverrideKeys.map((key) => (
+                                                            <SelectItem
+                                                                key={key}
+                                                                value={key}
+                                                                disabled={paramOverrideRows.some((other) => other.id !== row.id && other.mode === 'smart' && other.key === key)}
+                                                            >
+                                                                {t(`form.paramOverrideSmart.${key}`)}
+                                                            </SelectItem>
+                                                        ))}
+                                                    </SelectContent>
+                                                </Select>
+                                            ) : (
+                                                <Input
+                                                    id={row.id + '-key'}
+                                                    value={row.key}
+                                                    onChange={(event) => handleUpdateParamOverrideRow(row.id, 'key', event.target.value)}
+                                                    placeholder={t('form.paramOverrideNamePlaceholder')}
+                                                    aria-label={t('form.paramOverrideName')}
+                                                    className="h-8 rounded-lg text-xs"
+                                                />
+                                            )}
+                                            {row.mode === 'smart' && row.key === 'reasoning_effort' ? (
+                                                <Select value={row.value} onValueChange={(value) => handleUpdateParamOverrideRow(row.id, 'value', value)}>
+                                                    <SelectTrigger id={row.id + '-value'} size="sm" className="w-full rounded-lg text-xs">
+                                                        <SelectValue />
+                                                    </SelectTrigger>
+                                                    <SelectContent align="start">
+                                                        {(['minimal', 'low', 'medium', 'high', 'max'] as const).map((effort) => (
+                                                            <SelectItem key={effort} value={effort}>{t(`form.paramOverrideEffort.${effort}`)}</SelectItem>
+                                                        ))}
+                                                    </SelectContent>
+                                                </Select>
+                                            ) : (
+                                                <Input
+                                                    id={row.id + '-value'}
+                                                    type={row.mode === 'smart' ? 'number' : 'text'}
+                                                    min={row.key === 'temperature' || row.key === 'top_p' ? 0 : undefined}
+                                                    max={row.key === 'temperature' ? 2 : row.key === 'top_p' ? 1 : undefined}
+                                                    step={row.key === 'max_output_tokens' ? 1 : 'any'}
+                                                    value={row.value}
+                                                    onChange={(event) => handleUpdateParamOverrideRow(row.id, 'value', event.target.value)}
+                                                    placeholder={t('form.paramOverrideValuePlaceholder')}
+                                                    aria-label={t('form.paramOverrideValue')}
+                                                    className="h-8 rounded-lg text-xs"
+                                                />
+                                            )}
                                             <button
                                                 type="button"
                                                 onClick={() => handleRemoveParamOverrideRow(row.id)}
@@ -747,11 +873,11 @@ export function GroupEditor({
                                     ))}
                                 </div>
                             )}
-                            <datalist id="group-param-override-key-options">
-                                {commonParamOverrideKeys.map((key) => <option key={key} value={key} />)}
-                            </datalist>
                         </div>
                         <p className="text-xs text-muted-foreground">{t('form.paramOverrideHint')}</p>
+                        {paramOverrideRows.some((row) => row.mode === 'raw') && (
+                            <p className="text-xs text-amber-600 dark:text-amber-400">{t('form.paramOverrideRawHint')}</p>
+                        )}
                         {paramOverrideError && <p className="text-xs text-destructive">{paramOverrideError}</p>}
                     </Field>
 

@@ -95,6 +95,12 @@ func createChannel(c *gin.Context) {
 		resp.InvalidJSON(c)
 		return
 	}
+	if !channel.Type.Valid() {
+		resp.Error(c, http.StatusBadRequest, "invalid channel type")
+		return
+	}
+	channel.ModelRoutes.Learned = nil
+	channel.ModelRoutes = channel.ModelRoutes.Normalize()
 	if channel.ProxyMode == "" {
 		channel.ProxyMode = model.ProxyUsageModeDirect
 	}

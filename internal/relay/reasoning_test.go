@@ -9,6 +9,7 @@ func TestExtractReasoningEffort(t *testing.T) {
 		want string
 	}{
 		{name: "openai", body: `{"reasoning_effort":"high"}`, want: "high"},
+		{name: "openai max", body: `{"reasoning_effort":"max"}`, want: "max"},
 		{name: "responses", body: `{"reasoning":{"effort":"medium"}}`, want: "medium"},
 		{name: "anthropic", body: `{"output_config":{"effort":"low"}}`, want: "low"},
 		{name: "gemini level", body: `{"generationConfig":{"thinkingConfig":{"thinkingLevel":"HIGH"}}}`, want: "high"},

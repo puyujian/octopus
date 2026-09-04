@@ -229,7 +229,7 @@ type InternalLLMRequest struct {
 		Voice  string `json:"voice,omitempty"`
 	} `json:"audio,omitempty"`
 
-	// Controls effort on reasoning for reasoning models. It can be set to "low", "medium", or "high".
+	// Controls effort on reasoning models. Supported tiers vary by provider and model.
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 
 	// Reasoning budget for reasoning models.

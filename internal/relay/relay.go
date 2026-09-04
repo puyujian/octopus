@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bestruirui/octopus/internal/channelroute"
 	"github.com/bestruirui/octopus/internal/helper"
 	dbmodel "github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/op"
@@ -195,8 +196,13 @@ func Handler(inboundType inbound.InboundType, c *gin.Context) {
 			iter.Skip(channel.ID, 0, channel.Name, "channel disabled")
 			continue
 		}
+		configuredChannel := channel
+		resolution := channelroute.Resolve(*configuredChannel, item.ModelName, internalRequest.RawAPIFormat)
+		effectiveChannel := *configuredChannel
+		effectiveChannel.Type = resolution.Type
+		channel = &effectiveChannel
 		if responsesPassthroughRequired {
-			if channel.Type == outbound.OutboundTypeOpenAIResponse {
+			if resolution.Type == outbound.OutboundTypeOpenAIResponse {
 				responsesPassthroughCapableFound = true
 			} else {
 				iter.Skip(channel.ID, 0, channel.Name, "openai responses passthrough required")
@@ -224,9 +230,9 @@ func Handler(inboundType inbound.InboundType, c *gin.Context) {
 		// 设置实际模型
 		internalRequest.Model = item.ModelName
 
-		log.Debugf("request model %s, mode: %d, forwarding to channel: %s model: %s (attempt %d/%d, sticky=%t)",
+		log.Debugf("request model %s, mode: %d, forwarding to channel: %s model: %s route=%d source=%s (attempt %d/%d, sticky=%t)",
 			requestModel, group.Mode, channel.Name, item.ModelName,
-			iter.Index()+1, iter.Len(), iter.IsSticky())
+			resolution.Type, resolution.Source, iter.Index()+1, iter.Len(), iter.IsSticky())
 
 		selectOpts := dbmodel.ChannelKeySelectOptions{
 			ExcludeKeyIDs:  make(map[int]struct{}),
@@ -253,6 +259,7 @@ func Handler(inboundType inbound.InboundType, c *gin.Context) {
 
 		// 同通道重试循环
 		var result attemptResult
+		protocolFallbackUsed := false
 		for retryNum := 0; retryNum < maxSameChannelRetries; retryNum++ {
 			// 重试前等待退避
 			if retryNum > 0 {
@@ -281,6 +288,40 @@ func Handler(inboundType inbound.InboundType, c *gin.Context) {
 			}
 
 			result = ra.attempt()
+			if !protocolFallbackUsed &&
+				configuredChannel.Type == outbound.OutboundTypeAuto &&
+				resolution.Source != channelroute.SourceOverride &&
+				resolution.Source != channelroute.SourceRequired &&
+				!result.Success && !result.Written && !result.Canceled && !result.ResetConversation && !result.FirstTokenTimeout {
+				suggested, mismatch := detectProtocolFallback(result.StatusCode, inboundType, result.Err)
+				if mismatch {
+					if fallbackType, ok := channelroute.Fallback(*configuredChannel, channel.Type, suggested); ok {
+						fallbackChannel := *configuredChannel
+						fallbackChannel.Type = fallbackType
+						fallbackAdapter := outbound.Get(fallbackType)
+						if fallbackAdapter != nil &&
+							(!internalRequest.IsEmbeddingRequest() || outbound.IsEmbeddingChannelType(fallbackType)) &&
+							(!internalRequest.IsChatRequest() || outbound.IsChatChannelType(fallbackType)) {
+							protocolFallbackUsed = true
+							fallbackAttempt := &relayAttempt{
+								relayRequest:         req,
+								outAdapter:           fallbackAdapter,
+								channel:              &fallbackChannel,
+								usedKey:              usedKey,
+								firstTokenTimeOutSec: group.FirstTokenTimeOut,
+							}
+							log.Infof("auto route fallback channel=%d model=%s from=%d to=%d status=%d", configuredChannel.ID, item.ModelName, channel.Type, fallbackType, result.StatusCode)
+							result = fallbackAttempt.attempt()
+							if result.Success {
+								if err := op.ChannelModelRouteLearn(configuredChannel.ID, item.ModelName, fallbackType, c.Request.Context()); err != nil {
+									log.Warnf("failed to persist auto route channel=%d model=%s: %v", configuredChannel.ID, item.ModelName, err)
+								}
+								channel = &fallbackChannel
+							}
+						}
+					}
+				}
+			}
 			if result.Success || result.Written || result.Canceled || result.ResetConversation || result.FirstTokenTimeout || !isRetryableStatus(result.StatusCode) {
 				break
 			}
@@ -545,7 +586,10 @@ func (ra *relayAttempt) forward() (int, error) {
 // forwardViaWS attempts to forward via upstream WebSocket.
 // Returns statusCode=-1 if WS is not available (caller should fall through to HTTP).
 func (ra *relayAttempt) forwardViaWS(ctx context.Context) (int, error) {
-	if ra.c == nil && effectiveResponsesWSMode(ra.channel) == responsesWSModePassthrough && !ra.internalRequest.IsOpenAIExactReplayRequest() {
+	if ra.c == nil &&
+		effectiveResponsesWSMode(ra.channel) == responsesWSModePassthrough &&
+		!ra.internalRequest.IsOpenAIExactReplayRequest() &&
+		!helper.HasSemanticGroupParamOverride(ra.groupParamOverride) {
 		return ra.forwardViaWSPassthrough(ctx)
 	}
 	continuation := requiresUpstreamWSContinuation(ra.internalRequest)
@@ -563,17 +607,31 @@ func (ra *relayAttempt) forwardViaWS(ctx context.Context) (int, error) {
 	log.Debugf("upstream WS selected (channel=%s, key=%d, continuation=%t, previous_response_id=%s)",
 		ra.channel.Name, ra.usedKey.ID, continuation, currentPreviousResponseID(ra.internalRequest))
 
-	// Build the Responses API request body
-	responsesReq := openaiOutbound.ConvertToResponsesRequest(ra.internalRequest)
+	// Build the Responses API request body. Semantic group parameters must be
+	// applied before the provider transformer so Responses receives its native
+	// nested field names instead of Chat-style names.
+	wireRequest := cloneInternalRequest(ra.internalRequest)
+	rawGroupOverride, err := helper.PrepareSemanticGroupParamOverride(wireRequest, ra.groupParamOverride, ra.channel.Type, nil)
+	if err != nil {
+		wsUpstreamPool.Put(pc)
+		return 0, fmt.Errorf("failed to prepare semantic parameter override: %w", err)
+	}
+	responsesReq := openaiOutbound.ConvertToResponsesRequest(wireRequest)
 	reqBody, err := json.Marshal(responsesReq)
 	if err != nil {
 		wsUpstreamPool.Put(pc)
 		return -1, nil // fall through to HTTP
 	}
-	reqBody, err = helper.ApplyJSONParamOverrides(reqBody, ra.channel.ParamOverride, ra.groupParamOverride)
+	semanticTransformedBody := append([]byte(nil), reqBody...)
+	reqBody, err = helper.ApplyJSONParamOverrides(reqBody, ra.channel.ParamOverride, rawGroupOverride)
 	if err != nil {
 		wsUpstreamPool.Put(pc)
 		return 0, fmt.Errorf("failed to apply parameter override: %w", err)
+	}
+	reqBody, err = helper.ReapplySemanticGroupJSONPrecedence(reqBody, semanticTransformedBody, ra.groupParamOverride, ra.channel.Type, nil)
+	if err != nil {
+		wsUpstreamPool.Put(pc)
+		return 0, fmt.Errorf("failed to enforce semantic parameter override precedence: %w", err)
 	}
 	ra.metrics.SetTransportRequestPayload(reqBody, ra.internalRequest.Model)
 
@@ -763,6 +821,7 @@ func (ra *relayAttempt) handleWSStreamResponseV2(ctx context.Context, reader *ws
 func (ra *relayAttempt) forwardViaHTTP(ctx context.Context) (int, error) {
 	// Check for passthrough capability using interface
 	if pt, ok := ra.outAdapter.(model.PassthroughCapable); ok &&
+		!helper.HasSemanticGroupParamOverride(ra.groupParamOverride) &&
 		len(ra.rawBody) > 0 &&
 		pt.CanPassthrough(ra.internalRequest.RawAPIFormat) {
 		// Additional checks for OpenAI Responses edge cases
@@ -870,15 +929,30 @@ func (ra *relayAttempt) handleResponsePassthrough(ctx context.Context, response 
 func (ra *relayAttempt) forwardViaHTTPStandard(ctx context.Context) (int, error) {
 	wireRequest := ra.internalRequest
 	developerRoleDowngraded := false
+	reasoningMaxDowngraded := false
+	excludedSemanticParams := make(map[string]struct{})
 	if ra.channel.Type == outbound.OutboundTypeOpenAIChat &&
 		channelModelRequiresSystemRole(ra.channel.ID, ra.internalRequest.Model) {
 		wireRequest, developerRoleDowngraded = requestWithDeveloperRoleDowngraded(ra.internalRequest)
 	}
 
 	for {
+		attemptRequest := cloneInternalRequest(wireRequest)
+		rawGroupOverride, err := helper.PrepareSemanticGroupParamOverride(
+			attemptRequest,
+			ra.groupParamOverride,
+			ra.channel.Type,
+			excludedSemanticParams,
+		)
+		if err != nil {
+			return 0, fmt.Errorf("failed to prepare semantic parameter override: %w", err)
+		}
+		if reasoningMaxDowngraded && attemptRequest.ReasoningEffort == "max" {
+			attemptRequest.ReasoningEffort = "high"
+		}
 		outboundRequest, err := ra.outAdapter.TransformRequest(
 			ctx,
-			wireRequest,
+			attemptRequest,
 			ra.channel.GetBaseUrl(),
 			ra.usedKey.ChannelKey,
 		)
@@ -886,8 +960,21 @@ func (ra *relayAttempt) forwardViaHTTPStandard(ctx context.Context) (int, error)
 			log.Warnf("failed to create request: %v", err)
 			return 0, fmt.Errorf("failed to create request: %w", err)
 		}
-		if err := ra.applyParamOverride(outboundRequest); err != nil {
+		semanticTransformedBody, _ := readOutboundRequestBody(outboundRequest)
+		if err := ra.applyParamOverrideWithGroup(outboundRequest, rawGroupOverride); err != nil {
 			return 0, err
+		}
+		if err := helper.ReapplySemanticGroupWirePrecedence(
+			outboundRequest,
+			semanticTransformedBody,
+			ra.groupParamOverride,
+			ra.channel.Type,
+			excludedSemanticParams,
+		); err != nil {
+			return 0, fmt.Errorf("failed to enforce semantic parameter override precedence: %w", err)
+		}
+		if requestBody, readErr := readOutboundRequestBody(outboundRequest); readErr == nil {
+			ra.metrics.SetTransportRequestPayload(requestBody, ra.internalRequest.Model)
 		}
 
 		// 复制请求头
@@ -912,6 +999,26 @@ func (ra *relayAttempt) forwardViaHTTPStandard(ctx context.Context) (int, error)
 			}
 			if closeErr != nil {
 				log.Debugf("failed to close rejected response body: %v", closeErr)
+			}
+
+			if response.StatusCode == http.StatusBadRequest {
+				if !reasoningMaxDowngraded && helper.RejectedUpstreamReasoningMax(ra.groupParamOverride, body) {
+					reasoningMaxDowngraded = true
+					ra.retryAfter = 0
+					log.Warnf("channel %s model %s rejected reasoning effort max; retrying once with high", ra.channel.Name, ra.internalRequest.Model)
+					continue
+				}
+				if rejectedWireParam := unsupportedUpstreamParameter(body); rejectedWireParam != "" {
+					semanticParam := helper.SemanticParamForRejectedWireName(ra.groupParamOverride, rejectedWireParam)
+					if semanticParam != "" {
+						if _, alreadyExcluded := excludedSemanticParams[semanticParam]; !alreadyExcluded {
+							excludedSemanticParams[semanticParam] = struct{}{}
+							ra.retryAfter = 0
+							log.Warnf("channel %s model %s rejected semantic group parameter %s (wire=%s); retrying once without it", ra.channel.Name, ra.internalRequest.Model, semanticParam, rejectedWireParam)
+							continue
+						}
+					}
+				}
 			}
 
 			if !developerRoleDowngraded &&
@@ -992,7 +1099,11 @@ func (ra *relayAttempt) getStreamWriter() StreamWriter {
 // applyParamOverride applies channel-level overrides followed by the group's
 // recursive force-override and records the final upstream payload.
 func (ra *relayAttempt) applyParamOverride(outboundRequest *http.Request) error {
-	if err := helper.ApplyParamOverrides(outboundRequest, ra.channel.ParamOverride, ra.groupParamOverride); err != nil {
+	return ra.applyParamOverrideWithGroup(outboundRequest, ra.groupParamOverride)
+}
+
+func (ra *relayAttempt) applyParamOverrideWithGroup(outboundRequest *http.Request, groupOverride *string) error {
+	if err := helper.ApplyParamOverrides(outboundRequest, ra.channel.ParamOverride, groupOverride); err != nil {
 		return err
 	}
 	if requestBody, readErr := readOutboundRequestBody(outboundRequest); readErr == nil {

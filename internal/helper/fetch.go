@@ -20,8 +20,21 @@ func FetchModels(ctx context.Context, request model.Channel) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	fetchModel := make([]string, 0)
-	switch request.Type {
+	if request.Type == outbound.OutboundTypeAuto {
+		return fetchAutoModels(client, ctx, request)
+	}
+	fetchModel, err := fetchModelsForType(client, ctx, request, request.Type)
+	if err != nil {
+		return nil, err
+	}
+	return filterFetchedModels(fetchModel, request.MatchRegex)
+}
+
+func fetchModelsForType(client *http.Client, ctx context.Context, request model.Channel, routeType outbound.OutboundType) ([]string, error) {
+	request.Type = routeType
+	var fetchModel []string
+	var err error
+	switch routeType {
 	case outbound.OutboundTypeAnthropic:
 		fetchModel, err = fetchAnthropicModels(client, ctx, request)
 	case outbound.OutboundTypeGemini:
@@ -29,12 +42,45 @@ func FetchModels(ctx context.Context, request model.Channel) ([]string, error) {
 	default:
 		fetchModel, err = fetchOpenAIModels(client, ctx, request)
 	}
-	if err != nil {
-		return nil, err
+	return fetchModel, err
+}
+
+func fetchAutoModels(client *http.Client, ctx context.Context, request model.Channel) ([]string, error) {
+	fallback := request.ModelRoutes.Normalize().FallbackType
+	candidates := []outbound.OutboundType{
+		fallback,
+		outbound.OutboundTypeOpenAIChat,
+		outbound.OutboundTypeAnthropic,
+		outbound.OutboundTypeGemini,
 	}
-	if request.MatchRegex != nil && *request.MatchRegex != "" {
+	seen := make(map[outbound.OutboundType]struct{}, len(candidates))
+	errors := make([]string, 0, len(candidates))
+	for _, routeType := range candidates {
+		if !routeType.IsConcrete() {
+			continue
+		}
+		if _, ok := seen[routeType]; ok {
+			continue
+		}
+		seen[routeType] = struct{}{}
+		models, err := fetchModelsForType(client, ctx, request, routeType)
+		if err == nil && len(models) > 0 {
+			return filterFetchedModels(models, request.MatchRegex)
+		}
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("type %d: %v", routeType, err))
+		}
+	}
+	if len(errors) > 0 {
+		return nil, fmt.Errorf("auto model fetch failed: %s", strings.Join(errors, "; "))
+	}
+	return []string{}, nil
+}
+
+func filterFetchedModels(fetchModel []string, matchRegex *string) ([]string, error) {
+	if matchRegex != nil && *matchRegex != "" {
 		matchModel := make([]string, 0)
-		re, err := regexp2.Compile(*request.MatchRegex, regexp2.ECMAScript)
+		re, err := regexp2.Compile(*matchRegex, regexp2.ECMAScript)
 		if err != nil {
 			return nil, err
 		}

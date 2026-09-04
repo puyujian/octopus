@@ -14,7 +14,16 @@ export enum ChannelType {
     Gemini = 3,
     Volcengine = 4,
     OpenAIEmbedding = 5,
+    Auto = 6,
 }
+
+export type ConcreteChannelType = Exclude<ChannelType, ChannelType.Auto>;
+
+export type ChannelModelRoutes = {
+    fallback_type: ConcreteChannelType;
+    overrides?: Record<string, ConcreteChannelType> | null;
+    learned?: Record<string, ConcreteChannelType> | null;
+};
 
 /**
  * 自动分组类型枚举
@@ -76,6 +85,7 @@ export type Channel = {
     ws_mode: ChannelWSMode;
     param_override?: string | null;
     match_regex?: string | null;
+    model_routes: ChannelModelRoutes;
     managed: boolean;
     managed_source?: ManagedChannelSource | null;
     stats: StatsChannel;
@@ -107,6 +117,7 @@ export type CreateChannelRequest = {
     ws_mode?: ChannelWSMode;
     param_override?: string | null;
     match_regex?: string | null;
+    model_routes?: Pick<ChannelModelRoutes, 'fallback_type' | 'overrides'>;
 };
 
 /**
@@ -128,6 +139,8 @@ export type UpdateChannelRequest = {
     ws_mode?: ChannelWSMode;
     param_override?: string | null;
     match_regex?: string | null;
+    model_routes?: Pick<ChannelModelRoutes, 'fallback_type' | 'overrides'>;
+    reset_learned_models?: string[];
     // keys diff
     keys_to_add?: Array<Pick<ChannelKey, 'enabled' | 'channel_key' | 'remark'>>;
     keys_to_update?: Array<{ id: number; enabled?: boolean; channel_key?: string; remark?: string }>;
@@ -172,6 +185,11 @@ export function useChannelList() {
                 keys: item.keys ?? [],
                 proxy_mode: item.proxy_mode ?? 'direct',
                 proxy_config_id: item.proxy_config_id ?? null,
+                model_routes: {
+                    fallback_type: item.model_routes?.fallback_type ?? ChannelType.OpenAIChat,
+                    overrides: item.model_routes?.overrides ?? {},
+                    learned: item.model_routes?.learned ?? {},
+                },
             }) satisfies Channel,
             formatted: {
                 input_token: formatCount(item.stats.input_token),

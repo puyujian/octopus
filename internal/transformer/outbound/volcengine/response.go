@@ -105,7 +105,7 @@ func thinkingFor(effort string) Thinking {
 	switch strings.ToLower(strings.TrimSpace(effort)) {
 	case "minimal", "none":
 		return Thinking{Type: ThinkingTypeDisabled}
-	case "low", "medium", "high":
+	case "low", "medium", "high", "max":
 		return Thinking{Type: ThinkingTypeEnabled}
 	default:
 		return Thinking{}

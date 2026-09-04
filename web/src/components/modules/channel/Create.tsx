@@ -15,7 +15,7 @@ export function CreateDialogContent() {
     const createChannel = useCreateChannel();
     const [formData, setFormData] = useState<ChannelFormData>({
         name: '',
-        type: ChannelType.OpenAIChat,
+        type: ChannelType.Auto,
         base_urls: [{ url: '', delay: 0 }],
         custom_header: [],
         ws_mode: 'inherit',
@@ -29,6 +29,8 @@ export function CreateDialogContent() {
         auto_group: AutoGroupType.None,
         enabled: true,
         match_regex: '',
+        model_routes: { fallback_type: ChannelType.OpenAIChat, overrides: {}, learned: {} },
+        reset_learned_models: [],
     });
     const t = useTranslations('channel.create');
     const tProxy = useTranslations('proxyPool');
@@ -68,12 +70,16 @@ export function CreateDialogContent() {
                 ws_mode: formData.ws_mode,
                 param_override: paramOverride,
                 match_regex: formData.match_regex.trim(),
+                model_routes: {
+                    fallback_type: formData.model_routes.fallback_type,
+                    overrides: formData.model_routes.overrides ?? {},
+                },
             },
             {
                 onSuccess: () => {
                     setFormData({
                         name: '',
-                        type: ChannelType.OpenAIChat,
+                        type: ChannelType.Auto,
                         base_urls: [{ url: '', delay: 0 }],
                         custom_header: [],
                         ws_mode: 'inherit',
@@ -87,6 +93,8 @@ export function CreateDialogContent() {
                         auto_group: AutoGroupType.None,
                         enabled: true,
                         match_regex: '',
+                        model_routes: { fallback_type: ChannelType.OpenAIChat, overrides: {}, learned: {} },
+                        reset_learned_models: [],
                     });
                     setIsOpen(false);
                 }

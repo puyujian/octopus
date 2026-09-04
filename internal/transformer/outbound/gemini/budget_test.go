@@ -46,6 +46,7 @@ func TestResolveThinkingConfigEffortFallback(t *testing.T) {
 		"low":     1024,
 		"medium":  4096,
 		"high":    24576,
+		"max":     24576,
 		"minimal": 0,
 	}
 	for eff, want := range cases {
@@ -59,6 +60,10 @@ func TestResolveThinkingConfigEffortFallback(t *testing.T) {
 	d := resolveThinkingConfig("gemini-3.0-flash", nil, "medium", false)
 	if !d.UseLevel || d.Level != "medium" {
 		t.Errorf("gemini-3-flash medium: got %+v", d)
+	}
+	d = resolveThinkingConfig("gemini-3.0-flash", nil, "max", false)
+	if !d.UseLevel || d.Level != "high" {
+		t.Errorf("gemini-3-flash max should use highest supported level: got %+v", d)
 	}
 }
 

@@ -1,4 +1,4 @@
-import { ChannelType, type AutoGroupType, type Channel, type ChannelWSMode, useFetchModel } from '@/api/endpoints/channel';
+import { ChannelType, type AutoGroupType, type Channel, type ChannelWSMode, type ChannelModelRoutes, type ConcreteChannelType, useFetchModel } from '@/api/endpoints/channel';
 import { ProxySelector } from '@/components/modules/proxy-pool/ProxySelector';
 import {
     Select,
@@ -42,6 +42,8 @@ export interface ChannelFormData {
     auto_sync: boolean;
     auto_group: AutoGroupType;
     match_regex: string;
+    model_routes: ChannelModelRoutes;
+    reset_learned_models: string[];
 }
 
 export interface ChannelFormProps {
@@ -101,6 +103,7 @@ export function ChannelForm({
         ? formData.custom_model.split(',').map((m) => m.trim()).filter(Boolean)
         : [];
     const [inputValue, setInputValue] = useState('');
+    const [routeEditingModel, setRouteEditingModel] = useState<string | null>(null);
     const inputRef = useRef<HTMLInputElement>(null);
 
     const fetchModel = useFetchModel();
@@ -113,6 +116,63 @@ export function ChannelForm({
         const custom_model = nextCustom.join(',');
         if (formData.model === model && formData.custom_model === custom_model) return;
         onFormDataChange({ ...formData, model, custom_model });
+    };
+
+    const normalizeRouteKey = (modelName: string) => modelName.trim().toLowerCase();
+    const concreteRouteTypes: ConcreteChannelType[] = [
+        ChannelType.OpenAIChat,
+        ChannelType.OpenAIResponse,
+        ChannelType.Anthropic,
+        ChannelType.Gemini,
+        ChannelType.Volcengine,
+        ChannelType.OpenAIEmbedding,
+    ];
+    const routeTypeLabel = (routeType: ConcreteChannelType) => {
+        switch (routeType) {
+            case ChannelType.OpenAIResponse: return t('typeOpenAIResponse');
+            case ChannelType.Anthropic: return t('typeAnthropic');
+            case ChannelType.Gemini: return t('typeGemini');
+            case ChannelType.Volcengine: return t('typeVolcengine');
+            case ChannelType.OpenAIEmbedding: return t('typeOpenAIEmbedding');
+            default: return t('typeOpenAIChat');
+        }
+    };
+    const inferRouteType = (modelName: string): ConcreteChannelType | null => {
+        const normalized = normalizeRouteKey(modelName);
+        const name = normalized.split(/[/:]/).filter(Boolean).at(-1) ?? normalized;
+        if (name.includes('embedding') || name.includes('embed-') || name.includes('embed_') || ['bge-', 'e5-', 'gte-', 'm3e-', 'multilingual-e5-'].some((prefix) => name.startsWith(prefix))) return ChannelType.OpenAIEmbedding;
+        if (name.startsWith('claude')) return ChannelType.Anthropic;
+        if (name.startsWith('gemini')) return ChannelType.Gemini;
+        if (name.startsWith('gpt-5')) return ChannelType.OpenAIResponse;
+        if (name.startsWith('doubao-seed')) return ChannelType.Volcengine;
+        return null;
+    };
+    const resolvedRoute = (modelName: string) => {
+        const key = normalizeRouteKey(modelName);
+        const override = formData.model_routes.overrides?.[key];
+        if (override !== undefined) return { type: override, source: t('routeSourceManual') };
+        const reset = formData.reset_learned_models.some((item) => normalizeRouteKey(item) === key);
+        const learned = reset ? undefined : formData.model_routes.learned?.[key];
+        if (learned !== undefined) return { type: learned, source: t('routeSourceLearned') };
+        const inferred = inferRouteType(modelName);
+        if (inferred !== null) return { type: inferred, source: t('routeSourceInferred') };
+        return { type: formData.model_routes.fallback_type, source: t('routeSourceFallback') };
+    };
+    const updateModelRoute = (modelName: string, value: string) => {
+        const key = normalizeRouteKey(modelName);
+        const overrides = { ...(formData.model_routes.overrides ?? {}) };
+        let resetLearned = formData.reset_learned_models.filter((item) => normalizeRouteKey(item) !== key);
+        if (value === 'auto') {
+            delete overrides[key];
+            if (formData.model_routes.learned?.[key] !== undefined) resetLearned = [...resetLearned, modelName];
+        } else {
+            overrides[key] = Number(value) as ConcreteChannelType;
+        }
+        onFormDataChange({
+            ...formData,
+            model_routes: { ...formData.model_routes, overrides },
+            reset_learned_models: resetLearned,
+        });
     };
 
     const handleRefreshModels = async () => {
@@ -249,12 +309,23 @@ export function ChannelForm({
                     </label>
                     <Select
                         value={String(formData.type)}
-                        onValueChange={(value) => onFormDataChange({ ...formData, type: Number(value) as ChannelType })}
+                        onValueChange={(value) => {
+                            const nextType = Number(value) as ChannelType;
+                            const previousType = formData.type;
+                            onFormDataChange({
+                                ...formData,
+                                type: nextType,
+                                model_routes: nextType === ChannelType.Auto && previousType !== ChannelType.Auto
+                                    ? { ...formData.model_routes, fallback_type: previousType as ConcreteChannelType }
+                                    : formData.model_routes,
+                            });
+                        }}
                     >
                         <SelectTrigger id={`${idPrefix}-type`} className="rounded-xl w-full border border-border px-4 py-2 text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
                             <SelectValue />
                         </SelectTrigger>
                         <SelectContent className='rounded-xl'>
+                            <SelectItem className='rounded-xl' value={String(ChannelType.Auto)}>{t('typeAuto')}</SelectItem>
                             <SelectItem className='rounded-xl' value={String(ChannelType.OpenAIChat)}>{t('typeOpenAIChat')}</SelectItem>
                             <SelectItem className='rounded-xl' value={String(ChannelType.OpenAIResponse)}>{t('typeOpenAIResponse')}</SelectItem>
                             <SelectItem className='rounded-xl' value={String(ChannelType.Anthropic)}>{t('typeAnthropic')}</SelectItem>
@@ -265,6 +336,29 @@ export function ChannelForm({
                     </Select>
                 </div>
             </div>
+
+            {formData.type === ChannelType.Auto ? (
+                <div className="rounded-xl border border-primary/20 bg-primary/5 p-3">
+                    <div className="mb-2 text-xs text-muted-foreground">{t('autoRouteDescription')}</div>
+                    <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] sm:items-center">
+                        <label className="text-sm font-medium text-card-foreground">{t('routeFallback')}</label>
+                        <Select
+                            value={String(formData.model_routes.fallback_type)}
+                            onValueChange={(value) => onFormDataChange({
+                                ...formData,
+                                model_routes: { ...formData.model_routes, fallback_type: Number(value) as ConcreteChannelType },
+                            })}
+                        >
+                            <SelectTrigger className="w-full rounded-xl"><SelectValue /></SelectTrigger>
+                            <SelectContent className="rounded-xl">
+                                {concreteRouteTypes.map((routeType) => (
+                                    <SelectItem key={routeType} className="rounded-xl" value={String(routeType)}>{routeTypeLabel(routeType)}</SelectItem>
+                                ))}
+                            </SelectContent>
+                        </Select>
+                    </div>
+                </div>
+            ) : null}
 
             <div className="space-y-2">
                 <div className="flex items-center justify-between">
@@ -430,8 +524,13 @@ export function ChannelForm({
                         {(autoModels.length + customModels.length) > 0 ? (
                             <div className="flex flex-wrap gap-1.5">
                                 {autoModels.map((model) => (
-                                    <Badge key={model} variant="secondary" className="bg-muted hover:bg-muted/80">
-                                        {model}
+                                    <Badge key={model} variant="secondary" className="max-w-full gap-1 bg-muted hover:bg-muted/80">
+                                        <span className="max-w-64 truncate" title={model}>{model}</span>
+                                        {formData.type === ChannelType.Auto ? (
+                                            <button type="button" onClick={() => setRouteEditingModel(model)} className="shrink-0 rounded-md bg-background/70 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground hover:text-foreground">
+                                                {resolvedRoute(model).source} · {routeTypeLabel(resolvedRoute(model).type)}
+                                            </button>
+                                        ) : null}
                                         <button
                                             type="button"
                                             onClick={() => handleRemoveAutoModel(model)}
@@ -442,8 +541,13 @@ export function ChannelForm({
                                     </Badge>
                                 ))}
                                 {customModels.map((model) => (
-                                    <Badge key={model} className="bg-primary hover:bg-primary/90">
-                                        {model}
+                                    <Badge key={model} className="max-w-full gap-1 bg-primary hover:bg-primary/90">
+                                        <span className="max-w-64 truncate" title={model}>{model}</span>
+                                        {formData.type === ChannelType.Auto ? (
+                                            <button type="button" onClick={() => setRouteEditingModel(model)} className="shrink-0 rounded-md bg-background/20 px-1.5 py-0.5 text-[10px] font-medium hover:bg-background/30">
+                                                {resolvedRoute(model).source} · {routeTypeLabel(resolvedRoute(model).type)}
+                                            </button>
+                                        ) : null}
                                         <button
                                             type="button"
                                             onClick={() => handleRemoveCustomModel(model)}
@@ -460,6 +564,28 @@ export function ChannelForm({
                             </div>
                         )}
                     </div>
+                    {formData.type === ChannelType.Auto && routeEditingModel && [...autoModels, ...customModels].includes(routeEditingModel) ? (
+                        <div className="mt-2 grid min-w-0 gap-2 rounded-xl border border-primary/20 bg-background p-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] sm:items-center">
+                            <div className="min-w-0">
+                                <div className="truncate text-sm font-medium" title={routeEditingModel}>{routeEditingModel}</div>
+                                <div className="text-xs text-muted-foreground">{t('routeOverrideHint')}</div>
+                            </div>
+                            <Select
+                                value={formData.model_routes.overrides?.[normalizeRouteKey(routeEditingModel)] !== undefined
+                                    ? String(formData.model_routes.overrides?.[normalizeRouteKey(routeEditingModel)])
+                                    : 'auto'}
+                                onValueChange={(value) => updateModelRoute(routeEditingModel, value)}
+                            >
+                                <SelectTrigger className="w-full min-w-0 rounded-xl"><SelectValue /></SelectTrigger>
+                                <SelectContent className="rounded-xl">
+                                    <SelectItem className="rounded-xl" value="auto">{t('routeAuto')}</SelectItem>
+                                    {concreteRouteTypes.map((routeType) => (
+                                        <SelectItem key={routeType} className="rounded-xl" value={String(routeType)}>{routeTypeLabel(routeType)}</SelectItem>
+                                    ))}
+                                </SelectContent>
+                            </Select>
+                        </div>
+                    ) : null}
                 </div>
             </div>
 
@@ -481,7 +607,7 @@ export function ChannelForm({
                     </AccordionTrigger>
                     <AccordionContent className="pt-4 px-4 pb-4 space-y-4 border-t">
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            {formData.type === ChannelType.OpenAIResponse ? (
+                            {formData.type === ChannelType.OpenAIResponse || formData.type === ChannelType.Auto ? (
                                 <div className="space-y-2">
                                     <label htmlFor={`${idPrefix}-ws-mode`} className="text-sm font-medium text-card-foreground">
                                         {t('wsMode')}

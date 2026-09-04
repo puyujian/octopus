@@ -8,6 +8,7 @@ func TestValidateReasoningEffort(t *testing.T) {
 		"low":     "low",
 		"medium":  "medium",
 		"high":    "high",
+		"max":     "max",
 		"":        "",
 		"turbo":   "",
 		"ultra":   "",

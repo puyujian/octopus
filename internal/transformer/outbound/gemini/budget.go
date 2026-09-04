@@ -34,7 +34,7 @@ import (
 // resolveThinkingConfig picks the right lever for a given model family and
 // falls back through three priority tiers:
 //   1. request.ReasoningBudget pointer (honors an explicit 0 or -1)
-//   2. request.ReasoningEffort string ("low" / "medium" / "high" / "minimal")
+//   2. request.ReasoningEffort string ("minimal" / "low" / "medium" / "high" / "max")
 //   3. model-family default (dynamic — Gemini decides)
 //
 // If the client set AdaptiveThinking the whole result reduces to the dynamic
@@ -272,7 +272,7 @@ func map25EffortToBudget(effort string) int32 {
 		return 1024
 	case "medium":
 		return 4096
-	case "high":
+	case "high", "max":
 		return 24576
 	default:
 		return -1
@@ -296,7 +296,7 @@ func map3EffortToLevel(effort string) string {
 		return "low"
 	case "medium":
 		return "medium"
-	case "high":
+	case "high", "max":
 		return "high"
 	default:
 		return ""

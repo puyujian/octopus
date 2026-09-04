@@ -17,7 +17,28 @@ const (
 	OutboundTypeGemini
 	OutboundTypeVolcengine
 	OutboundTypeOpenAIEmbedding
+	// OutboundTypeAuto is a persisted channel configuration mode. It must be
+	// resolved to one of the concrete outbound types before calling Get.
+	OutboundTypeAuto
 )
+
+func (t OutboundType) IsConcrete() bool {
+	switch t {
+	case OutboundTypeOpenAIChat,
+		OutboundTypeOpenAIResponse,
+		OutboundTypeAnthropic,
+		OutboundTypeGemini,
+		OutboundTypeVolcengine,
+		OutboundTypeOpenAIEmbedding:
+		return true
+	default:
+		return false
+	}
+}
+
+func (t OutboundType) Valid() bool {
+	return t.IsConcrete() || t == OutboundTypeAuto
+}
 
 // EmbeddingChannelTypes 定义支持 embedding 请求的 channel 类型集合
 var EmbeddingChannelTypes = map[OutboundType]bool{

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bestruirui/octopus/internal/channelroute"
 	"github.com/bestruirui/octopus/internal/helper"
 	"github.com/bestruirui/octopus/internal/model"
 	transformerModel "github.com/bestruirui/octopus/internal/transformer/model"
@@ -65,24 +66,7 @@ func (p *Prober) runCandidate(ctx context.Context, channel model.Channel, usedKe
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	request, err := buildProbeRequest(probeCtx, &channel, &usedKey, modelName)
-	if err != nil {
-		result.ErrorMessage = err.Error()
-		result.DurationMS = time.Since(startedAt).Milliseconds()
-		return result
-	}
-
-	applyCustomHeaders(request, channel.CustomHeader)
-	// 防止 Go 默认 User-Agent 泄露到上游
-	if request.Header.Get("User-Agent") == "" {
-		request.Header.Set("User-Agent", "")
-	}
-	if err := helper.ApplyParamOverrides(request, channel.ParamOverride, groupOverride); err != nil {
-		result.ErrorMessage = err.Error()
-		result.DurationMS = time.Since(startedAt).Milliseconds()
-		return result
-	}
-
+	effectiveType := channelroute.Resolve(channel, modelName, transformerModel.APIFormatOpenAIChatCompletion).Type
 	httpClient, err := helper.ChannelHTTPClientWithContext(probeCtx, &channel)
 	if err != nil {
 		result.ErrorMessage = err.Error()
@@ -90,61 +74,144 @@ func (p *Prober) runCandidate(ctx context.Context, channel model.Channel, usedKe
 		return result
 	}
 
-	response, err := httpClient.Do(request)
-	if err != nil {
-		result.ErrorMessage = err.Error()
+	excludedSemanticParams := make(map[string]struct{})
+	reasoningMaxDowngraded := false
+	for {
+		request, rawGroupOverride, buildErr := buildProbeRequestWithGroupOverride(probeCtx, &channel, &usedKey, modelName, groupOverride, excludedSemanticParams, reasoningMaxDowngraded)
+		if buildErr != nil {
+			result.ErrorMessage = buildErr.Error()
+			result.DurationMS = time.Since(startedAt).Milliseconds()
+			return result
+		}
+
+		applyCustomHeaders(request, channel.CustomHeader)
+		// 防止 Go 默认 User-Agent 泄露到上游
+		if request.Header.Get("User-Agent") == "" {
+			request.Header.Set("User-Agent", "")
+		}
+		semanticTransformedBody, _ := readProbeRequestBody(request)
+		if err := helper.ApplyParamOverrides(request, channel.ParamOverride, rawGroupOverride); err != nil {
+			result.ErrorMessage = err.Error()
+			result.DurationMS = time.Since(startedAt).Milliseconds()
+			return result
+		}
+		if err := helper.ReapplySemanticGroupWirePrecedence(request, semanticTransformedBody, groupOverride, effectiveType, excludedSemanticParams); err != nil {
+			result.ErrorMessage = err.Error()
+			result.DurationMS = time.Since(startedAt).Milliseconds()
+			return result
+		}
+
+		response, requestErr := httpClient.Do(request)
+		if requestErr != nil {
+			result.ErrorMessage = requestErr.Error()
+			result.DurationMS = time.Since(startedAt).Milliseconds()
+			return result
+		}
+		result.HTTPStatus = response.StatusCode
+		result.Header = response.Header.Clone()
 		result.DurationMS = time.Since(startedAt).Milliseconds()
+
+		if response.StatusCode >= 200 && response.StatusCode < 300 {
+			_ = response.Body.Close()
+			result.Success = true
+			return result
+		}
+
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 8*1024))
+		_ = response.Body.Close()
+		if response.StatusCode == http.StatusBadRequest {
+			if !reasoningMaxDowngraded && helper.RejectedUpstreamReasoningMax(groupOverride, body) {
+				reasoningMaxDowngraded = true
+				continue
+			}
+			rejectedWireParam := helper.RejectedUpstreamParameter(body)
+			semanticParam := helper.SemanticParamForRejectedWireName(groupOverride, rejectedWireParam)
+			if semanticParam != "" {
+				if _, alreadyExcluded := excludedSemanticParams[semanticParam]; !alreadyExcluded {
+					excludedSemanticParams[semanticParam] = struct{}{}
+					continue
+				}
+			}
+		}
+		if len(body) > 0 {
+			result.ErrorMessage = fmt.Sprintf("upstream error: %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
+		} else {
+			result.ErrorMessage = fmt.Sprintf("upstream error: %d", response.StatusCode)
+		}
 		return result
 	}
-	defer response.Body.Close()
+}
 
-	result.HTTPStatus = response.StatusCode
-	result.Header = response.Header.Clone()
-	result.DurationMS = time.Since(startedAt).Milliseconds()
-
-	if response.StatusCode >= 200 && response.StatusCode < 300 {
-		result.Success = true
-		return result
+func readProbeRequestBody(request *http.Request) ([]byte, error) {
+	if request == nil || request.Body == nil {
+		return nil, nil
 	}
-
-	body, _ := io.ReadAll(io.LimitReader(response.Body, 8*1024))
-	if len(body) > 0 {
-		result.ErrorMessage = fmt.Sprintf("upstream error: %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
-	} else {
-		result.ErrorMessage = fmt.Sprintf("upstream error: %d", response.StatusCode)
+	if request.GetBody != nil {
+		body, err := request.GetBody()
+		if err != nil {
+			return nil, err
+		}
+		defer body.Close()
+		return io.ReadAll(body)
 	}
-	return result
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
+		return nil, err
+	}
+	request.Body = io.NopCloser(bytes.NewReader(body))
+	request.ContentLength = int64(len(body))
+	return body, nil
 }
 
 func buildProbeRequest(ctx context.Context, channel *model.Channel, usedKey *model.ChannelKey, modelName string) (*http.Request, error) {
+	request, _, err := buildProbeRequestWithGroupOverride(ctx, channel, usedKey, modelName, nil, nil, false)
+	return request, err
+}
+
+func buildProbeRequestWithGroupOverride(ctx context.Context, channel *model.Channel, usedKey *model.ChannelKey, modelName string, groupOverride *string, excludedSemanticParams map[string]struct{}, reasoningMaxDowngraded bool) (*http.Request, *string, error) {
 	if channel == nil {
-		return nil, fmt.Errorf("channel is nil")
+		return nil, nil, fmt.Errorf("channel is nil")
 	}
 	if usedKey == nil {
-		return nil, fmt.Errorf("channel key is nil")
+		return nil, nil, fmt.Errorf("channel key is nil")
 	}
 	if strings.TrimSpace(usedKey.ChannelKey) == "" {
-		return nil, fmt.Errorf("channel key is empty")
+		return nil, nil, fmt.Errorf("channel key is empty")
 	}
 	if strings.TrimSpace(modelName) == "" {
-		return nil, fmt.Errorf("model name is empty")
+		return nil, nil, fmt.Errorf("model name is empty")
 	}
 
-	protocol := classifyProbeProtocol(channel.Type, modelName)
+	resolution := channelroute.Resolve(*channel, modelName, transformerModel.APIFormatOpenAIChatCompletion)
+	effectiveType := resolution.Type
+	protocol := probeProtocolChannel
+	if channel.Type != outbound.OutboundTypeAuto || (resolution.Source != channelroute.SourceOverride && resolution.Source != channelroute.SourceLearned) {
+		protocol = classifyProbeProtocol(effectiveType, modelName)
+	} else if effectiveType == outbound.OutboundTypeOpenAIEmbedding {
+		protocol = probeProtocolEmbedding
+	}
 	if protocol == probeProtocolRerank {
-		return buildRerankProbeRequest(ctx, channel.GetBaseUrl(), usedKey.ChannelKey, modelName)
+		request, err := buildRerankProbeRequest(ctx, channel.GetBaseUrl(), usedKey.ChannelKey, modelName)
+		return request, nil, err
 	}
 
-	effectiveType := channel.Type
 	if protocol == probeProtocolEmbedding {
 		effectiveType = outbound.OutboundTypeOpenAIEmbedding
 	}
 	request := buildProbeInternalRequest(effectiveType, modelName)
+	rawGroupOverride, err := helper.PrepareSemanticGroupParamOverride(request, groupOverride, effectiveType, excludedSemanticParams)
+	if err != nil {
+		return nil, nil, err
+	}
+	if reasoningMaxDowngraded && request.ReasoningEffort == "max" {
+		request.ReasoningEffort = "high"
+	}
 	adapter := outbound.Get(effectiveType)
 	if adapter == nil {
-		return nil, fmt.Errorf("unsupported outbound type: %d", effectiveType)
+		return nil, nil, fmt.Errorf("unsupported outbound type: %d", effectiveType)
 	}
-	return adapter.TransformRequest(ctx, request, channel.GetBaseUrl(), usedKey.ChannelKey)
+	outboundRequest, err := adapter.TransformRequest(ctx, request, channel.GetBaseUrl(), usedKey.ChannelKey)
+	return outboundRequest, rawGroupOverride, err
 }
 
 // classifyProbeProtocol keeps explicitly configured non-Chat channels on their

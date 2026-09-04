@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bestruirui/octopus/internal/channelroute"
 	dbmodel "github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/op"
 	"github.com/bestruirui/octopus/internal/relay/balancer"
@@ -506,6 +507,11 @@ func runWSRelay(ctx context.Context, req *relayRequest, group *dbmodel.Group) ws
 			req.iter.Skip(channel.ID, 0, channel.Name, "channel disabled")
 			continue
 		}
+		configuredChannel := channel
+		resolution := channelroute.Resolve(*configuredChannel, item.ModelName, req.internalRequest.RawAPIFormat)
+		effectiveChannel := *configuredChannel
+		effectiveChannel.Type = resolution.Type
+		channel = &effectiveChannel
 
 		outAdapter := outbound.Get(channel.Type)
 		if outAdapter == nil {
@@ -544,10 +550,11 @@ func runWSRelay(ctx context.Context, req *relayRequest, group *dbmodel.Group) ws
 			continue
 		}
 
-		log.Debugf("ws request model %s, forwarding to channel: %s model: %s (attempt %d/%d)",
-			req.requestModel, channel.Name, item.ModelName, req.iter.Index()+1, req.iter.Len())
+		log.Debugf("ws request model %s, forwarding to channel: %s model: %s route=%d source=%s (attempt %d/%d)",
+			req.requestModel, channel.Name, item.ModelName, resolution.Type, resolution.Source, req.iter.Index()+1, req.iter.Len())
 
 		var result attemptResult
+		protocolFallbackUsed := false
 		for retryNum := 0; retryNum < maxSameChannelRetries; retryNum++ {
 			if retryNum > 0 {
 				delay := computeBackoff(retryNum, result.RetryAfter)
@@ -575,6 +582,39 @@ func runWSRelay(ctx context.Context, req *relayRequest, group *dbmodel.Group) ws
 			}
 
 			result = ra.attempt()
+			if !protocolFallbackUsed && !replayExact &&
+				configuredChannel.Type == outbound.OutboundTypeAuto &&
+				resolution.Source != channelroute.SourceOverride &&
+				resolution.Source != channelroute.SourceRequired &&
+				!result.Success && !result.Written && !result.Canceled && !result.ResetConversation && !result.FirstTokenTimeout {
+				suggested, mismatch := detectProtocolFallback(result.StatusCode, inbound.InboundTypeOpenAIResponse, result.Err)
+				if mismatch {
+					if fallbackType, ok := channelroute.Fallback(*configuredChannel, channel.Type, suggested); ok {
+						fallbackChannel := *configuredChannel
+						fallbackChannel.Type = fallbackType
+						fallbackAdapter := outbound.Get(fallbackType)
+						if fallbackAdapter != nil && outbound.IsChatChannelType(fallbackType) {
+							protocolFallbackUsed = true
+							fallbackAttempt := &relayAttempt{
+								relayRequest:         req,
+								outAdapter:           fallbackAdapter,
+								channel:              &fallbackChannel,
+								usedKey:              usedKey,
+								firstTokenTimeOutSec: group.FirstTokenTimeOut,
+							}
+							log.Infof("auto ws route fallback channel=%d model=%s from=%d to=%d status=%d", configuredChannel.ID, item.ModelName, channel.Type, fallbackType, result.StatusCode)
+							result = fallbackAttempt.attempt()
+							if result.Success {
+								if err := op.ChannelModelRouteLearn(configuredChannel.ID, item.ModelName, fallbackType, relayCtx); err != nil {
+									log.Warnf("failed to persist auto ws route channel=%d model=%s: %v", configuredChannel.ID, item.ModelName, err)
+								}
+								channel = &fallbackChannel
+								outAdapter = fallbackAdapter
+							}
+						}
+					}
+				}
+			}
 			if result.Success || result.Written || result.Canceled || result.ResetConversation || !isRetryableStatus(result.StatusCode) {
 				break
 			}

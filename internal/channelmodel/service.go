@@ -13,10 +13,13 @@ import (
 	"time"
 
 	"github.com/bestruirui/octopus/internal/apperror"
+	"github.com/bestruirui/octopus/internal/channelroute"
 	"github.com/bestruirui/octopus/internal/db"
 	"github.com/bestruirui/octopus/internal/grouphealth"
 	"github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/op"
+	transformermodel "github.com/bestruirui/octopus/internal/transformer/model"
+	"github.com/bestruirui/octopus/internal/transformer/outbound"
 	"github.com/bestruirui/octopus/internal/utils/safe"
 	"gorm.io/gorm/clause"
 )
@@ -32,8 +35,8 @@ func targetKey(target model.ChannelModelHealthTarget) string {
 
 func fingerprint(channel model.Channel) string {
 	type config struct {
-		Type, URLs, Proxy, ProxyID, Headers, Param, Models any
-		Keys                                               []string
+		Type, URLs, Proxy, ProxyID, Headers, Param, Models, ModelRoutes any
+		Keys                                                            []string
 	}
 	keys := make([]string, 0, len(channel.Keys))
 	for _, key := range channel.Keys {
@@ -44,7 +47,7 @@ func fingerprint(channel model.Channel) string {
 		keys = append(keys, fmt.Sprintf("%d:%s", key.ID, hex.EncodeToString(digest[:])))
 	}
 	sort.Strings(keys)
-	encoded, _ := json.Marshal(config{channel.Type, channel.BaseUrls, channel.ProxyMode, channel.ProxyConfigID, channel.CustomHeader, channel.ParamOverride, channel.Model + "\x00" + channel.CustomModel, keys})
+	encoded, _ := json.Marshal(config{channel.Type, channel.BaseUrls, channel.ProxyMode, channel.ProxyConfigID, channel.CustomHeader, channel.ParamOverride, channel.Model + "\x00" + channel.CustomModel, channel.ModelRoutes.Normalize(), keys})
 	digest := sha256.Sum256(encoded)
 	return hex.EncodeToString(digest[:])
 }
@@ -166,6 +169,30 @@ func runTarget(ctx context.Context, target model.ChannelModelHealthTarget) error
 		usedKey = key
 		result = grouphealth.NewProber().RunCandidate(ctx, *channel, key, target.ModelName)
 		totalDuration += result.DurationMS
+		resolution := channelroute.Resolve(*channel, target.ModelName, transformermodel.APIFormatOpenAIChatCompletion)
+		if !result.Success && channel.Type == outbound.OutboundTypeAuto && resolution.Source != channelroute.SourceOverride && resolution.Source != channelroute.SourceRequired {
+			suggested, hasSuggested, mismatch := channelroute.DetectMismatch(result.HTTPStatus, result.ErrorMessage)
+			if mismatch {
+				if !hasSuggested {
+					suggested = outbound.OutboundTypeAuto
+				}
+				if fallbackType, ok := channelroute.Fallback(*channel, resolution.Type, suggested); ok {
+					fallbackChannel := *channel
+					fallbackChannel.Type = fallbackType
+					fallbackResult := grouphealth.NewProber().RunCandidate(ctx, fallbackChannel, key, target.ModelName)
+					totalDuration += fallbackResult.DurationMS
+					result = fallbackResult
+					if result.Success {
+						if err := op.ChannelModelRouteLearn(channel.ID, target.ModelName, fallbackType, ctx); err == nil {
+							if updated, getErr := op.ChannelGet(channel.ID, ctx); getErr == nil {
+								channel = updated
+								configFingerprint = fingerprint(*updated)
+							}
+						}
+					}
+				}
+			}
+		}
 		if result.Success || !shouldTryNextKey(result) {
 			break
 		}

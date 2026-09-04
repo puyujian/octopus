@@ -62,6 +62,8 @@ export function CardContent({ channel, stats }: { channel: Channel; stats: Stats
         auto_sync: channel.auto_sync,
         auto_group: channel.auto_group,
         match_regex: channel.match_regex ?? '',
+        model_routes: channel.model_routes,
+        reset_learned_models: [],
     });
     const t = useTranslations('channel.detail');
     const tProxy = useTranslations('proxyPool');
@@ -81,6 +83,21 @@ export function CardContent({ channel, stats }: { channel: Channel; stats: Stats
         // only send changed fields to avoid accidental clears
         if (formData.name !== channel.name) req.name = formData.name;
         if (formData.type !== channel.type) req.type = formData.type;
+
+        const currentRouteConfig = {
+            fallback_type: channel.model_routes.fallback_type,
+            overrides: channel.model_routes.overrides ?? {},
+        };
+        const nextRouteConfig = {
+            fallback_type: formData.model_routes.fallback_type,
+            overrides: formData.model_routes.overrides ?? {},
+        };
+        if (JSON.stringify(nextRouteConfig) !== JSON.stringify(currentRouteConfig)) {
+            req.model_routes = nextRouteConfig;
+        }
+        if (formData.reset_learned_models.length > 0) {
+            req.reset_learned_models = formData.reset_learned_models;
+        }
         if (formData.enabled !== channel.enabled) req.enabled = formData.enabled;
         if (!baseUrlsEqual(formData.base_urls, channel.base_urls)) {
             req.base_urls = (formData.base_urls ?? []).filter((u) => u.url.trim()).map((u) => ({

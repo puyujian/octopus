@@ -544,7 +544,7 @@ func reasoningToThinkingBudget(effort string) int32 {
 		return 1024
 	case "medium":
 		return 4096
-	case "high":
+	case "high", "max":
 		return 24576
 	default:
 		// 防御性：未知值走动态

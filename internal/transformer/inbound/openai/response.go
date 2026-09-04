@@ -2501,7 +2501,7 @@ func generateItemID() string {
 // fall back to the provider default.
 func validateReasoningEffort(effort string) string {
 	switch effort {
-	case "minimal", "low", "medium", "high":
+	case "minimal", "low", "medium", "high", "max":
 		return effort
 	case "":
 		return ""

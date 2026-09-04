@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -48,6 +49,10 @@ func init() {
 		)
 	router.NewGroupRouter("/api/v1/channel").
 		Use(middleware.Auth()).
+		AddRoute(
+			router.NewRoute("/sync-models/:id", http.MethodPost).
+				Handle(syncChannelModels),
+		).
 		AddRoute(
 			router.NewRoute("/sync", http.MethodPost).
 				Handle(syncChannel),
@@ -207,6 +212,26 @@ func fetchModel(c *gin.Context) {
 		return
 	}
 	resp.Success(c, models)
+}
+
+func syncChannelModels(c *gin.Context) {
+	channelID, err := strconv.Atoi(c.Param("id"))
+	if err != nil || channelID <= 0 {
+		resp.InvalidParam(c)
+		return
+	}
+	result, err := task.SyncChannelModels(c.Request.Context(), channelID)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, task.ErrChannelModelSyncManaged) {
+			status = http.StatusBadRequest
+		} else if errors.Is(err, task.ErrChannelModelSyncInProgress) {
+			status = http.StatusConflict
+		}
+		resp.ErrorWithAppError(c, status, channelError(codeChannelSyncModelsFailed, "channel model sync failed", err).WithStatus(status))
+		return
+	}
+	resp.Success(c, result)
 }
 
 func syncChannel(c *gin.Context) {

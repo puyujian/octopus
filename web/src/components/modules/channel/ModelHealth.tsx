@@ -20,7 +20,9 @@ import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectSeparator, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Switch } from '@/components/ui/switch';
 import { cn } from '@/lib/utils';
+import { useSyncChannelModels, useUpdateChannel } from '@/api/endpoints/channel';
 
 const keyOf = (target: ChannelModelTarget) => `${target.channel_id}\u0000${target.model_name}`;
 
@@ -322,11 +324,18 @@ export function ChannelModelActionButtons({
     );
 }
 
-export function ChannelModelHealthPanel({ targets }: { targets: ChannelModelTarget[] }) {
+export function ChannelModelHealthPanel({ channelId, autoSync, targets }: { channelId: number; autoSync: boolean; targets: ChannelModelTarget[] }) {
     const t = useTranslations('channelModel');
     const healthQuery = useChannelModelHealth(targets);
+    const runHealth = useRunChannelModelHealth();
+    const syncModels = useSyncChannelModels();
+    const updateChannel = useUpdateChannel();
+    const [groupTarget, setGroupTarget] = useState<ChannelModelTarget | null>(null);
+    const [autoSyncOverride, setAutoSyncOverride] = useState<boolean | null>(null);
     const healthByKey = useMemo(() => new Map((healthQuery.data ?? []).map((row) => [keyOf(row), row])), [healthQuery.data]);
     const healthy = targets.filter((target) => healthByKey.get(keyOf(target))?.status === 'success').length;
+    const probingKey = runHealth.isPending && runHealth.variables?.length === 1 ? keyOf(runHealth.variables[0]) : null;
+    const effectiveAutoSync = autoSyncOverride ?? autoSync;
     return (
         <section className="space-y-3">
             <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -334,6 +343,50 @@ export function ChannelModelHealthPanel({ targets }: { targets: ChannelModelTarg
                     <Activity className="size-3.5" />{t('title')} · {healthQuery.isLoading ? t('loading') : `${healthy}/${targets.length}`}
                 </h4>
                 <ChannelModelActionButtons targets={targets} compact className="w-full sm:w-auto" />
+            </div>
+            <div className="flex flex-col gap-3 rounded-2xl border border-border/70 bg-muted/20 p-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="min-w-0">
+                    <div className="text-sm font-medium">{t('upstreamSync.title')}</div>
+                    <div className="mt-0.5 text-xs text-muted-foreground">{t('upstreamSync.description')}</div>
+                </div>
+                <div className="grid shrink-0 grid-cols-2 gap-2 sm:flex sm:items-center">
+                    <label className="flex h-8 items-center justify-center gap-2 rounded-xl border border-border/70 bg-background px-2 text-xs">
+                        <Switch
+                            checked={effectiveAutoSync}
+                            disabled={updateChannel.isPending}
+                            aria-label={t('upstreamSync.auto')}
+                            onCheckedChange={(checked) => {
+                                setAutoSyncOverride(checked);
+                                updateChannel.mutate({ id: channelId, auto_sync: checked }, {
+                                    onSuccess: () => toast.success(t(checked ? 'toast.autoSyncEnabled' : 'toast.autoSyncDisabled')),
+                                    onError: (error) => {
+                                        setAutoSyncOverride(null);
+                                        toast.error(t('toast.autoSyncFailed'), { description: error.message });
+                                    },
+                                });
+                            }}
+                        />
+                        <span>{t('upstreamSync.auto')}</span>
+                    </label>
+                    <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-8 rounded-xl px-2 text-xs"
+                        disabled={syncModels.isPending}
+                        onClick={() => syncModels.mutate(channelId, {
+                            onSuccess: (result) => toast.success(t('toast.syncSuccess', {
+                                total: result.model_count,
+                                added: result.added_models?.length ?? 0,
+                                removed: result.removed_models?.length ?? 0,
+                            })),
+                            onError: (error) => toast.error(t('toast.syncFailed'), { description: error.message }),
+                        })}
+                    >
+                        <RefreshCw className={cn('size-3.5', syncModels.isPending && 'animate-spin')} />
+                        {t('upstreamSync.manual')}
+                    </Button>
+                </div>
             </div>
             <div className="max-h-56 space-y-1.5 overflow-y-auto overscroll-contain rounded-2xl border bg-card p-2">
                 {targets.map((target) => {
@@ -348,12 +401,43 @@ export function ChannelModelHealthPanel({ targets }: { targets: ChannelModelTarg
                                     {health?.duration_ms ? <span className="text-right text-xs tabular-nums text-muted-foreground">{health.duration_ms}ms</span> : null}
                                 </div>
                                 {health?.error_message ? <div className="mt-1 line-clamp-2 break-all text-xs text-destructive">{health.error_message}</div> : null}
+                                <div className="mt-2 flex flex-wrap justify-end gap-1.5">
+                                    <Button
+                                        type="button"
+                                        variant="outline"
+                                        size="sm"
+                                        className="h-7 rounded-lg px-2 text-xs"
+                                        disabled={runHealth.isPending}
+                                        aria-label={t('probeModel', { model: target.model_name })}
+                                        title={t('probeModel', { model: target.model_name })}
+                                        onClick={() => runHealth.mutate([target], {
+                                            onSuccess: (result) => toast.success(t('toast.probeStarted', { count: result.count })),
+                                            onError: (error) => toast.error(t('toast.probeFailed'), { description: error.message }),
+                                        })}
+                                    >
+                                        {probingKey === keyOf(target) ? <LoaderCircle className="size-3.5 animate-spin" /> : <Activity className="size-3.5" />}
+                                        {t('probe')}
+                                    </Button>
+                                    <Button
+                                        type="button"
+                                        variant="outline"
+                                        size="sm"
+                                        className="h-7 rounded-lg px-2 text-xs"
+                                        onClick={() => setGroupTarget(target)}
+                                        aria-label={t('joinModel', { model: target.model_name })}
+                                        title={t('joinModel', { model: target.model_name })}
+                                    >
+                                        <Sparkles className="size-3.5" />
+                                        {t('join')}
+                                    </Button>
+                                </div>
                             </div>
                         </div>
                     );
                 })}
                 {targets.length === 0 && <div className="py-4 text-center text-sm text-muted-foreground">{t('empty')}</div>}
             </div>
+            <SmartGroupDialog targets={groupTarget ? [groupTarget] : []} open={groupTarget !== null} onOpenChange={(open) => !open && setGroupTarget(null)} />
         </section>
     );
 }

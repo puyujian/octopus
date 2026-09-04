@@ -24,6 +24,7 @@ const (
 	codeChannelUpdateFailed      = "channel.update_failed"
 	codeChannelDeleteFailed      = "channel.delete_failed"
 	codeChannelFetchModelsFailed = "channel.fetch_models_failed"
+	codeChannelSyncModelsFailed  = "channel.sync_models_failed"
 
 	codeGroupNotFound     = "group.not_found"
 	codeGroupCreateFailed = "group.create_failed"

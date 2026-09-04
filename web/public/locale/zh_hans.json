@@ -856,9 +856,10 @@
         }
     },
     "channelModel": {
-        "title": "模型测活", "probe": "测活", "smartGroup": "智能加入分组", "loading": "加载中...", "empty": "暂无模型", "cancel": "取消",
+        "title": "模型测活", "probe": "测活", "probeModel": "测活模型 {model}", "join": "加入", "joinModel": "将模型 {model} 加入分组", "smartGroup": "智能加入分组", "loading": "加载中...", "empty": "暂无模型", "cancel": "取消",
+        "upstreamSync": { "title": "上游模型同步", "description": "从当前渠道重新拉取完整模型列表", "auto": "自动同步", "manual": "立即同步" },
         "status": { "idle": "未检查", "queued": "排队中", "running": "检查中", "success": "健康", "failed": "失败", "stale": "已过期", "interrupted": "已中断" },
-        "toast": { "probeStarted": "已开始测活 {count} 个模型", "probeFailed": "启动测活失败", "groupApplied": "已加入 {added} 个模型，已有 {existing} 个", "groupFailed": "加入分组失败" },
+        "toast": { "probeStarted": "已开始测活 {count} 个模型", "probeFailed": "启动测活失败", "groupApplied": "已加入 {added} 个模型，已有 {existing} 个", "groupFailed": "加入分组失败", "syncSuccess": "同步完成：共 {total} 个，新增 {added} 个，移除 {removed} 个", "syncFailed": "同步上游模型失败", "autoSyncEnabled": "已开启自动同步", "autoSyncDisabled": "已关闭自动同步", "autoSyncFailed": "更新自动同步失败" },
         "group": { "title": "智能加入分组", "description": "系统按精准匹配、模糊匹配、建议新建排序；仅健康模型默认选中，未测活或失败模型需二次确认，已有或已排除成员不会自动恢复。", "select": "选择目标分组", "existing": "已存在", "excluded": "已排除", "create": "新建分组", "unmatched": "暂无匹配建议", "otherGroups": "其他分组", "selectedCount": "已选 {count} 个模型", "selectHealthy": "仅选健康", "clearSelection": "清空", "apply": "加入 {count} 个", "confirmForce": "确认强制加入", "forceWarning": "其中 {count} 个模型未通过最近测活，确认仍要加入？", "bucket": { "precise": { "title": "精准匹配", "description": "名称完全一致或正则规则命中" }, "fuzzy": { "title": "模糊匹配", "description": "分组名称包含于模型名称" }, "create": { "title": "建议新建", "description": "没有可用匹配，以模型名新建分组" } }, "reason": { "exact": "精确匹配", "regex": "正则匹配", "fuzzy": "模糊匹配" } }
     },
     "channel": {

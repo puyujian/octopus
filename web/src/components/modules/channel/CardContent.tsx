@@ -304,7 +304,11 @@ export function CardContent({ channel, stats }: { channel: Channel; stats: Stats
                                     </div>
                                 </dl>
 
-                                <ChannelModelHealthPanel targets={channelModels.map((modelName) => ({ channel_id: channel.id, model_name: modelName }))} />
+                                <ChannelModelHealthPanel
+                                    channelId={channel.id}
+                                    autoSync={channel.auto_sync}
+                                    targets={channelModels.map((modelName) => ({ channel_id: channel.id, model_name: modelName }))}
+                                />
 
                                 {/* 请求详情 */}
                                 <section className="space-y-3">

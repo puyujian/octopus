@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/bestruirui/octopus/internal/helper"
-	"github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/op"
 	"github.com/bestruirui/octopus/internal/utils/diff"
 	"github.com/bestruirui/octopus/internal/utils/log"
@@ -35,14 +34,20 @@ func SyncModelsTask() {
 		if !channel.AutoSync {
 			continue
 		}
-		fetchModels, err := helper.FetchModels(ctx, channel)
+		syncResult, err := SyncChannelModels(ctx, channel.ID)
 		if err != nil {
-			log.Warnf("failed to fetch models for channel %s: %v", channel.Name, err)
+			log.Warnf("failed to sync models for channel %s: %v", channel.Name, err)
+			for _, modelName := range xstrings.SplitTrimCompact(",", channel.Model) {
+				key := strings.ToLower(modelName)
+				if _, ok := seenTotalNewModels[key]; ok {
+					continue
+				}
+				seenTotalNewModels[key] = struct{}{}
+				totalNewModels = append(totalNewModels, key)
+			}
 			continue
 		}
-		oldModels := xstrings.SplitTrimCompact(",", channel.Model)
-		newModels := xstrings.TrimCompact(fetchModels)
-		for _, m := range newModels {
+		for _, m := range syncResult.Models {
 			m = strings.TrimSpace(m)
 			if m == "" {
 				continue
@@ -54,32 +59,8 @@ func SyncModelsTask() {
 			seenTotalNewModels[m] = struct{}{}
 			totalNewModels = append(totalNewModels, m)
 		}
-		deletedModels, addedModels := diff.Diff(oldModels, newModels)
-		if len(deletedModels) > 0 || len(addedModels) > 0 {
-			fetchModelStr := strings.Join(newModels, ",")
-			if _, err := op.ChannelUpdate(&model.ChannelUpdateRequest{
-				ID:    channel.ID,
-				Model: &fetchModelStr,
-			}, ctx); err != nil {
-				log.Errorf("failed to update channel %s: %v", channel.Name, err)
-				continue
-			}
-		}
-		// 批量删除消失的模型对应的 GroupItem
-		if len(deletedModels) > 0 {
-			log.Infof("deleted channel %s models: %v", channel.Name, deletedModels)
-			keys := make([]model.GroupIDAndLLMName, len(deletedModels))
-			for i, m := range deletedModels {
-				keys[i] = model.GroupIDAndLLMName{ChannelID: channel.ID, ModelName: m}
-			}
-			if err := op.GroupItemBatchDelByChannelAndModels(keys, ctx); err != nil {
-				log.Errorf("failed to batch delete group items for channel %s: %v", channel.Name, err)
-			}
-		}
-
-		// 自动分组
-		if len(newModels) > 0 {
-			helper.ChannelAutoGroup(&channel, ctx)
+		if len(syncResult.RemovedModels) > 0 {
+			log.Infof("deleted channel %s models: %v", channel.Name, syncResult.RemovedModels)
 		}
 	}
 	llmPrice, err := op.LLMList(ctx)

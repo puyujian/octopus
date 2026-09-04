@@ -157,6 +157,13 @@ export type FetchModelRequest = {
     custom_header?: CustomHeader[];
 };
 
+export type ChannelModelSyncResult = {
+    channel_id: number;
+    model_count: number;
+    added_models: string[];
+    removed_models: string[];
+};
+
 /**
  * 获取渠道列表 Hook
  * 
@@ -362,6 +369,31 @@ export function useFetchModel() {
         },
         onError: (error) => {
             logger.error('模型列表获取失败:', error);
+        },
+    });
+}
+
+export function useSyncChannelModels() {
+    const queryClient = useQueryClient();
+    return useMutation({
+        mutationFn: async (channelId: number) => {
+            const result = await apiClient.post<ChannelModelSyncResult>(`/api/v1/channel/sync-models/${channelId}`);
+            return {
+                ...result,
+                added_models: result.added_models ?? [],
+                removed_models: result.removed_models ?? [],
+            };
+        },
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['channels', 'list'] });
+            queryClient.invalidateQueries({ queryKey: ['models', 'channel'] });
+            queryClient.invalidateQueries({ queryKey: ['models', 'list'] });
+            queryClient.invalidateQueries({ queryKey: ['groups', 'list'] });
+            queryClient.invalidateQueries({ queryKey: ['channel-model-health'] });
+            queryClient.invalidateQueries({ queryKey: ['channel-model-group-preview'] });
+        },
+        onError: (error) => {
+            logger.error('渠道模型同步失败:', error);
         },
     });
 }

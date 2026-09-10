@@ -8,6 +8,8 @@ func TestUnsupportedUpstreamParameter(t *testing.T) {
 		want string
 	}{
 		{`{"detail":"Unsupported parameter: reasoning_effort"}`, "reasoning_effort"},
+		{"{\"error\":{\"message\":\"Validation: Unsupported parameter(s): `prompt_cache_key`\",\"type\":\"bad_response_status_code\"}}", "prompt_cache_key"},
+		{`{"detail":"Unsupported parameters: 'reasoning_effort', 'temperature'"}`, "reasoning_effort"},
 		{`{"error":{"message":"Unknown parameter 'reasoning.effort'"}}`, "reasoning.effort"},
 		{`{"message":"unrecognized parameter = generationConfig.thinkingConfig"}`, "generationConfig.thinkingConfig"},
 		{`{"detail":"invalid value for reasoning_effort"}`, ""},

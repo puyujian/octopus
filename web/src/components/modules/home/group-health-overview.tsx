@@ -7,7 +7,8 @@ import { useGroupHealthList, useRunAllGroupHealth, useRunGroupHealth, type Group
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
-import { GroupHealthAttemptDetails, GroupHealthExcludedItems } from '../group/health';
+import { GroupHealthAttemptDetails, GroupHealthExcludedItems, GroupHealthReorderAction } from '../group/health';
+import { useGroupHealthReorder } from '../group/use-health-reorder';
 
 function formatDateTime(value?: string | null, fallback?: string) {
     if (!value) return fallback ?? '';
@@ -56,11 +57,13 @@ function GroupHealthCard({
 }) {
     const t = useTranslations('group.health');
     const [expanded, setExpanded] = useState(false);
-    const { attempts, successCount } = summarize(view);
+    const { successCount } = summarize(view);
+    const ordering = useGroupHealthReorder(view, isRunningMutation);
+    const { attempts } = ordering;
     const latest = view.latest;
     return (
         <article className="min-w-0 overflow-hidden rounded-3xl border border-border/70 bg-card p-3.5">
-            <header className="flex items-start justify-between gap-3">
+            <header className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div className="min-w-0">
                     <div className="flex items-center gap-2">
                         <FolderTree className="size-4 text-primary" />
@@ -70,7 +73,7 @@ function GroupHealthCard({
                         {t('lastRun', { time: formatDateTime(latest?.finished_at ?? latest?.started_at ?? null, t('never')) })}
                     </div>
                 </div>
-                <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
+                <div className="flex shrink-0 flex-wrap items-center gap-1.5 sm:justify-end">
                     <Badge variant="outline" className={cn('h-6 px-2 text-[11px]', latest ? statusTone(latest.status) : 'border-border bg-muted/40 text-muted-foreground')}>
                         {t(`statusValue.${latest?.status ?? 'idle'}`)}
                     </Badge>
@@ -82,7 +85,7 @@ function GroupHealthCard({
                         size="sm"
                         variant="outline"
                         className="h-7 rounded-xl px-2 text-xs"
-                        disabled={isRunningMutation || latest?.status === 'running'}
+                        disabled={isRunningMutation || latest?.status === 'running' || ordering.isPending}
                         onClick={() => onRun(view.group_id)}
                     >
                         {latest?.status === 'running' ? <LoaderCircle className="size-4 animate-spin" /> : <Play className="size-4" />}
@@ -93,7 +96,7 @@ function GroupHealthCard({
                         size="sm"
                         variant="outline"
                         className="h-7 rounded-xl px-2 text-xs"
-                        disabled={isRunningMutation || latest?.status === 'running'}
+                        disabled={isRunningMutation || latest?.status === 'running' || ordering.isPending}
                         onClick={() => onRun(view.group_id, 'full')}
                     >
                         <Play className="size-4" />
@@ -125,10 +128,13 @@ function GroupHealthCard({
                     </button>
 
                     {expanded ? (
-                        <div className="flex max-h-[22rem] flex-col gap-2 overflow-y-auto pr-1">
-                            {attempts.map((attempt) => (
-                                <GroupHealthAttemptDetails key={attempt.id} attempt={attempt} groupId={view.group_id} activeItemCount={view.active_item_count} />
-                            ))}
+                        <div className="space-y-2">
+                            <GroupHealthReorderAction ordering={ordering} />
+                            <div className="flex max-h-[22rem] flex-col gap-2 overflow-y-auto pr-1">
+                                {attempts.map((attempt) => (
+                                    <GroupHealthAttemptDetails key={attempt.id} attempt={attempt} groupId={view.group_id} activeItemCount={view.active_item_count} />
+                                ))}
+                            </div>
                         </div>
                     ) : null}
                 </div>

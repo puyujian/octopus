@@ -110,6 +110,12 @@ func (o *ChatOutbound) TransformRequest(ctx context.Context, request *model.Inte
 	if request == nil {
 		return nil, fmt.Errorf("request is nil")
 	}
+	// DeepSeek V4 exposes its reasoning stream through the provider-native
+	// `thinking` switch. Responses clients do not have an equivalent Chat
+	// field, so add the provider default only when a Responses request is
+	// being translated to Chat Completions. This keeps ordinary Chat requests
+	// unchanged and still lets an explicit setting win.
+	applyDeepSeekResponsesThinkingDefault(request)
 	request.NormalizeMessages()
 	request.FlattenUnsupportedBlocks(model.AlternationProviderOpenAI)
 
@@ -285,6 +291,21 @@ func isReasoningChatModel(modelName string) bool {
 		return true
 	}
 	return false
+}
+
+func applyDeepSeekResponsesThinkingDefault(request *model.InternalLLMRequest) {
+	if request == nil || request.Thinking != nil || request.RawAPIFormat != model.APIFormatOpenAIResponse {
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(request.ReasoningEffort), "none") || !isDeepSeekV4Model(request.Model) {
+		return
+	}
+	request.Thinking = &model.ThinkingConfig{Type: "enabled"}
+}
+
+func isDeepSeekV4Model(modelName string) bool {
+	name := strings.ToLower(strings.TrimSpace(modelName))
+	return strings.Contains(name, "deepseek") && strings.Contains(name, "v4")
 }
 
 func convertToolsToChatCompletions(tools []model.Tool) []ChatCompletionsTool {

@@ -34,7 +34,7 @@ var supportedSemanticGroupParams = map[string]struct{}{
 	SemanticParamReasoningEffort: {},
 }
 
-var unsupportedParameterPattern = regexp.MustCompile(`(?i)(?:unsupported|unknown|unrecognized)\s+parameter(?:s)?\s*(?::|=|is)?\s*[\x60'\"]?([a-zA-Z0-9_.-]+)`)
+var unsupportedParameterPattern = regexp.MustCompile(`(?i)(?:unsupported|unknown|unrecognized)\s+parameter(?:s|\(s\))?\s*(?::|=|is)?\s*[\x60'\"]?([a-zA-Z0-9_.-]+)`)
 
 var rejectedReasoningMaxValuePattern = regexp.MustCompile(`(?i)(?:unsupported|invalid)\s+(?:parameter\s+)?value|(?:value\s+)?[\x60'\"]?max[\x60'\"]?\s+is\s+not\s+supported`)
 

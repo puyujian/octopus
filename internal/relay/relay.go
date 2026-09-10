@@ -1167,8 +1167,8 @@ func mergeBetaHeader(existing, incoming string) string {
 	return strings.Join(merged, ",")
 }
 
-// sendRequest 发送 HTTP 请求
-func (ra *relayAttempt) sendRequest(req *http.Request) (*http.Response, error) {
+// sendRequestOnce sends one HTTP request without compatibility retries.
+func (ra *relayAttempt) sendRequestOnce(req *http.Request) (*http.Response, error) {
 	httpClient, err := helper.ChannelHTTPClientWithContext(req.Context(), ra.channel)
 	if err != nil {
 		log.Warnf("failed to get http client: %v", err)

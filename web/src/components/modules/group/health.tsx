@@ -1,7 +1,7 @@
 'use client';
 
 import { useMemo, useState } from 'react';
-import { Activity, ChevronDown, Clock3, LoaderCircle, Play, RotateCcw, ShieldMinus } from 'lucide-react';
+import { Activity, ArrowDownWideNarrow, ChevronDown, Clock3, LoaderCircle, Play, RotateCcw, ShieldMinus } from 'lucide-react';
 import { useLocale, useTranslations } from 'next-intl';
 import { toast } from 'sonner';
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog';
@@ -32,6 +32,23 @@ import {
     type GroupHealthProbeMode,
     type GroupHealthStatus,
 } from '@/api/endpoints/group-health';
+import { useGroupHealthReorder } from './use-health-reorder';
+
+export function GroupHealthReorderAction({ ordering }: { ordering: ReturnType<typeof useGroupHealthReorder> }) {
+    const t = useTranslations('group.health');
+    return (
+        <div className="flex flex-col gap-2 rounded-2xl border border-border/60 bg-muted/20 p-3 sm:flex-row sm:items-center sm:justify-between">
+            <p className="min-w-0 text-xs leading-relaxed text-muted-foreground">
+                {t('reorderDescription')}
+                {!ordering.hasSpeedResults && <span className="mt-1 block">{t('reorderNoResults')}</span>}
+            </p>
+            <Button type="button" size="sm" variant="outline" className="shrink-0 rounded-xl" disabled={!ordering.canReorder} onClick={ordering.reorder}>
+                {ordering.isPending ? <LoaderCircle className="size-4 animate-spin" /> : <ArrowDownWideNarrow className="size-4" />}
+                {t('reorder')}
+            </Button>
+        </div>
+    );
+}
 
 function formatDateTime(value?: string | null) {
     if (!value) return 'Never';
@@ -215,7 +232,8 @@ export function GroupHealthBadge({ groupId }: { groupId?: number }) {
         [groupId, views]
     );
     const latest = view?.latest ?? null;
-    const attempts = latest?.attempts ?? [];
+    const ordering = useGroupHealthReorder(view, runGroupHealth.isPending || excludeAllFailed.isPending);
+    const attempts = ordering.attempts;
     const successCount = attempts.filter((attempt) => attempt.status === 'success').length;
     const failedActiveCount = attempts.filter((attempt) => attempt.status === 'failed' && attempt.membership_state === 'active').length;
 
@@ -267,7 +285,7 @@ export function GroupHealthBadge({ groupId }: { groupId?: number }) {
                             size="sm"
                             variant="outline"
                             className="h-7 w-full rounded-lg px-2 text-xs"
-                            disabled={isRunPendingForGroup || isRunning}
+                            disabled={isRunPendingForGroup || isRunning || ordering.isPending}
                             onClick={() => runGroupHealth.mutate({ groupId })}
                         >
                             {isRunning || isStandardRunPending ? <LoaderCircle className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
@@ -278,7 +296,7 @@ export function GroupHealthBadge({ groupId }: { groupId?: number }) {
                             size="sm"
                             variant="outline"
                             className="h-7 w-full rounded-lg px-2 text-xs"
-                            disabled={isRunPendingForGroup || isRunning}
+                            disabled={isRunPendingForGroup || isRunning || ordering.isPending}
                             onClick={() => runGroupHealth.mutate({ groupId, probeMode: 'full' })}
                         >
                             {isFullRunPending ? <LoaderCircle className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
@@ -329,8 +347,10 @@ export function GroupHealthBadge({ groupId }: { groupId?: number }) {
                     </Card>
                 </div>
 
+                <GroupHealthReorderAction ordering={ordering} />
+
                 {failedActiveCount > 0 ? <div className="flex justify-end">
-                    <Button type="button" size="sm" variant="destructive" disabled={excludeAllFailed.isPending || isRunning} onClick={() => { if (failedActiveCount >= (view?.active_item_count ?? 0)) setBatchConfirmOpen(true); else doBatchExclude(); }}>
+                    <Button type="button" size="sm" variant="destructive" disabled={excludeAllFailed.isPending || isRunning || ordering.isPending} onClick={() => { if (failedActiveCount >= (view?.active_item_count ?? 0)) setBatchConfirmOpen(true); else doBatchExclude(); }}>
                         {excludeAllFailed.isPending ? <LoaderCircle className="size-4 animate-spin" /> : <ShieldMinus className="size-4" />}
                         {t('excludeAllFailed', { count: failedActiveCount })}
                     </Button>

@@ -133,3 +133,83 @@ func TestChatOutbound_ThinkingWithReasoningEffort(t *testing.T) {
 		t.Fatalf("expected 'reasoning_effort' field in payload")
 	}
 }
+
+func TestChatOutbound_ResponsesDeepSeekDefaultsThinking(t *testing.T) {
+	content := "hello"
+	request := &model.InternalLLMRequest{
+		Model:        "deepseek-ai/deepseek-v4-pro-0813",
+		RawAPIFormat: model.APIFormatOpenAIResponse,
+		Messages:     []model.Message{{Role: "user", Content: model.MessageContent{Content: &content}}},
+	}
+
+	outbound := &ChatOutbound{}
+	httpReq, err := outbound.TransformRequest(context.Background(), request, "https://example.test/v1", "test-key")
+	if err != nil {
+		t.Fatalf("TransformRequest failed: %v", err)
+	}
+	body, err := io.ReadAll(httpReq.Body)
+	if err != nil {
+		t.Fatalf("failed to read request body: %v", err)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("failed to unmarshal payload: %v", err)
+	}
+	var thinking model.ThinkingConfig
+	if err := json.Unmarshal(payload["thinking"], &thinking); err != nil {
+		t.Fatalf("failed to decode thinking: %v", err)
+	}
+	if thinking.Type != "enabled" {
+		t.Fatalf("expected Responses-to-Chat DeepSeek default to enable thinking, got %q", thinking.Type)
+	}
+}
+
+func TestChatOutbound_ResponsesDeepSeekKeepsExplicitThinkingAndDisable(t *testing.T) {
+	content := "hello"
+	for _, test := range []struct {
+		name   string
+		model  string
+		effort string
+		think  *model.ThinkingConfig
+		want   string
+	}{
+		{name: "explicit disabled", model: "deepseek-ai/deepseek-v4-pro-0813", think: &model.ThinkingConfig{Type: "disabled"}, want: "disabled"},
+		{name: "reasoning none", model: "deepseek-ai/deepseek-v4-pro-0813", effort: "none", want: ""},
+		{name: "other model", model: "deepseek-ai/deepseek-v3", want: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := &model.InternalLLMRequest{
+				Model:           test.model,
+				RawAPIFormat:    model.APIFormatOpenAIResponse,
+				ReasoningEffort: test.effort,
+				Thinking:        test.think,
+				Messages:        []model.Message{{Role: "user", Content: model.MessageContent{Content: &content}}},
+			}
+			httpReq, err := (&ChatOutbound{}).TransformRequest(context.Background(), request, "https://example.test/v1", "test-key")
+			if err != nil {
+				t.Fatalf("TransformRequest failed: %v", err)
+			}
+			body, err := io.ReadAll(httpReq.Body)
+			if err != nil {
+				t.Fatalf("failed to read request body: %v", err)
+			}
+			var payload map[string]json.RawMessage
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("failed to unmarshal payload: %v", err)
+			}
+			if test.want == "" {
+				if _, present := payload["thinking"]; present {
+					t.Fatalf("expected thinking to remain omitted, payload has %s", payload["thinking"])
+				}
+				return
+			}
+			var thinking model.ThinkingConfig
+			if err := json.Unmarshal(payload["thinking"], &thinking); err != nil {
+				t.Fatalf("failed to decode thinking: %v", err)
+			}
+			if thinking.Type != test.want {
+				t.Fatalf("expected thinking.type=%q, got %q", test.want, thinking.Type)
+			}
+		})
+	}
+}

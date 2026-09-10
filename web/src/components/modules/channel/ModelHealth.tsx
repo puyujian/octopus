@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
-import { Activity, CheckCircle2, CircleAlert, LoaderCircle, Plus, RefreshCw, Sparkles, XCircle } from 'lucide-react';
+import { Activity, CheckCircle2, CircleAlert, LoaderCircle, Plus, RefreshCw, Search, Sparkles, X, XCircle } from 'lucide-react';
 import { useTranslations } from 'next-intl';
 import {
     type ChannelModelGroupApplyItem,
@@ -330,8 +330,11 @@ export function ChannelModelHealthPanel({ channelId, autoSync, targets }: { chan
     const runHealth = useRunChannelModelHealth();
     const syncModels = useSyncChannelModels();
     const updateChannel = useUpdateChannel();
+    const [search, setSearch] = useState('');
     const [groupTarget, setGroupTarget] = useState<ChannelModelTarget | null>(null);
     const [autoSyncOverride, setAutoSyncOverride] = useState<boolean | null>(null);
+    const searchQuery = search.trim().toLowerCase();
+    const filteredTargets = useMemo(() => targets.filter((target) => target.model_name.toLowerCase().includes(searchQuery)), [targets, searchQuery]);
     const healthByKey = useMemo(() => new Map((healthQuery.data ?? []).map((row) => [keyOf(row), row])), [healthQuery.data]);
     const healthy = targets.filter((target) => healthByKey.get(keyOf(target))?.status === 'success').length;
     const probingKey = runHealth.isPending && runHealth.variables?.length === 1 ? keyOf(runHealth.variables[0]) : null;
@@ -342,7 +345,7 @@ export function ChannelModelHealthPanel({ channelId, autoSync, targets }: { chan
                 <h4 className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                     <Activity className="size-3.5" />{t('title')} · {healthQuery.isLoading ? t('loading') : `${healthy}/${targets.length}`}
                 </h4>
-                <ChannelModelActionButtons targets={targets} compact className="w-full sm:w-auto" />
+                <ChannelModelActionButtons targets={filteredTargets} compact className="w-full sm:w-auto" />
             </div>
             <div className="flex flex-col gap-3 rounded-2xl border border-border/70 bg-muted/20 p-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="min-w-0">
@@ -388,8 +391,27 @@ export function ChannelModelHealthPanel({ channelId, autoSync, targets }: { chan
                     </Button>
                 </div>
             </div>
+            <div className="space-y-1.5">
+                <div className="relative">
+                    <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                        type="search"
+                        value={search}
+                        onChange={(event) => setSearch(event.target.value)}
+                        placeholder={t('searchPlaceholder')}
+                        aria-label={t('searchPlaceholder')}
+                        className="h-9 rounded-xl pl-9 pr-9 [&::-webkit-search-cancel-button]:appearance-none"
+                    />
+                    {search && (
+                        <Button type="button" variant="ghost" size="icon" className="absolute right-1 top-1/2 size-7 -translate-y-1/2 rounded-lg" aria-label={t('clearSearch')} onClick={() => setSearch('')}>
+                            <X className="size-3.5" />
+                        </Button>
+                    )}
+                </div>
+                {searchQuery && <p role="status" className="text-xs text-muted-foreground">{t('searchResults', { count: filteredTargets.length, total: targets.length })}</p>}
+            </div>
             <div className="max-h-56 space-y-1.5 overflow-y-auto overscroll-contain rounded-2xl border bg-card p-2">
-                {targets.map((target) => {
+                {filteredTargets.map((target) => {
                     const health = healthByKey.get(keyOf(target));
                     return (
                         <div key={keyOf(target)} className="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-2 rounded-xl px-2 py-2 hover:bg-muted/40">
@@ -435,7 +457,7 @@ export function ChannelModelHealthPanel({ channelId, autoSync, targets }: { chan
                         </div>
                     );
                 })}
-                {targets.length === 0 && <div className="py-4 text-center text-sm text-muted-foreground">{t('empty')}</div>}
+                {filteredTargets.length === 0 && <div className="py-4 text-center text-sm text-muted-foreground">{t(targets.length === 0 ? 'empty' : 'noSearchResults')}</div>}
             </div>
             <SmartGroupDialog targets={groupTarget ? [groupTarget] : []} open={groupTarget !== null} onOpenChange={(open) => !open && setGroupTarget(null)} />
         </section>

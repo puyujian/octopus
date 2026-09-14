@@ -264,6 +264,10 @@ func (i *ResponseInbound) processStreamEvents(ctx context.Context, events []mode
 				continue
 			}
 			i.responseCompleted = true
+			var errorCode any = 500
+			if event.Error.Detail.Code != "" {
+				errorCode = event.Error.Detail.Code
+			}
 			response := &ResponsesResponse{
 				Object:    "response",
 				ID:        i.responseID,
@@ -271,7 +275,7 @@ func (i *ResponseInbound) processStreamEvents(ctx context.Context, events []mode
 				CreatedAt: i.createdAt,
 				Status:    lo.ToPtr("failed"),
 				Error: &ResponsesError{
-					Code:    500,
+					Code:    errorCode,
 					Message: event.Error.Detail.Message,
 				},
 			}
@@ -1081,6 +1085,9 @@ type ResponsesTool struct {
 	Format            *ResponsesCustomToolFormat      `json:"format,omitempty"`
 	Filters           *ResponsesWebSearchFilters      `json:"filters,omitempty"`
 	UserLocation      *ResponsesWebSearchUserLocation `json:"user_location,omitempty"`
+	SearchContextSize string                          `json:"search_context_size,omitempty"`
+	ExternalWebAccess *bool                           `json:"external_web_access,omitempty"`
+	ReturnTokenBudget *int64                          `json:"return_token_budget,omitempty"`
 	Background        string                          `json:"background,omitempty"`
 	OutputFormat      string                          `json:"output_format,omitempty"`
 	Quality           string                          `json:"quality,omitempty"`
@@ -1102,6 +1109,7 @@ type ResponsesToolChoiceOption struct {
 
 type ResponsesWebSearchFilters struct {
 	AllowedDomains []string `json:"allowed_domains,omitempty"`
+	BlockedDomains []string `json:"blocked_domains,omitempty"`
 }
 
 type ResponsesWebSearchUserLocation struct {
@@ -1210,7 +1218,7 @@ type ResponsesUsage struct {
 }
 
 type ResponsesError struct {
-	Code    int    `json:"code"`
+	Code    any    `json:"code"`
 	Message string `json:"message"`
 }
 
@@ -1483,7 +1491,7 @@ func buildResponsesToolSignatures(tools []ResponsesTool) []string {
 
 func isStructurallyRepresentedResponsesToolType(toolType string) bool {
 	switch toolType {
-	case "function", "image_generation", "web_search", "custom":
+	case "function", "image_generation", "web_search", "web_search_preview", "web_search_preview_2025_03_11", "custom":
 		return true
 	default:
 		return false
@@ -1643,7 +1651,7 @@ func markOpenAIResponsesPassthroughIfNeeded(req *ResponsesRequest, chatReq *mode
 func firstUnsupportedResponsesToolType(tools []ResponsesTool) string {
 	for _, tool := range tools {
 		switch tool.Type {
-		case "function", "image_generation", "web_search", "custom", "namespace":
+		case "function", "image_generation", "web_search", "web_search_preview", "web_search_preview_2025_03_11", "custom", "namespace":
 			continue
 		case "":
 			return "<empty>"
@@ -2096,10 +2104,14 @@ func convertToolsToInternal(tools []ResponsesTool) ([]model.Tool, error) {
 				},
 			})
 
-		case "web_search":
-			webSearch := &model.WebSearch{}
+		case "web_search", "web_search_preview", "web_search_preview_2025_03_11":
+			webSearch := &model.WebSearch{
+				ResponsesType: tool.Type, SearchContextSize: tool.SearchContextSize,
+				ExternalWebAccess: tool.ExternalWebAccess, ReturnTokenBudget: tool.ReturnTokenBudget,
+			}
 			if tool.Filters != nil {
 				webSearch.AllowedDomains = append(webSearch.AllowedDomains, tool.Filters.AllowedDomains...)
+				webSearch.BlockedDomains = append(webSearch.BlockedDomains, tool.Filters.BlockedDomains...)
 			}
 			if tool.UserLocation != nil {
 				locationType := tool.UserLocation.Type

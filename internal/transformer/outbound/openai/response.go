@@ -103,6 +103,10 @@ func (o *ResponseOutbound) TransformRequest(ctx context.Context, request *model.
 	if err != nil {
 		return nil, err
 	}
+	axonRequest.Body, err = overlayResponsesSearchTools(axonRequest.Body, request.Tools)
+	if err != nil {
+		return nil, err
+	}
 	// AxonHub reconstructs the normalized Responses input from the common
 	// message model.  When the inbound request carried a raw input array,
 	// that projection can omit provider-native items (for example
@@ -420,11 +424,16 @@ func (o *ResponseOutbound) TransformStreamEvent(ctx context.Context, eventData [
 		default:
 			reason = lo.ToPtr("stop")
 		}
-		if streamEvent.Response != nil && streamEvent.Response.Error != nil {
+		if streamEvent.Error != nil {
+			respErr = &model.ResponseError{Detail: model.ErrorDetail{
+				Code: responsesErrorCode(streamEvent.Error.Code), Message: streamEvent.Error.Message, Type: streamEvent.Error.Type,
+			}}
+		} else if streamEvent.Response != nil && streamEvent.Response.Error != nil {
 			respErr = &model.ResponseError{
 				Detail: model.ErrorDetail{
-					Code:    fmt.Sprintf("%d", streamEvent.Response.Error.Code),
+					Code:    responsesErrorCode(streamEvent.Response.Error.Code),
 					Message: streamEvent.Response.Error.Message,
+					Type:    streamEvent.Response.Error.Type,
 				},
 			}
 		} else if streamEvent.Code != "" || streamEvent.Message != "" {
@@ -434,6 +443,9 @@ func (o *ResponseOutbound) TransformStreamEvent(ctx context.Context, eventData [
 					Message: streamEvent.Message,
 				},
 			}
+		}
+		if respErr == nil && streamEvent.Type != "response.incomplete" {
+			respErr = &model.ResponseError{Detail: model.ErrorDetail{Message: "upstream response failed"}}
 		}
 		if respErr != nil {
 			events = append(events, model.StreamEvent{Kind: model.StreamEventKindError, ID: base.ID, Model: base.Model, Error: respErr})
@@ -559,8 +571,7 @@ type ResponsesItem struct {
 	Input     *string `json:"input,omitempty"`
 
 	// Function call output
-	Output        *ResponsesInput `json:"output,omitempty"`
-	ItemReference *string         `json:"item_reference,omitempty"`
+	Output *ResponsesInput `json:"output,omitempty"`
 
 	// Image generation fields
 	Result       *string `json:"result,omitempty"`
@@ -626,6 +637,9 @@ type ResponsesTool struct {
 	Format            *ResponsesCustomToolFormat      `json:"format,omitempty"`
 	Filters           *ResponsesWebSearchFilters      `json:"filters,omitempty"`
 	UserLocation      *ResponsesWebSearchUserLocation `json:"user_location,omitempty"`
+	SearchContextSize string                          `json:"search_context_size,omitempty"`
+	ExternalWebAccess *bool                           `json:"external_web_access,omitempty"`
+	ReturnTokenBudget *int64                          `json:"return_token_budget,omitempty"`
 	Background        string                          `json:"background,omitempty"`
 	OutputFormat      string                          `json:"output_format,omitempty"`
 	Quality           string                          `json:"quality,omitempty"`
@@ -651,6 +665,7 @@ type ResponsesToolChoiceOption struct {
 
 type ResponsesWebSearchFilters struct {
 	AllowedDomains []string `json:"allowed_domains,omitempty"`
+	BlockedDomains []string `json:"blocked_domains,omitempty"`
 }
 
 type ResponsesWebSearchUserLocation struct {
@@ -725,14 +740,23 @@ type ResponsesUsage struct {
 }
 
 type ResponsesError struct {
-	Code    int    `json:"code"`
+	Code    any    `json:"code"`
 	Message string `json:"message"`
+	Type    string `json:"type,omitempty"`
+}
+
+func responsesErrorCode(code any) string {
+	if code == nil {
+		return ""
+	}
+	return fmt.Sprint(code)
 }
 
 type ResponsesStreamEvent struct {
 	Type           string             `json:"type"`
 	SequenceNumber int                `json:"sequence_number"`
 	Response       *ResponsesResponse `json:"response,omitempty"`
+	Error          *ResponsesError    `json:"error,omitempty"`
 	OutputIndex    int                `json:"output_index"`
 	Item           *ResponsesItem     `json:"item,omitempty"`
 	ItemID         *string            `json:"item_id,omitempty"`
@@ -1236,8 +1260,7 @@ func convertInputFromMessages(msgs []model.Message, transformOptions model.Trans
 		return ResponsesInput{Text: nonSystemMsgs[0].Content.Content}
 	}
 
-	// Build call_id -> item_id mapping for function_call_output reference
-	callIDToItemID := make(map[string]string)
+	// Preserve the tool kind while correlating results by call_id.
 	callIDToItemType := make(map[string]string)
 	var items []ResponsesItem
 	for _, msg := range msgs {
@@ -1249,16 +1272,13 @@ func convertInputFromMessages(msgs []model.Message, transformOptions model.Trans
 		case "assistant":
 			assistantItems := convertAssistantMessageToResponses(msg)
 			for _, item := range assistantItems {
-				if (item.Type == "function_call" || item.Type == "custom_tool_call") && item.ID != "" && item.CallID != "" {
-					callIDToItemID[item.CallID] = item.ID
-				}
 				if item.CallID != "" {
 					callIDToItemType[item.CallID] = item.Type
 				}
 			}
 			items = append(items, assistantItems...)
 		case "tool":
-			items = append(items, convertToolMessageToResponses(msg, callIDToItemID, callIDToItemType))
+			items = append(items, convertToolMessageToResponses(msg, callIDToItemType))
 		}
 	}
 
@@ -1436,7 +1456,7 @@ func convertAssistantMessageToResponses(msg model.Message) []ResponsesItem {
 	return sanitizeResponsesItems(items)
 }
 
-func convertToolMessageToResponses(msg model.Message, callIDToItemID map[string]string, callIDToItemType map[string]string) ResponsesItem {
+func convertToolMessageToResponses(msg model.Message, callIDToItemType map[string]string) ResponsesItem {
 	var output ResponsesInput
 
 	if msg.Content.Content != nil {
@@ -1464,13 +1484,6 @@ func convertToolMessageToResponses(msg model.Message, callIDToItemID map[string]
 		Type:   itemType,
 		CallID: lo.FromPtr(msg.ToolCallID),
 		Output: &output,
-	}
-
-	// Set item_reference to the corresponding function_call's ID
-	if msg.ToolCallID != nil {
-		if itemID, ok := callIDToItemID[*msg.ToolCallID]; ok {
-			item.ItemReference = lo.ToPtr(itemID)
-		}
 	}
 
 	return item
@@ -1520,8 +1533,17 @@ func convertToolsToResponses(tools []model.Tool) []ResponsesTool {
 		case "web_search":
 			rt := ResponsesTool{Type: "web_search"}
 			if tool.WebSearch != nil {
-				if len(tool.WebSearch.AllowedDomains) > 0 {
-					rt.Filters = &ResponsesWebSearchFilters{AllowedDomains: append([]string(nil), tool.WebSearch.AllowedDomains...)}
+				if tool.WebSearch.ResponsesType != "" {
+					rt.Type = tool.WebSearch.ResponsesType
+				}
+				rt.SearchContextSize = tool.WebSearch.SearchContextSize
+				rt.ExternalWebAccess = tool.WebSearch.ExternalWebAccess
+				rt.ReturnTokenBudget = tool.WebSearch.ReturnTokenBudget
+				if len(tool.WebSearch.AllowedDomains) > 0 || len(tool.WebSearch.BlockedDomains) > 0 {
+					rt.Filters = &ResponsesWebSearchFilters{
+						AllowedDomains: append([]string(nil), tool.WebSearch.AllowedDomains...),
+						BlockedDomains: append([]string(nil), tool.WebSearch.BlockedDomains...),
+					}
 				}
 				location := tool.WebSearch.UserLocation
 				if location.Type != "" || location.City != "" || location.Country != "" || location.Region != "" || location.Timezone != "" {
@@ -2148,49 +2170,16 @@ func sanitizeResponsesRawItems(raw json.RawMessage) json.RawMessage {
 
 	changed := false
 
-	// Build call_id -> item_id mapping from function_call items.
-	// Generate an id for any function_call that has call_id but no id,
-	// so the function_call_output backfill can always resolve item_reference.
-	callIDToItemID := make(map[string]string)
-	for _, item := range items {
-		if decodeRawString(item["type"]) == "function_call" {
-			callID := decodeRawString(item["call_id"])
-			if callID == "" {
-				continue
-			}
-			itemID := decodeRawString(item["id"])
-			if itemID == "" {
-				itemID = generateResponsesItemID()
-				if b, err := json.Marshal(itemID); err == nil {
-					item["id"] = b
-					changed = true
-				}
-			}
-			if itemID != "" {
-				callIDToItemID[callID] = itemID
-			}
-		}
-	}
-
 	for _, item := range items {
 		itemType := decodeRawString(item["type"])
-
-		// Sanitize function_call_output: add missing item_reference
-		if itemType == "function_call_output" {
-			refRaw, hasRef := item["item_reference"]
-			refMissing := !hasRef || len(bytes.TrimSpace(refRaw)) == 0 ||
-				bytes.Equal(bytes.TrimSpace(refRaw), []byte("null")) ||
-				bytes.Equal(bytes.TrimSpace(refRaw), []byte(`""`))
-			if refMissing {
-				callID := decodeRawString(item["call_id"])
-				if callID != "" {
-					if itemID, ok := callIDToItemID[callID]; ok {
-						if b, err := json.Marshal(itemID); err == nil {
-							item["item_reference"] = b
-							changed = true
-						}
-					}
-				}
+		// Tool outputs refer to their invocation through call_id. A nested
+		// item_reference is not part of the Responses tool-output schema;
+		// also remove it from histories serialized by older relay versions.
+		// Standalone {type:"item_reference", id:...} items remain untouched.
+		if itemType == "function_call_output" || itemType == "custom_tool_call_output" {
+			if _, present := item["item_reference"]; present {
+				delete(item, "item_reference")
+				changed = true
 			}
 		}
 
@@ -2295,10 +2284,10 @@ func firstNonEmpty(values ...string) string {
 // with O-M1.
 func normalizeResponsesFinishReason(status *string, errDetail *ResponsesError) (*string, *model.ResponseError) {
 	var respErr *model.ResponseError
-	if errDetail != nil && (errDetail.Message != "" || errDetail.Code != 0) {
+	if errDetail != nil && (errDetail.Message != "" || (responsesErrorCode(errDetail.Code) != "" && responsesErrorCode(errDetail.Code) != "0")) {
 		respErr = &model.ResponseError{
 			Detail: model.ErrorDetail{
-				Code:    fmt.Sprintf("%d", errDetail.Code),
+				Code:    responsesErrorCode(errDetail.Code),
 				Message: errDetail.Message,
 			},
 		}

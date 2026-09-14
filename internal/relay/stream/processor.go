@@ -32,6 +32,8 @@ type StreamSource interface {
 
 // StreamTransform converts raw event data to the client's expected format.
 // Returns nil/empty slice to skip writing (e.g., keep-alive events).
+// A nonempty output with an error is a terminal error event: deliver it if
+// a previous payload committed the response, then return the error.
 // For passthrough, set to nil in StreamConfig.
 type StreamTransform func(ctx context.Context, data []byte) ([]byte, error)
 
@@ -215,7 +217,7 @@ func (p *StreamProcessor) processEvent(data []byte) error {
 
 	if p.config.Transform != nil {
 		output, err = p.config.Transform(p.config.Context, data)
-		if err != nil {
+		if err != nil && (len(output) == 0 || !p.payloadWritten) {
 			return fmt.Errorf("transform error: %w", err)
 		}
 		if len(output) == 0 {
@@ -240,6 +242,9 @@ func (p *StreamProcessor) processEvent(data []byte) error {
 
 	p.payloadWritten = true
 	p.config.Writer.Flush()
+	if err != nil {
+		return fmt.Errorf("transform error: %w", err)
+	}
 	return nil
 }
 

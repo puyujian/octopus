@@ -81,6 +81,12 @@ func (o *MessageOutbound) TransformRequest(ctx context.Context, request *model.I
 	if request == nil {
 		return nil, fmt.Errorf("request is nil")
 	}
+	for _, tool := range request.Tools {
+		if tool.Type == "web_search" && tool.WebSearch != nil &&
+			tool.WebSearch.ExternalWebAccess != nil && !*tool.WebSearch.ExternalWebAccess {
+			return nil, fmt.Errorf("Anthropic web search cannot preserve external_web_access=false")
+		}
+	}
 
 	request.NormalizeMessages()
 	request.EnforceMessageAlternation(model.AlternationProviderAnthropic)
@@ -109,6 +115,12 @@ func (o *MessageOutbound) TransformRequest(ctx context.Context, request *model.I
 	for _, tool := range request.Tools {
 		if len(tool.AnthropicServerSpec) > 0 || strings.Contains(tool.Type, "web_search") || strings.Contains(tool.Type, "code_execution") || strings.Contains(tool.Type, "computer") {
 			fields = append(fields, "tools")
+			if choice := request.ToolChoice; choice != nil && choice.NamedToolChoice != nil {
+				switch choice.NamedToolChoice.Type {
+				case "web_search", "web_search_preview", "web_search_preview_2025_03_11":
+					fields = append(fields, "tool_choice")
+				}
+			}
 			break
 		}
 	}
@@ -874,6 +886,10 @@ func convertToolChoice(tc *model.ToolChoice) *anthropicModel.ToolChoice {
 		out.Type = "any"
 	case "none":
 		out.Type = "none"
+	case "web_search", "web_search_preview", "web_search_preview_2025_03_11":
+		out.Type = "tool"
+		name := "web_search"
+		out.Name = &name
 	case "tool", "function":
 		out.Type = "tool"
 		if name := named.ResolvedFunctionName(); name != "" {
@@ -1497,6 +1513,8 @@ func convertTools(tools []model.Tool) []anthropicModel.Tool {
 	result := make([]anthropicModel.Tool, 0, len(tools))
 	for _, tool := range tools {
 		switch tool.Type {
+		case "web_search":
+			result = append(result, convertWebSearchTool(tool))
 		case "function", "":
 			result = append(result, anthropicModel.Tool{
 				Name:         tool.Function.Name,
@@ -1527,6 +1545,36 @@ func convertTools(tools []model.Tool) []anthropicModel.Tool {
 		}
 	}
 	return result
+}
+
+// Responses hosted search maps to Anthropic's hosted search, never to a
+// client-executed function. Keep domain restrictions and location intact.
+func convertWebSearchTool(tool model.Tool) anthropicModel.Tool {
+	spec := struct {
+		Type           string                           `json:"type"`
+		Name           string                           `json:"name"`
+		MaxUses        *int64                           `json:"max_uses,omitempty"`
+		AllowedDomains []string                         `json:"allowed_domains,omitempty"`
+		BlockedDomains []string                         `json:"blocked_domains,omitempty"`
+		UserLocation   *model.WebSearchToolUserLocation `json:"user_location,omitempty"`
+	}{Type: "web_search_20250305", Name: "web_search"}
+	if search := tool.WebSearch; search != nil {
+		spec.MaxUses = search.MaxUses
+		spec.AllowedDomains = search.AllowedDomains
+		spec.BlockedDomains = search.BlockedDomains
+		if search.UserLocation != (model.WebSearchToolUserLocation{}) {
+			location := search.UserLocation
+			if location.Type == "" {
+				location.Type = "approximate"
+			}
+			spec.UserLocation = &location
+		}
+	}
+	raw, _ := json.Marshal(spec)
+	return anthropicModel.Tool{
+		Type: spec.Type, Name: spec.Name, RawBody: raw,
+		CacheControl: convertCacheControl(tool.CacheControl),
+	}
 }
 
 // anthropicMaxStopSequences caps the stop_sequences array sent to

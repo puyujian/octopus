@@ -897,6 +897,9 @@ func (ra *relayAttempt) forwardViaHTTPPassthrough(ctx context.Context, pt model.
 
 // handleResponsePassthrough handles non-streaming passthrough responses.
 func (ra *relayAttempt) handleResponsePassthrough(ctx context.Context, response *http.Response, cfg model.PassthroughConfig) error {
+	if err := rejectUpstreamHTML(response); err != nil {
+		return err
+	}
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
 		return fmt.Errorf("failed to read response body: %w", err)
@@ -1332,6 +1335,25 @@ func (ra *relayAttempt) handleStreamResponsePassthroughV2(ctx context.Context, r
 			if cfg.CollectMetrics {
 				ra.collectResponse()
 			}
+			// Raw passthrough already delivered the provider's error event;
+			// still mark the attempt failed instead of recording HTTP 200 as success.
+			for event, readErr := range sse.Read(bytes.NewReader(rawStream), &sse.ReadConfig{MaxEventSize: maxSSEEventSize}) {
+				if readErr != nil {
+					break
+				}
+				var probe struct {
+					Type  string           `json:"type"`
+					Error *json.RawMessage `json:"error"`
+				}
+				if json.Unmarshal([]byte(event.Data), &probe) != nil {
+					continue
+				}
+				if probe.Type == "error" || probe.Type == "response.failed" || probe.Error != nil {
+					if err := inspectFirstSSEEvent(ra.internalRequest.RawAPIFormat, []byte("event: "+event.Type+"\ndata: "+event.Data+"\n\n")); err != nil {
+						return err
+					}
+				}
+			}
 
 			log.Debugf("passthrough stream end")
 			return nil
@@ -1457,6 +1479,11 @@ func (ra *relayAttempt) encodeInboundStreamEvents(ctx context.Context, events []
 		log.Warnf("failed to transform inbound stream events: %v", err)
 		return nil, err
 	}
+	for _, event := range events {
+		if event.Kind == model.StreamEventKindError && event.Error != nil {
+			return inStream, fmt.Errorf("%w: %s", errUpstreamStreamError, event.Error.Error())
+		}
+	}
 	return inStream, nil
 }
 
@@ -1470,11 +1497,17 @@ func (ra *relayAttempt) encodeInboundStreamResponse(ctx context.Context, interna
 		log.Warnf("failed to transform stream: %v", err)
 		return nil, err
 	}
+	if internalStream.Error != nil {
+		return inStream, fmt.Errorf("%w: %s", errUpstreamStreamError, internalStream.Error.Error())
+	}
 	return inStream, nil
 }
 
 // handleResponse 处理非流式响应
 func (ra *relayAttempt) handleResponse(ctx context.Context, response *http.Response) error {
+	if err := rejectUpstreamHTML(response); err != nil {
+		return err
+	}
 	internalResponse, err := ra.outAdapter.TransformResponse(ctx, response)
 	if err != nil {
 		log.Warnf("failed to transform response: %v", err)

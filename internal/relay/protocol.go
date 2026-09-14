@@ -81,13 +81,16 @@ func inspectOpenAIResponseEvent(data []byte) error {
 		Response *struct {
 			Status string `json:"status"`
 			Error  *struct {
-				Code    string `json:"code"`
-				Message string `json:"message"`
-				Type    string `json:"type"`
+				Code    json.RawMessage `json:"code"`
+				Message string          `json:"message"`
+				Type    string          `json:"type"`
 			} `json:"error"`
 		} `json:"response"`
-		Message string `json:"message"`
-		Code    string `json:"code"`
+		Message string          `json:"message"`
+		Code    json.RawMessage `json:"code"`
+		Error   *struct {
+			Message string `json:"message"`
+		} `json:"error"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return nil
@@ -105,6 +108,9 @@ func inspectOpenAIResponseEvent(data []byte) error {
 		return fmt.Errorf("%w: response cancelled", errUpstreamStreamError)
 	case "error":
 		msg := probe.Message
+		if probe.Error != nil && probe.Error.Message != "" {
+			msg = probe.Error.Message
+		}
 		if msg == "" {
 			msg = "responses stream error"
 		}

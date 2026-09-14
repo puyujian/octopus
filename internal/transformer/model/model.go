@@ -2042,11 +2042,16 @@ type ImageGeneration struct {
 }
 
 type WebSearch struct {
-	MaxUses        *int64                    `json:"max_uses,omitempty"`
-	Strict         *bool                     `json:"strict,omitempty"`
-	AllowedDomains []string                  `json:"allowed_domains,omitempty"`
-	BlockedDomains []string                  `json:"blocked_domains,omitempty"`
-	UserLocation   WebSearchToolUserLocation `json:"user_location,omitempty"`
+	// ResponsesType preserves the requested Responses search-tool version.
+	ResponsesType     string                    `json:"-"`
+	SearchContextSize string                    `json:"search_context_size,omitempty"`
+	ExternalWebAccess *bool                     `json:"external_web_access,omitempty"`
+	ReturnTokenBudget *int64                    `json:"return_token_budget,omitempty"`
+	MaxUses           *int64                    `json:"max_uses,omitempty"`
+	Strict            *bool                     `json:"strict,omitempty"`
+	AllowedDomains    []string                  `json:"allowed_domains,omitempty"`
+	BlockedDomains    []string                  `json:"blocked_domains,omitempty"`
+	UserLocation      WebSearchToolUserLocation `json:"user_location,omitempty"`
 }
 
 type WebSearchToolUserLocation struct {

@@ -1,241 +1,114 @@
 package openai
 
 import (
+	"context"
 	"encoding/json"
-	"testing"
-
+	inboundOpenAI "github.com/bestruirui/octopus/internal/transformer/inbound/openai"
 	"github.com/bestruirui/octopus/internal/transformer/model"
 	"github.com/samber/lo"
+	"io"
+	"testing"
 )
 
-func TestConvertInputFromMessagesGeneratesFunctionCallIDAndItemReference(t *testing.T) {
-	// Test that function_call items get unique IDs and function_call_output items get item_reference
+// Strict Responses providers correlate tool results by call_id and reject
+// the nested item_reference field added by older relay versions.
+func TestResponsesToolOutputsUseCallID(t *testing.T) {
 	msgs := []model.Message{
-		{
-			Role: "assistant",
-			ToolCalls: []model.ToolCall{
-				{
-					ID:   "call_abc123",
-					Type: "function",
-					Function: model.FunctionCall{
-						Name:      "get_weather",
-						Arguments: `{"location":"Beijing"}`,
-					},
-				},
-			},
-		},
-		{
-			Role:       "tool",
-			ToolCallID: lo.ToPtr("call_abc123"),
-			Content: model.MessageContent{
-				Content: lo.ToPtr("Sunny, 25°C"),
-			},
-		},
+		{Role: "assistant", ToolCalls: []model.ToolCall{
+			{ID: "call_a", Type: "function", Function: model.FunctionCall{Name: "weather", Arguments: `{}`}},
+			{ID: "call_b", Type: "function", Function: model.FunctionCall{Name: "time", Arguments: `{}`}},
+		}},
+		{Role: "tool", ToolCallID: lo.ToPtr("call_a"), Content: model.MessageContent{Content: lo.ToPtr("sunny")}},
+		{Role: "tool", ToolCallID: lo.ToPtr("call_b"), Content: model.MessageContent{Content: lo.ToPtr("noon")}},
 	}
-
-	input := convertInputFromMessages(msgs, model.TransformOptions{ArrayInputs: lo.ToPtr(true)})
-
-	if len(input.Items) != 2 {
-		t.Fatalf("expected 2 items, got %d", len(input.Items))
-	}
-
-	// Check function_call has ID
-	functionCall := input.Items[0]
-	if functionCall.Type != "function_call" {
-		t.Fatalf("expected first item to be function_call, got %s", functionCall.Type)
-	}
-	if functionCall.ID == "" {
-		t.Error("function_call item missing ID")
-	}
-	if functionCall.CallID != "call_abc123" {
-		t.Errorf("expected call_id=call_abc123, got %s", functionCall.CallID)
-	}
-
-	// Check function_call_output has item_reference
-	functionCallOutput := input.Items[1]
-	if functionCallOutput.Type != "function_call_output" {
-		t.Fatalf("expected second item to be function_call_output, got %s", functionCallOutput.Type)
-	}
-	if functionCallOutput.ItemReference == nil {
-		t.Fatal("function_call_output item missing item_reference")
-	}
-	if *functionCallOutput.ItemReference != functionCall.ID {
-		t.Errorf("item_reference=%s doesn't match function_call ID=%s", *functionCallOutput.ItemReference, functionCall.ID)
-	}
-}
-
-func TestSanitizeResponsesRawItemsAddsItemReference(t *testing.T) {
-	// Test that sanitizeResponsesRawItems automatically adds missing item_reference
-	rawItems := json.RawMessage(`[
-		{
-			"id": "item_xyz789",
-			"type": "function_call",
-			"call_id": "call_abc123",
-			"name": "get_weather",
-			"arguments": "{\"location\":\"Beijing\"}"
-		},
-		{
-			"type": "function_call_output",
-			"call_id": "call_abc123",
-			"output": {"text": "Sunny, 25°C"}
-		}
-	]`)
-
-	sanitized := sanitizeResponsesRawItems(rawItems)
-
-	var items []map[string]interface{}
-	if err := json.Unmarshal(sanitized, &items); err != nil {
-		t.Fatalf("failed to unmarshal sanitized items: %v", err)
-	}
-
-	if len(items) != 2 {
-		t.Fatalf("expected 2 items, got %d", len(items))
-	}
-
-	// Check function_call_output now has item_reference
-	functionCallOutput := items[1]
-	if functionCallOutput["type"] != "function_call_output" {
-		t.Fatalf("expected second item to be function_call_output, got %v", functionCallOutput["type"])
-	}
-
-	itemRef, ok := functionCallOutput["item_reference"].(string)
-	if !ok {
-		t.Fatal("function_call_output missing item_reference after sanitization")
-	}
-	if itemRef != "item_xyz789" {
-		t.Errorf("expected item_reference=item_xyz789, got %s", itemRef)
-	}
-}
-
-func TestSanitizeResponsesRawItemsFixesNullItemReference(t *testing.T) {
-	tests := []struct {
-		name string
-		raw  string
-	}{
-		{"null value", `[
-			{"id":"item_xyz","type":"function_call","call_id":"call_1","name":"f","arguments":"{}"},
-			{"type":"function_call_output","call_id":"call_1","item_reference":null,"output":{"text":"ok"}}
-		]`},
-		{"empty string", `[
-			{"id":"item_xyz","type":"function_call","call_id":"call_1","name":"f","arguments":"{}"},
-			{"type":"function_call_output","call_id":"call_1","item_reference":"","output":{"text":"ok"}}
-		]`},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			sanitized := sanitizeResponsesRawItems(json.RawMessage(tt.raw))
-			var items []map[string]interface{}
-			if err := json.Unmarshal(sanitized, &items); err != nil {
-				t.Fatalf("unmarshal: %v", err)
-			}
-			ref, ok := items[1]["item_reference"].(string)
-			if !ok || ref != "item_xyz" {
-				t.Errorf("expected item_reference=item_xyz, got %v", items[1]["item_reference"])
-			}
-		})
-	}
-}
-
-func TestSanitizeResponsesRawItemsBackfillsMissingFunctionCallID(t *testing.T) {
-	rawItems := json.RawMessage(`[
-		{
-			"type": "function_call",
-			"call_id": "call_noid",
-			"name": "do_thing",
-			"arguments": "{}"
-		},
-		{
-			"type": "function_call_output",
-			"call_id": "call_noid",
-			"output": {"text": "done"}
-		}
-	]`)
-
-	sanitized := sanitizeResponsesRawItems(rawItems)
-
-	var items []map[string]interface{}
-	if err := json.Unmarshal(sanitized, &items); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-
-	generatedID, ok := items[0]["id"].(string)
-	if !ok || generatedID == "" {
-		t.Fatal("function_call missing generated id")
-	}
-
-	ref, ok := items[1]["item_reference"].(string)
-	if !ok || ref == "" {
-		t.Fatal("function_call_output missing item_reference")
-	}
-	if ref != generatedID {
-		t.Errorf("item_reference=%s doesn't match generated id=%s", ref, generatedID)
-	}
-}
-
-func TestMarshalResponsesInputItemsPreservesItemReference(t *testing.T) {
-	// Test end-to-end: Messages -> Items -> JSON preserves item_reference
-	msgs := []model.Message{
-		{
-			Role: "assistant",
-			ToolCalls: []model.ToolCall{
-				{
-					ID:   "call_test123",
-					Type: "function",
-					Function: model.FunctionCall{
-						Name:      "test_func",
-						Arguments: `{}`,
-					},
-				},
-			},
-		},
-		{
-			Role:       "tool",
-			ToolCallID: lo.ToPtr("call_test123"),
-			Content: model.MessageContent{
-				Content: lo.ToPtr("result"),
-			},
-		},
-	}
-
-	rawItems, err := MarshalResponsesInputItems(msgs)
+	raw, err := MarshalResponsesInputItems(msgs)
 	if err != nil {
-		t.Fatalf("MarshalResponsesInputItems failed: %v", err)
+		t.Fatal(err)
 	}
-
-	var items []map[string]interface{}
-	if err := json.Unmarshal(rawItems, &items); err != nil {
-		t.Fatalf("failed to unmarshal: %v", err)
+	assertResponsesToolPairs(t, raw)
+	req := &model.InternalLLMRequest{Model: "gpt-5.6-luna", Messages: msgs, TransformOptions: model.TransformOptions{ArrayInputs: lo.ToPtr(true)}}
+	httpReq, err := (&ResponseOutbound{}).TransformRequest(context.Background(), req, "https://example.test/v1", "test-key")
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer httpReq.Body.Close()
+	body, _ := io.ReadAll(httpReq.Body)
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	assertResponsesToolPairs(t, payload["input"])
+}
 
-	// Find function_call and function_call_output, then verify item_reference matches function_call.id
-	var functionCallID string
-	var itemReference string
-	var foundCall, foundOutput bool
-	for _, item := range items {
-		switch item["type"] {
-		case "function_call":
-			if id, ok := item["id"].(string); ok {
-				functionCallID = id
-				foundCall = true
-			}
-		case "function_call_output":
-			if ref, ok := item["item_reference"].(string); ok {
-				itemReference = ref
-				foundOutput = true
-			}
+func assertResponsesToolPairs(t *testing.T, raw []byte) {
+	t.Helper()
+	var items []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 4 {
+		t.Fatalf("expected two calls and two results, got %s", raw)
+	}
+	for i, want := range []struct{ kind, id string }{
+		{"function_call", "call_a"}, {"function_call", "call_b"},
+		{"function_call_output", "call_a"}, {"function_call_output", "call_b"},
+	} {
+		if string(items[i]["type"]) != `"`+want.kind+`"` || string(items[i]["call_id"]) != `"`+want.id+`"` {
+			t.Fatalf("tool pairing/order changed: %s", raw)
+		}
+		if _, present := items[i]["item_reference"]; present {
+			t.Fatalf("unexpected nested item_reference: %s", raw)
 		}
 	}
+	if string(items[2]["output"]) != `"sunny"` || string(items[3]["output"]) != `"noon"` {
+		t.Fatalf("tool output changed: %s", raw)
+	}
+}
 
-	if !foundCall {
-		t.Fatal("function_call item not found in marshaled output")
+func TestResponsesRawToolHistoryPreservedWithoutInjectedReferences(t *testing.T) {
+	raw := json.RawMessage(`[
+  {"type":"function_call","call_id":"call_a","name":"weather","arguments":"{}"},
+  {"type":"function_call","call_id":"call_b","name":"time","arguments":"{}"},
+  {"type":"function_call_output","call_id":"call_a","output":"sunny"},
+  {"type":"function_call_output","call_id":"call_b","output":"noon"}
+ ]`)
+	if got := sanitizeResponsesRawItems(raw); string(got) != string(raw) {
+		t.Fatalf("valid raw history rewritten: %s", got)
 	}
-	if functionCallID == "" {
-		t.Fatal("function_call item has empty id")
+	req, err := (&inboundOpenAI.ResponseInbound{}).TransformRequest(context.Background(), []byte(`{"model":"gpt-5.6-luna","input":`+string(raw)+`}`))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !foundOutput {
-		t.Fatal("function_call_output item missing item_reference")
+	// Semantic group overrides force this normalized path in the live CPA case.
+	req.ReasoningEffort = "max"
+	httpReq, err := (&ResponseOutbound{}).TransformRequest(context.Background(), req, "https://example.test/v1", "test-key")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if itemReference != functionCallID {
-		t.Errorf("item_reference=%s doesn't match function_call id=%s", itemReference, functionCallID)
+	defer httpReq.Body.Close()
+	body, _ := io.ReadAll(httpReq.Body)
+	var payload map[string]json.RawMessage
+	_ = json.Unmarshal(body, &payload)
+	assertResponsesToolPairs(t, payload["input"])
+}
+
+func TestSanitizeResponsesRemovesOnlyLegacyNestedReferences(t *testing.T) {
+	for _, ref := range []string{`null`, `""`, `"fc_old"`} {
+		raw := json.RawMessage(`[
+   {"type":"function_call","id":"fc_old","call_id":"call_a","name":"f","arguments":"{}"},
+   {"type":"function_call_output","call_id":"call_a","item_reference":` + ref + `,"output":"done"},
+   {"type":"custom_tool_call_output","call_id":"custom_a","item_reference":` + ref + `,"output":"custom done"},
+   {"type":"item_reference","id":"msg_saved"}
+  ]`)
+		var items []map[string]json.RawMessage
+		_ = json.Unmarshal(sanitizeResponsesRawItems(raw), &items)
+		for _, i := range []int{1, 2} {
+			if _, present := items[i]["item_reference"]; present {
+				t.Fatalf("legacy nested reference survived: %v", items[i])
+			}
+		}
+		if string(items[0]["id"]) != `"fc_old"` || string(items[3]["type"]) != `"item_reference"` || string(items[3]["id"]) != `"msg_saved"` {
+			t.Fatalf("valid IDs or standalone reference changed: %v", items)
+		}
 	}
 }

@@ -22,9 +22,9 @@ type promptCacheKeyCompatibilityKey struct {
 // so a different protocol or a changed base URL keeps its cache support.
 var promptCacheKeyCompatibility sync.Map
 
-// sendRequest handles the optional cache hint after all transformations and
+// sendRequestWithPromptCacheKeyCompatibility handles the optional cache hint after all transformations and
 // overrides. Both normalized and raw passthrough requests use this path.
-func (ra *relayAttempt) sendRequest(req *http.Request) (*http.Response, error) {
+func (ra *relayAttempt) sendRequestWithPromptCacheKeyCompatibility(req *http.Request) (*http.Response, error) {
 	if ra.channel.Type != outbound.OutboundTypeOpenAIChat &&
 		ra.channel.Type != outbound.OutboundTypeOpenAIResponse {
 		return ra.sendRequestOnce(req)

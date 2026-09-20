@@ -328,6 +328,44 @@ func TestStreamToolCallArgumentDeltaUsesStoredOutputIndex(t *testing.T) {
 	}
 }
 
+func TestTransformStreamEventsPreservesToolCallArgumentsDelta(t *testing.T) {
+	toolCall := model.ToolCall{
+		Index: 0,
+		ID:    "call_echo",
+		Type:  "function",
+		Function: model.FunctionCall{
+			Name: "echo_text",
+		},
+	}
+	events := []model.StreamEvent{
+		{Kind: model.StreamEventKindMessageStart, ID: "resp_tool", Model: "gpt-test", Index: 0, Role: "assistant"},
+		{Kind: model.StreamEventKindToolCallStart, ID: "resp_tool", Model: "gpt-test", Index: 0, ToolCall: &toolCall},
+		{Kind: model.StreamEventKindToolCallDelta, ID: "resp_tool", Model: "gpt-test", Index: 0, ToolCall: &toolCall, Delta: &model.StreamDelta{Arguments: `{"text":"ping"}`}},
+		{Kind: model.StreamEventKindMessageStop, ID: "resp_tool", Model: "gpt-test", Index: 0, StopReason: model.FinishReasonToolCalls},
+		{Kind: model.StreamEventKindUsageDelta, ID: "resp_tool", Model: "gpt-test", Usage: &model.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15}},
+	}
+
+	inbound := &ResponseInbound{}
+	out, err := inbound.TransformStreamEvents(context.Background(), events)
+	if err != nil {
+		t.Fatalf("TransformStreamEvents failed: %v", err)
+	}
+	streamEvents := parseSSEEvents(t, out)
+
+	delta := findEvent(streamEvents, "response.function_call_arguments.delta")
+	if delta == nil || delta.Delta != `{"text":"ping"}` {
+		t.Fatalf("expected function call argument delta, got %+v", delta)
+	}
+	done := findEvent(streamEvents, "response.function_call_arguments.done")
+	if done == nil || done.Arguments != `{"text":"ping"}` {
+		t.Fatalf("expected function call arguments on done event, got %+v", done)
+	}
+	item := findItemDone(streamEvents, "function_call")
+	if item == nil || item.Arguments != `{"text":"ping"}` {
+		t.Fatalf("expected function call arguments on output item, got %+v", item)
+	}
+}
+
 func TestTransformStreamEventsSignatureOnlyStillOpensReasoningItem(t *testing.T) {
 	i := &ResponseInbound{}
 	ctx := context.Background()

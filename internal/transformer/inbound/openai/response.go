@@ -218,7 +218,11 @@ func (i *ResponseInbound) processStreamEvents(ctx context.Context, events []mode
 
 		case model.StreamEventKindToolCallDelta:
 			if event.ToolCall != nil {
-				out = append(out, i.handleToolCalls([]model.ToolCall{*event.ToolCall})...)
+				toolCall := *event.ToolCall
+				if event.Delta != nil && event.Delta.Arguments != "" {
+					toolCall.Function.Arguments = event.Delta.Arguments
+				}
+				out = append(out, i.handleToolCalls([]model.ToolCall{toolCall})...)
 			}
 
 		case model.StreamEventKindMessageStop:

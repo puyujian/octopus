@@ -38,10 +38,41 @@ type GeminiModelList struct {
 }
 
 type OpenAIModel struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int    `json:"created"`
-	OwnedBy string `json:"owned_by"`
+	ID               string                   `json:"id"`
+	Object           string                   `json:"object"`
+	Created          int                      `json:"created"`
+	OwnedBy          string                   `json:"owned_by"`
+	Name             string                   `json:"name,omitempty"`
+	Description      string                   `json:"description,omitempty"`
+	ContextLength    int                      `json:"context_length,omitempty"`
+	MaxOutputTokens  int                      `json:"max_output_tokens,omitempty"`
+	TopProvider      *OpenAIModelTopProvider  `json:"top_provider,omitempty"`
+	Architecture     *OpenAIModelArchitecture `json:"architecture,omitempty"`
+	Pricing          *OpenAIModelPricing      `json:"pricing,omitempty"`
+	Reasoning        *bool                    `json:"reasoning,omitempty"`
+	ReasoningOptions []ModelReasoningOption   `json:"reasoning_options,omitempty"`
+}
+
+type ModelReasoningOption struct {
+	Type   string   `json:"type"`
+	Values []string `json:"values,omitempty"`
+}
+
+type OpenAIModelTopProvider struct {
+	ContextLength       int `json:"context_length,omitempty"`
+	MaxCompletionTokens int `json:"max_completion_tokens,omitempty"`
+}
+
+type OpenAIModelArchitecture struct {
+	InputModalities  []string `json:"input_modalities,omitempty"`
+	OutputModalities []string `json:"output_modalities,omitempty"`
+}
+
+type OpenAIModelPricing struct {
+	Prompt          string `json:"prompt"`
+	Completion      string `json:"completion"`
+	InputCacheRead  string `json:"input_cache_read,omitempty"`
+	InputCacheWrite string `json:"input_cache_write,omitempty"`
 }
 
 type OpenAIModelList struct {
@@ -49,10 +80,14 @@ type OpenAIModelList struct {
 	Data   []OpenAIModel `json:"data"`
 }
 type AnthropicModel struct {
-	ID          string `json:"id"`
-	CreatedAt   string `json:"created_at"`
-	DisplayName string `json:"display_name"`
-	Type        string `json:"type"`
+	ID               string                 `json:"id"`
+	CreatedAt        string                 `json:"created_at"`
+	DisplayName      string                 `json:"display_name"`
+	Type             string                 `json:"type"`
+	MaxInputTokens   *int                   `json:"max_input_tokens,omitempty"`
+	MaxTokens        *int                   `json:"max_tokens,omitempty"`
+	Reasoning        *bool                  `json:"reasoning,omitempty"`
+	ReasoningOptions []ModelReasoningOption `json:"reasoning_options,omitempty"`
 }
 
 type AnthropicModelList struct {

@@ -115,7 +115,11 @@ func fetchOpenAIModels(client *http.Client, ctx context.Context, request model.C
 	}
 	defer resp.Body.Close()
 
-	var result model.OpenAIModelList
+	var result struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
 	if err := decodeModelJSONResponse(resp, &result); err != nil {
 		return nil, err
 	}

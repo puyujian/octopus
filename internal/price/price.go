@@ -32,6 +32,20 @@ var Provider = []string{
 
 var lastUpdateTime time.Time
 
+type ModelMetadata struct {
+	Name             string
+	Description      string
+	ContextLength    int
+	MaxInputTokens   int
+	MaxOutputTokens  int
+	InputModalities  []string
+	OutputModalities []string
+	Reasoning        *bool
+	ReasoningOptions []model.ModelReasoningOption
+}
+
+var modelMetadata = make(map[string]ModelMetadata)
+
 func UpdateLLMPrice(ctx context.Context) error {
 	log.Debugf("update LLM price task started")
 	startTime := time.Now()
@@ -55,29 +69,72 @@ func UpdateLLMPrice(ctx context.Context) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("failed to fetch LLM info: %s", resp.Status)
 	}
-	var rawPrice map[string]struct {
-		Models map[string]struct {
-			ID   string         `json:"id"`
-			Cost model.LLMPrice `json:"cost"`
-		} `json:"models"`
-	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("failed to read response body: %w", err)
+	}
+	if err := updateModelCatalog(body); err != nil {
+		return err
+	}
+	lastUpdateTime = time.Now()
+	return nil
+}
+
+func updateModelCatalog(body []byte) error {
+	var rawPrice map[string]struct {
+		Models map[string]struct {
+			ID          string         `json:"id"`
+			Name        string         `json:"name"`
+			Description string         `json:"description"`
+			Cost        model.LLMPrice `json:"cost"`
+			Limit       struct {
+				Context int `json:"context"`
+				Input   int `json:"input"`
+				Output  int `json:"output"`
+			} `json:"limit"`
+			Modalities struct {
+				Input  []string `json:"input"`
+				Output []string `json:"output"`
+			} `json:"modalities"`
+			Reasoning        *bool                        `json:"reasoning"`
+			ReasoningOptions []model.ModelReasoningOption `json:"reasoning_options"`
+		} `json:"models"`
 	}
 	if err := json.Unmarshal(body, &rawPrice); err != nil {
 		return fmt.Errorf("failed to parse LLM info: %w", err)
 	}
 	llmPriceLock.Lock()
+	metadata := make(map[string]ModelMetadata)
 	for _, provider := range Provider {
 		for _, model := range rawPrice[provider].Models {
 			model.ID = strings.ToLower(model.ID)
+			if model.ID == "" {
+				continue
+			}
 			llmPrice[model.ID] = model.Cost
+			metadata[model.ID] = ModelMetadata{
+				Name:             model.Name,
+				Description:      model.Description,
+				ContextLength:    model.Limit.Context,
+				MaxInputTokens:   model.Limit.Input,
+				MaxOutputTokens:  model.Limit.Output,
+				InputModalities:  model.Modalities.Input,
+				OutputModalities: model.Modalities.Output,
+				Reasoning:        model.Reasoning,
+				ReasoningOptions: model.ReasoningOptions,
+			}
 		}
 	}
+	modelMetadata = metadata
 	llmPriceLock.Unlock()
-	lastUpdateTime = time.Now()
 	return nil
+}
+
+func GetModelMetadata(modelName string) (ModelMetadata, bool) {
+	llmPriceLock.RLock()
+	defer llmPriceLock.RUnlock()
+	metadata, ok := modelMetadata[strings.ToLower(modelName)]
+	return metadata, ok
 }
 
 func GetLastUpdateTime() time.Time {

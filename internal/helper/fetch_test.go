@@ -47,3 +47,20 @@ func TestFetchModelsUsesBrowserHeadersAndSummarizesHTMLError(t *testing.T) {
 		t.Fatalf("expected Accept-Language header to be set")
 	}
 }
+
+func TestFetchModelsIgnoresNonstandardModelMetadata(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"object":"list","data":[{"id":"glm-5.3","reasoning_options":{"vendor_specific":true},"pricing":"free"}]}`))
+	}))
+	defer server.Close()
+
+	models, err := FetchModels(context.Background(), model.Channel{
+		Type:     outbound.OutboundTypeOpenAIChat,
+		BaseUrls: []model.BaseUrl{{URL: server.URL}},
+		Keys:     []model.ChannelKey{{Enabled: true, ChannelKey: "test-key"}},
+	})
+	if err != nil || len(models) != 1 || models[0] != "glm-5.3" {
+		t.Fatalf("unexpected model list: %v, %v", models, err)
+	}
+}

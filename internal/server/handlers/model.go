@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/bestruirui/octopus/internal/model"
@@ -11,7 +12,6 @@ import (
 	"github.com/bestruirui/octopus/internal/server/resp"
 	"github.com/bestruirui/octopus/internal/server/router"
 	"github.com/gin-gonic/gin"
-	"github.com/samber/lo"
 )
 
 func init() {
@@ -51,58 +51,201 @@ func init() {
 		AddRoute(
 			router.NewRoute("/models", http.MethodGet).
 				Handle(getModelList),
+		).
+		AddRoute(
+			router.NewRoute("/models/*model", http.MethodGet).
+				Handle(getModel),
 		)
 }
 
-func getModelList(c *gin.Context) {
+func availableModelNames(c *gin.Context) ([]string, error) {
 	models, err := op.GroupListModel(c.Request.Context())
 	if err != nil {
-		resp.Error(c, http.StatusInternalServerError, err.Error())
-		return
+		return nil, err
 	}
-	apiKeyId := c.GetInt("api_key_id")
-	apiKey, err := op.APIKeyGet(apiKeyId, c.Request.Context())
+	if supported := c.GetString("supported_models"); supported != "" {
+		allowed := make(map[string]bool)
+		for _, name := range strings.Split(supported, ",") {
+			allowed[strings.TrimSpace(name)] = true
+		}
+		filtered := make([]string, 0, len(models))
+		for _, name := range models {
+			if allowed[name] {
+				filtered = append(filtered, name)
+			}
+		}
+		models = filtered
+	}
+	return models, nil
+}
+
+func newOpenAIModel(name string, metadata price.ModelMetadata, found bool, modelPrice *model.LLMPrice) model.OpenAIModel {
+	result := model.OpenAIModel{ID: name, Object: "model", Created: 1763395200, OwnedBy: "octopus"}
+	if found {
+		result.Name = metadata.Name
+		result.Description = metadata.Description
+		if metadata.ContextLength > 0 {
+			result.ContextLength = metadata.ContextLength
+			result.TopProvider = &model.OpenAIModelTopProvider{ContextLength: metadata.ContextLength}
+		}
+		if metadata.MaxOutputTokens > 0 {
+			result.MaxOutputTokens = metadata.MaxOutputTokens
+			if result.TopProvider == nil {
+				result.TopProvider = &model.OpenAIModelTopProvider{}
+			}
+			result.TopProvider.MaxCompletionTokens = metadata.MaxOutputTokens
+		}
+		if len(metadata.InputModalities) > 0 || len(metadata.OutputModalities) > 0 {
+			result.Architecture = &model.OpenAIModelArchitecture{
+				InputModalities: metadata.InputModalities, OutputModalities: metadata.OutputModalities,
+			}
+		}
+		result.Reasoning = metadata.Reasoning
+		result.ReasoningOptions = metadata.ReasoningOptions
+	}
+	if modelPrice != nil && *modelPrice != (model.LLMPrice{}) {
+		result.Pricing = &model.OpenAIModelPricing{
+			Prompt:          strconv.FormatFloat(modelPrice.Input/1e6, 'f', -1, 64),
+			Completion:      strconv.FormatFloat(modelPrice.Output/1e6, 'f', -1, 64),
+			InputCacheRead:  strconv.FormatFloat(modelPrice.CacheRead/1e6, 'f', -1, 64),
+			InputCacheWrite: strconv.FormatFloat(modelPrice.CacheWrite/1e6, 'f', -1, 64),
+		}
+	}
+	return result
+}
+
+func modelDetails(name string) (price.ModelMetadata, bool, *model.LLMPrice) {
+	metadata, found := price.GetModelMetadata(name)
+	return metadata, found, price.GetLLMPrice(name)
+}
+
+func newAnthropicModel(name string, metadata price.ModelMetadata, found bool) model.AnthropicModel {
+	result := model.AnthropicModel{ID: name, CreatedAt: "2024-01-01T00:00:00Z", DisplayName: name, Type: "model"}
+	if found {
+		if metadata.Name != "" {
+			result.DisplayName = metadata.Name
+		}
+		if metadata.MaxInputTokens > 0 {
+			result.MaxInputTokens = &metadata.MaxInputTokens
+		} else if metadata.ContextLength > 0 {
+			result.MaxInputTokens = &metadata.ContextLength
+		}
+		if metadata.MaxOutputTokens > 0 {
+			result.MaxTokens = &metadata.MaxOutputTokens
+		}
+		result.Reasoning = metadata.Reasoning
+		result.ReasoningOptions = metadata.ReasoningOptions
+	}
+	return result
+}
+
+type etaReasoningMetadata struct {
+	SupportedEfforts []string `json:"supported_efforts,omitempty"`
+	Mandatory        bool     `json:"mandatory"`
+}
+
+type etaOpenAIModel struct {
+	model.OpenAIModel
+	Reasoning any `json:"reasoning,omitempty"`
+}
+
+type etaAnthropicModel struct {
+	model.AnthropicModel
+	Capabilities gin.H `json:"capabilities,omitempty"`
+}
+
+func etaReasoningOptions(reasoning *bool, options []model.ModelReasoningOption) (etaReasoningMetadata, bool, bool) {
+	if reasoning == nil || !*reasoning {
+		return etaReasoningMetadata{}, false, false
+	}
+	metadata := etaReasoningMetadata{}
+	canDisable := false
+	for _, option := range options {
+		switch option.Type {
+		case "effort":
+			metadata.SupportedEfforts = append(metadata.SupportedEfforts, option.Values...)
+		case "toggle":
+			canDisable = true
+		}
+	}
+	if len(metadata.SupportedEfforts) == 0 && !canDisable {
+		return etaReasoningMetadata{}, false, false
+	}
+	metadata.Mandatory = !canDisable
+	return metadata, canDisable, true
+}
+
+func newEtaOpenAIModel(result model.OpenAIModel) etaOpenAIModel {
+	response := etaOpenAIModel{OpenAIModel: result, Reasoning: result.Reasoning}
+	if metadata, _, ok := etaReasoningOptions(result.Reasoning, result.ReasoningOptions); ok {
+		response.Reasoning = metadata
+	}
+	return response
+}
+
+func newEtaAnthropicModel(result model.AnthropicModel) etaAnthropicModel {
+	response := etaAnthropicModel{AnthropicModel: result}
+	metadata, canDisable, ok := etaReasoningOptions(result.Reasoning, result.ReasoningOptions)
+	if !ok {
+		return response
+	}
+	capabilities := gin.H{}
+	if len(metadata.SupportedEfforts) > 0 {
+		efforts := gin.H{"supported": true}
+		for _, effort := range metadata.SupportedEfforts {
+			efforts[effort] = gin.H{"supported": true}
+		}
+		capabilities["effort"] = efforts
+	}
+	if canDisable {
+		capabilities["thinking"] = gin.H{"supported": true}
+	}
+	response.Capabilities = capabilities
+	return response
+}
+
+func isEtaModelsClient(c *gin.Context) bool {
+	userAgent := c.GetHeader("User-Agent")
+	return strings.EqualFold(userAgent, "Eta") || strings.HasPrefix(strings.ToLower(userAgent), "eta/") || strings.EqualFold(c.GetHeader("X-Octopus-Model-Format"), "eta")
+}
+
+func getModelList(c *gin.Context) {
+	models, err := availableModelNames(c)
 	if err != nil {
 		resp.Error(c, http.StatusInternalServerError, err.Error())
 		return
-	}
-	if apiKey.SupportedModels != "" {
-		supportedModels := lo.Map(strings.Split(apiKey.SupportedModels, ","), func(s string, _ int) string {
-			return strings.TrimSpace(s)
-		})
-		models = lo.Filter(models, func(m string, _ int) bool {
-			return lo.Contains(supportedModels, m)
-		})
 	}
 
 	if c.GetString("request_type") == "anthropic" {
-		var anthropicModels []model.AnthropicModel
-		for _, m := range models {
-			anthropicModels = append(anthropicModels, model.AnthropicModel{
-				ID:          m,
-				CreatedAt:   "2024-01-01T00:00:00Z",
-				DisplayName: m,
-				Type:        "model",
-			})
+		anthropicModels := make([]any, 0, len(models))
+		for _, name := range models {
+			metadata, found, _ := modelDetails(name)
+			result := newAnthropicModel(name, metadata, found)
+			if isEtaModelsClient(c) {
+				anthropicModels = append(anthropicModels, newEtaAnthropicModel(result))
+			} else {
+				anthropicModels = append(anthropicModels, result)
+			}
 		}
 		response := gin.H{
 			"data":     anthropicModels,
 			"has_more": false,
 		}
-		if len(anthropicModels) > 0 {
-			response["first_id"] = anthropicModels[0].ID
-			response["last_id"] = anthropicModels[len(anthropicModels)-1].ID
+		if len(models) > 0 {
+			response["first_id"] = models[0]
+			response["last_id"] = models[len(models)-1]
 		}
 		c.JSON(200, response)
 	} else {
-		var openAIModels []model.OpenAIModel
-		for _, m := range models {
-			openAIModels = append(openAIModels, model.OpenAIModel{
-				ID:      m,
-				Object:  "model",
-				Created: 1763395200,
-				OwnedBy: "octopus",
-			})
+		openAIModels := make([]any, 0, len(models))
+		for _, name := range models {
+			metadata, found, modelPrice := modelDetails(name)
+			result := newOpenAIModel(name, metadata, found, modelPrice)
+			if isEtaModelsClient(c) {
+				openAIModels = append(openAIModels, newEtaOpenAIModel(result))
+			} else {
+				openAIModels = append(openAIModels, result)
+			}
 		}
 		c.JSON(200, gin.H{
 			"success": true,
@@ -110,6 +253,38 @@ func getModelList(c *gin.Context) {
 			"object":  "list",
 		})
 	}
+}
+
+func getModel(c *gin.Context) {
+	name := strings.TrimPrefix(c.Param("model"), "/")
+	models, err := availableModelNames(c)
+	if err != nil {
+		resp.Error(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	for _, available := range models {
+		if available != name {
+			continue
+		}
+		metadata, found, modelPrice := modelDetails(name)
+		if c.GetString("request_type") == "anthropic" {
+			result := newAnthropicModel(name, metadata, found)
+			if isEtaModelsClient(c) {
+				c.JSON(http.StatusOK, newEtaAnthropicModel(result))
+			} else {
+				c.JSON(http.StatusOK, result)
+			}
+		} else {
+			result := newOpenAIModel(name, metadata, found, modelPrice)
+			if isEtaModelsClient(c) {
+				c.JSON(http.StatusOK, newEtaOpenAIModel(result))
+			} else {
+				c.JSON(http.StatusOK, result)
+			}
+		}
+		return
+	}
+	resp.NotFound(c)
 }
 
 func listLLM(c *gin.Context) {

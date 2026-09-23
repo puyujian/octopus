@@ -352,6 +352,10 @@ curl http://你的IP:8080/v1/models \
 
 能列出模型（也就是你建的**分组名**）就说明通了。
 
+`GET /v1/models/{模型名}` 可查询单个模型，同样受 API Key 的「支持的模型」限制。列表和详情除了 OpenAI 标准字段，还会按分组名匹配 models.dev，提供已知的 `name`、`description`、`context_length`、`max_output_tokens`、`top_provider`、`architecture`、`reasoning`（是否支持推理）、`reasoning_options`（目录记录的思考选项）和 `pricing`（每 token 价格字符串，优先使用价格管理中的价格）。使用 `x-api-key` 请求时，Anthropic 格式也会提供已知的 `max_input_tokens`、`max_tokens` 和思考选项。这些是分组名匹配到的目录参考信息，**不保证分组内每个渠道/变体都具有相同窗口或支持相同思考等级**；不匹配目录的分组仍可返回手动设置的价格，但不猜测上下文或思考能力。
+
+ETA 客户端使用 `User-Agent: Eta` 获取模型列表时，会收到其支持的 `reasoning.supported_efforts` 格式（Anthropic 模式使用 `capabilities.effort`）；其他客户端仍收到原有的 `reasoning` 布尔值。如果旧版 ETA 没有发送该标识，可在提供商自定义请求头中设置 `X-Octopus-Model-Format: eta`。更新 ETA 里的模型列表后即可查看自动识别的档位；如果曾在 ETA 手动覆盖思考能力，还需要点击模型设置中的「恢复自动」。实际调用是否支持仍取决于分组路由到的上游。
+
 ### 8.2 接入常见客户端
 
 **OpenAI SDK / Cherry Studio / 沉浸式翻译**等：

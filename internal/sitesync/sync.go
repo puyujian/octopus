@@ -58,7 +58,7 @@ func checkinAccountState(ctx context.Context, siteRecord *model.Site, account *m
 		if err != nil {
 			return nil, accessToken, err
 		}
-		payload, err := requestJSONWithManagedAccessToken(ctx, siteRecord, http.MethodPost, buildSiteURL(siteRecord.BaseURL, "/api/user/checkin"), nil, accessToken, account)
+		payload, err := requestManagedCheckin(ctx, siteRecord, account, accessToken)
 		if err != nil {
 			lowered := strings.ToLower(err.Error())
 			if strings.Contains(lowered, "404") || strings.Contains(lowered, "not found") {

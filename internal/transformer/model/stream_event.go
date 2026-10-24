@@ -21,6 +21,7 @@ const (
 	StreamEventKindMessageStop       StreamEventKind = "message_stop"
 	StreamEventKindDone              StreamEventKind = "done"
 	StreamEventKindError             StreamEventKind = "error"
+	StreamEventKindWebSearch         StreamEventKind = "web_search"
 )
 
 type StreamEvent struct {
@@ -31,13 +32,14 @@ type StreamEvent struct {
 	Index int    `json:"index,omitempty"`
 	Role  string `json:"role,omitempty"`
 
-	ContentBlock *StreamContentBlock `json:"content_block,omitempty"`
-	Delta        *StreamDelta        `json:"delta,omitempty"`
-	ToolCall     *ToolCall           `json:"tool_call,omitempty"`
-	Usage        *Usage              `json:"usage,omitempty"`
-	StopReason   FinishReason        `json:"stop_reason,omitempty"`
-	StopSequence *string             `json:"stop_sequence,omitempty"`
-	Error        *ResponseError      `json:"error,omitempty"`
+	ContentBlock  *StreamContentBlock `json:"content_block,omitempty"`
+	Delta         *StreamDelta        `json:"delta,omitempty"`
+	ToolCall      *ToolCall           `json:"tool_call,omitempty"`
+	Usage         *Usage              `json:"usage,omitempty"`
+	StopReason    FinishReason        `json:"stop_reason,omitempty"`
+	StopSequence  *string             `json:"stop_sequence,omitempty"`
+	Error         *ResponseError      `json:"error,omitempty"`
+	WebSearchCall *WebSearchCall      `json:"web_search_call,omitempty"`
 
 	ProviderExtensions *ProviderExtensions `json:"provider_extensions,omitempty"`
 }
@@ -70,10 +72,14 @@ func StreamEventsFromInternalResponse(response *InternalLLMResponse) []StreamEve
 	if response.Object == "[DONE]" {
 		return []StreamEvent{{Kind: StreamEventKindDone}}
 	}
-	if response.Error != nil {
-		return []StreamEvent{{Kind: StreamEventKindError, ID: response.ID, Model: response.Model, Error: response.Error}}
-	}
 	events := make([]StreamEvent, 0, len(response.Choices)+1)
+	for _, call := range response.WebSearchCalls {
+		call := call
+		events = append(events, StreamEvent{Kind: StreamEventKindWebSearch, ID: response.ID, Model: response.Model, WebSearchCall: &call})
+	}
+	if response.Error != nil {
+		return append(events, StreamEvent{Kind: StreamEventKindError, ID: response.ID, Model: response.Model, Error: response.Error})
+	}
 	for _, choice := range response.Choices {
 		if choice.Delta != nil {
 			delta := choice.Delta
@@ -195,6 +201,12 @@ func InternalResponseFromStreamEvents(events []StreamEvent) *InternalLLMResponse
 		if event.Kind == StreamEventKindUsageDelta {
 			continue
 		}
+		if event.Kind == StreamEventKindWebSearch {
+			if event.WebSearchCall != nil {
+				response.WebSearchCalls = MergeWebSearchCalls(response.WebSearchCalls, *event.WebSearchCall)
+			}
+			continue
+		}
 		if event.Kind == StreamEventKindError {
 			response.Error = event.Error
 			continue
@@ -215,26 +227,32 @@ func InternalResponseFromStreamEvents(events []StreamEvent) *InternalLLMResponse
 		case StreamEventKindTextDelta:
 			if event.Delta != nil {
 				if event.Delta.Text != "" {
-					text := event.Delta.Text
-					choice.Delta.Content.Content = &text
+					if choice.Delta.Content.Content == nil {
+						choice.Delta.Content.Content = new(string)
+					}
+					*choice.Delta.Content.Content += event.Delta.Text
 				}
 				if event.Delta.Refusal != "" {
-					choice.Delta.Refusal = event.Delta.Refusal
+					choice.Delta.Refusal += event.Delta.Refusal
 				}
 			}
 		case StreamEventKindThinkingDelta:
 			if event.Delta != nil && (event.Delta.Thinking != "" || event.Delta.Signature != "") {
 				if event.Delta.Thinking != "" {
-					thinking := event.Delta.Thinking
-					choice.Delta.ReasoningContent = &thinking
+					if choice.Delta.ReasoningContent == nil {
+						choice.Delta.ReasoningContent = new(string)
+					}
+					*choice.Delta.ReasoningContent += event.Delta.Thinking
 				}
 				choice.Delta.AppendReasoningBlock(ReasoningBlock{Kind: ReasoningBlockKindThinking, Index: -1, Text: event.Delta.Thinking, Signature: event.Delta.Signature})
 			}
 		case StreamEventKindSignatureDelta:
 			if event.Delta != nil && event.Delta.Signature != "" {
-				signature := event.Delta.Signature
-				choice.Delta.ReasoningSignature = &signature
-				choice.Delta.AppendReasoningBlock(ReasoningBlock{Kind: ReasoningBlockKindSignature, Index: -1, Signature: signature})
+				if choice.Delta.ReasoningSignature == nil {
+					choice.Delta.ReasoningSignature = new(string)
+				}
+				*choice.Delta.ReasoningSignature += event.Delta.Signature
+				choice.Delta.AppendReasoningBlock(ReasoningBlock{Kind: ReasoningBlockKindSignature, Index: -1, Signature: event.Delta.Signature})
 			}
 		case StreamEventKindToolCallStart, StreamEventKindToolCallDelta:
 			if event.ToolCall != nil {
@@ -260,7 +278,7 @@ func InternalResponseFromStreamEvents(events []StreamEvent) *InternalLLMResponse
 	for _, idx := range indices {
 		response.Choices = append(response.Choices, *choices[idx])
 	}
-	if len(response.Choices) == 0 && response.Usage == nil && response.Error == nil {
+	if len(response.Choices) == 0 && response.Usage == nil && response.Error == nil && len(response.WebSearchCalls) == 0 {
 		return nil
 	}
 	return response

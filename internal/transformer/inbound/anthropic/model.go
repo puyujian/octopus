@@ -301,6 +301,7 @@ type MessageParam struct {
 
 // MessageContent supports both string and array formats.
 type MessageContent struct {
+	Raw             json.RawMessage       `json:"-"`
 	Content         *string               `json:"content,omitempty"`
 	MultipleContent []MessageContentBlock `json:"multiple_content,omitempty"`
 }
@@ -329,6 +330,9 @@ func (m MessageContent) ExtractTrivalBlocks(cacheControl *CacheControl) []Messag
 }
 
 func (c MessageContent) MarshalJSON() ([]byte, error) {
+	if len(c.Raw) > 0 {
+		return c.Raw, nil
+	}
 	if c.Content != nil {
 		return json.Marshal(c.Content)
 	}
@@ -337,6 +341,7 @@ func (c MessageContent) MarshalJSON() ([]byte, error) {
 }
 
 func (c *MessageContent) UnmarshalJSON(data []byte) error {
+	c.Raw = nil
 	if string(data) == "null" {
 		return fmt.Errorf("content cannot be null")
 	}
@@ -377,6 +382,11 @@ type MessageContentBlock struct {
 	// "tool_use", "server_tool_use", "tool_result", "web_search_tool_result",
 	// "code_execution_tool_result".
 	Type string `json:"type"`
+
+	// Mid-conversation tool changes carry either a definition or a reference.
+	Tool       json.RawMessage `json:"tool,omitempty"`
+	Definition json.RawMessage `json:"definition,omitempty"`
+	ToolName   string          `json:"tool_name,omitempty"`
 
 	// Text will be present if type is "text".
 	// Use pointer to distinguish between "not set" (nil, omitted) and "set to empty" (non-nil, included).

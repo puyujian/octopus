@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"strings"
 	"testing"
 
+	inboundAnthropic "github.com/bestruirui/octopus/internal/transformer/inbound/anthropic"
 	inboundOpenAI "github.com/bestruirui/octopus/internal/transformer/inbound/openai"
 )
 
@@ -42,6 +44,75 @@ func TestResponsesSearchToolControlsSurviveNormalization(t *testing.T) {
 		gotJSON, _ := json.Marshal(got)
 		if string(wantJSON) != string(gotJSON) {
 			t.Fatalf("search controls changed: want %s, got %s", wantJSON, gotJSON)
+		}
+	}
+}
+
+func TestAnthropicForcedSearchToResponses(t *testing.T) {
+	for _, tc := range []struct{ name, tools, choice string }{
+		{"native", `{"type":"web_search_20250305","name":"web_search","allowed_domains":["example.org"]}`, `{"type":"web_search"}`},
+		{"function", `{"name":"web_search","input_schema":{}}`, `{"type":"function","name":"web_search"}`},
+		{"collision", `{"type":"web_search_20250305","name":"web_search"},{"name":"web_search","input_schema":{}}`, `{"type":"function","name":"web_search"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := (&inboundAnthropic.MessagesInbound{}).TransformRequest(context.Background(), []byte(`{"model":"test","max_tokens":32,"messages":[{"role":"user","content":"search"}],"tools":[`+tc.tools+`],"tool_choice":{"type":"tool","name":"web_search"}}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, err := (&ResponseOutbound{}).TransformRequest(context.Background(), req, "https://example.test/v1", "key")
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(out.Body)
+			out.Body.Close()
+			var payload map[string]json.RawMessage
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatal(err)
+			}
+			var got, want any
+			json.Unmarshal(payload["tool_choice"], &got)
+			json.Unmarshal([]byte(tc.choice), &want)
+			gotJSON, _ := json.Marshal(got)
+			wantJSON, _ := json.Marshal(want)
+			if string(gotJSON) != string(wantJSON) {
+				t.Fatalf("choice = %s, want %s; body=%s", gotJSON, wantJSON, body)
+			}
+			if tc.name != "function" && !strings.Contains(string(payload["include"]), "web_search_call.action.sources") {
+				t.Fatalf("search sources not requested: %s", body)
+			}
+			if tc.name == "native" && !strings.Contains(string(payload["tools"]), "example.org") {
+				t.Fatalf("domain constraint lost: %s", body)
+			}
+		})
+	}
+}
+
+func TestAnthropicSearchParallelControlsAndRetry(t *testing.T) {
+	for _, mode := range []string{"any", "auto", "none"} {
+		raw := []byte(`{"model":"test","messages":[{"role":"user","content":"search"}],"tools":[{"type":"web_search_20250305","name":"web_search"}],"tool_choice":{"type":"` + mode + `","disable_parallel_tool_use":true}}`)
+		req, err := (&inboundAnthropic.MessagesInbound{}).TransformRequest(context.Background(), raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := (&ResponseOutbound{}).TransformRequest(context.Background(), req, "https://example.test/v1", "key")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(out.Body)
+		out.Body.Close()
+		var payload map[string]json.RawMessage
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatal(err)
+		}
+		want := mode
+		if mode == "any" {
+			want = "required"
+		}
+		if string(payload["tool_choice"]) != `"`+want+`"` || string(payload["parallel_tool_calls"]) != "false" {
+			t.Fatalf("tool controls lost: %s", body)
+		}
+		if req.Tools[0].Type != "web_search_20250305" || req.ToolChoice.NamedToolChoice.Type != mode || len(req.Include) != 0 {
+			t.Fatal("Responses conversion mutated original request needed for retry")
 		}
 	}
 }

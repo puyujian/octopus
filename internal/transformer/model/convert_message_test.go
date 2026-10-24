@@ -55,3 +55,44 @@ func TestToLLMContentPartRetainsDocumentMetadataWithoutInputMetadata(t *testing.
 		t.Fatalf("document metadata/content did not round-trip: %#v", roundTrip)
 	}
 }
+
+func TestToLLMMessagePreservesMixedReasoning(t *testing.T) {
+	for _, source := range []string{"blocks", "legacy"} {
+		t.Run(source, func(t *testing.T) {
+			msg := FromLLMMessage(&llm.Message{
+				Role:                     "assistant",
+				ReasoningItems:           []llm.ReasoningItem{{ID: "reason-1", Content: "plan", Signature: "sig"}},
+				RedactedReasoningContent: ptrStr("opaque"),
+			})
+			if source == "legacy" {
+				msg.ReasoningBlocks = nil
+			}
+			got, err := ToLLMMessage(msg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got.ReasoningItems) != 1 || got.ReasoningItems[0].Signature != "sig" {
+				t.Fatalf("thinking item lost or duplicated: %+v", got.ReasoningItems)
+			}
+			if got.RedactedReasoningContent == nil || *got.RedactedReasoningContent != "opaque" {
+				t.Fatalf("redacted thinking lost: %+v", got.RedactedReasoningContent)
+			}
+		})
+	}
+}
+
+func TestToLLMMessagePreservesScalarReasoningWithRedacted(t *testing.T) {
+	got, err := ToLLMMessage(&Message{
+		ReasoningContent: ptrStr("plan"), ReasoningSignature: ptrStr("sig"),
+		RedactedThinkingBlocks: []string{"opaque"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.ReasoningItems) != 1 || got.ReasoningItems[0].Content != "plan" || got.ReasoningItems[0].Signature != "sig" {
+		t.Fatalf("scalar reasoning lost: %+v", got.ReasoningItems)
+	}
+	if got.RedactedReasoningContent == nil || *got.RedactedReasoningContent != "opaque" {
+		t.Fatalf("redacted thinking lost: %+v", got.RedactedReasoningContent)
+	}
+}

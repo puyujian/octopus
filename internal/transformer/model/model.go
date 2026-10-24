@@ -1381,6 +1381,7 @@ type InternalLLMResponse struct {
 	// RawResponsesOutputItems preserves exact OpenAI Responses output items when available.
 	// It is an internal helper field for exact replay reconstruction and is not part of API output.
 	RawResponsesOutputItems json.RawMessage `json:"-"`
+	WebSearchCalls          []WebSearchCall `json:"-"`
 
 	// A list of chat completion choices. Can be more than one if `n` is greater
 	// than 1.

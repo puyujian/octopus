@@ -36,6 +36,7 @@ type ResponseOutbound struct {
 	// message, function_call), so function calls may start above 0, while
 	// the Chat Completions protocol expects dense 0-based tool_calls indices.
 	toolCallIndexes map[int]int
+	searchCalls     []model.WebSearchCall
 
 	// inner is the axonhub Responses outbound converter used for response
 	// and stream parsing (request serialization stays local).
@@ -78,6 +79,11 @@ func (o *ResponseOutbound) toolCallIndexFor(outputIndex int) int {
 func (o *ResponseOutbound) TransformRequest(ctx context.Context, request *model.InternalLLMRequest, baseUrl, key string) (*http.Request, error) {
 	if request == nil {
 		return nil, fmt.Errorf("request is nil")
+	}
+	var err error
+	request, err = prepareAnthropicResponsesRequest(request)
+	if err != nil {
+		return nil, err
 	}
 
 	request.NormalizeMessages()
@@ -254,6 +260,9 @@ func mergeResponsesCompatibility(dst, fallback *model.InternalLLMResponse) {
 	if dst.Error == nil {
 		dst.Error = fallback.Error
 	}
+	for _, call := range fallback.WebSearchCalls {
+		dst.WebSearchCalls = model.MergeWebSearchCalls(dst.WebSearchCalls, call)
+	}
 	if len(dst.RawResponsesOutputItems) == 0 {
 		dst.RawResponsesOutputItems = append(json.RawMessage(nil), fallback.RawResponsesOutputItems...)
 	}
@@ -333,7 +342,7 @@ func (o *ResponseOutbound) TransformStreamEvent(ctx context.Context, eventData [
 		}
 	}
 
-	var events []model.StreamEvent
+	events := o.responsesSearchEvents(streamEvent)
 	base := model.StreamEvent{ID: o.streamID, Model: o.streamModel, Index: 0}
 
 	switch streamEvent.Type {
@@ -415,7 +424,7 @@ func (o *ResponseOutbound) TransformStreamEvent(ctx context.Context, eventData [
 			}
 		}
 
-	case "response.failed", "response.incomplete", "error":
+	case "response.failed", "response.incomplete", "response.cancelled", "error":
 		var reason *string
 		var respErr *model.ResponseError
 		switch streamEvent.Type {
@@ -451,9 +460,12 @@ func (o *ResponseOutbound) TransformStreamEvent(ctx context.Context, eventData [
 			events = append(events, model.StreamEvent{Kind: model.StreamEventKindError, ID: base.ID, Model: base.Model, Error: respErr})
 		}
 		events = append(events, model.StreamEvent{Kind: model.StreamEventKindMessageStop, ID: base.ID, Model: base.Model, Index: base.Index, StopReason: model.ParseFinishReason(lo.FromPtr(reason))})
+		if streamEvent.Response != nil && streamEvent.Response.Usage != nil {
+			events = append(events, model.StreamEvent{Kind: model.StreamEventKindUsageDelta, ID: base.ID, Model: base.Model, Usage: convertResponsesUsage(streamEvent.Response.Usage)})
+		}
 
 	default:
-		return nil, nil
+		return events, nil
 	}
 
 	return events, nil
@@ -550,15 +562,16 @@ func (i *ResponsesInput) UnmarshalJSON(data []byte) error {
 }
 
 type ResponsesItem struct {
-	ID       string          `json:"id,omitempty"`
-	Type     string          `json:"type,omitempty"`
-	Role     string          `json:"role,omitempty"`
-	Content  *ResponsesInput `json:"content,omitempty"`
-	Status   *string         `json:"status,omitempty"`
-	Text     *string         `json:"text,omitempty"`
-	Refusal  *string         `json:"refusal,omitempty"`
-	ImageURL *string         `json:"image_url,omitempty"`
-	Detail   *string         `json:"detail,omitempty"`
+	ID       string                 `json:"id,omitempty"`
+	Type     string                 `json:"type,omitempty"`
+	Role     string                 `json:"role,omitempty"`
+	Content  *ResponsesInput        `json:"content,omitempty"`
+	Status   *string                `json:"status,omitempty"`
+	Text     *string                `json:"text,omitempty"`
+	Refusal  *string                `json:"refusal,omitempty"`
+	ImageURL *string                `json:"image_url,omitempty"`
+	Detail   *string                `json:"detail,omitempty"`
+	Action   *model.WebSearchAction `json:"action,omitempty"`
 
 	// Annotations for output_text content
 	Annotations []ResponsesAnnotation `json:"annotations,omitempty"`
@@ -1607,6 +1620,11 @@ func convertToLLMResponseFromResponses(resp *ResponsesResponse) *model.InternalL
 		Object:             "chat.completion",
 		Model:              resp.Model,
 		Created:            resp.CreatedAt,
+	}
+	for _, item := range resp.Output {
+		if item.Type == "web_search_call" {
+			result.WebSearchCalls = model.MergeWebSearchCalls(result.WebSearchCalls, model.WebSearchCall{ID: item.ID, Status: lo.FromPtr(item.Status), Action: item.Action})
+		}
 	}
 	if len(resp.Output) > 0 {
 		if rawOutput, err := json.Marshal(sanitizeResponsesItems(resp.Output)); err == nil {

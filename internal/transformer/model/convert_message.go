@@ -65,25 +65,15 @@ func ToLLMMessage(m *Message) (*llm.Message, error) {
 		}
 		out.ToolCalls = append(out.ToolCalls, *tc)
 	}
+	// Visible and redacted reasoning may coexist. Project the blocks first,
+	// then let explicit items replace only the visible reasoning projection.
+	ToLLMReasoningBlocks(m, out)
 	if len(m.ReasoningItems) > 0 {
+		out.ReasoningItems = nil
 		for _, item := range m.ReasoningItems {
 			out.ReasoningItems = append(out.ReasoningItems, llm.ReasoningItem{ID: item.ID, Content: item.Content, Signature: item.Signature})
 		}
-	} else if len(m.ReasoningBlocks) > 0 {
-		ToLLMReasoningBlocks(m, out)
-	} else if len(m.RedactedThinkingBlocks) > 0 {
-		// AxonHub currently has one opaque redacted-reasoning field. Preserve
-		// the first block rather than dropping the entire signal when callers
-		// populated the legacy compatibility slice without ReasoningBlocks.
-		for _, block := range m.RedactedThinkingBlocks {
-			if block == "" {
-				continue
-			}
-			content := block
-			out.RedactedReasoningContent = &content
-			break
-		}
-	} else if m.ReasoningContent != nil || m.ReasoningSignature != nil {
+	} else if len(out.ReasoningItems) == 0 && (m.ReasoningContent != nil || m.ReasoningSignature != nil) {
 		// AxonHub still uses the legacy scalar fields for some provider stream
 		// events. Preserve a scalar-only reasoning/signature chunk as an item
 		// instead of silently dropping its opaque signature.
@@ -96,6 +86,16 @@ func ToLLMMessage(m *Message) (*llm.Message, error) {
 		}
 		if item.Content != "" || item.Signature != "" {
 			out.ReasoningItems = append(out.ReasoningItems, item)
+		}
+	}
+	if out.RedactedReasoningContent == nil {
+		// AxonHub has one opaque redacted-reasoning field. Keep the first
+		// nonempty legacy block independently of visible reasoning.
+		for _, block := range m.RedactedThinkingBlocks {
+			if block != "" {
+				out.RedactedReasoningContent = cloneStringPtr(&block)
+				break
+			}
 		}
 	}
 	return out, nil

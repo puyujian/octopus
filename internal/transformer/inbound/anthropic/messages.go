@@ -32,7 +32,9 @@ type MessagesInbound struct {
 
 	streamAggregator model.StreamAggregator
 	// storedResponse stores the non-stream response
-	storedResponse *model.InternalLLMResponse
+	storedResponse  *model.InternalLLMResponse
+	searchCalls     []model.WebSearchCall
+	searchesEmitted bool
 }
 
 func geminiThoughtSignatureShim(block MessageContentBlock) string {
@@ -55,6 +57,9 @@ func countGeminiSignatureShims(blocks []MessageContentBlock) int {
 func (i *MessagesInbound) TransformRequest(ctx context.Context, body []byte) (*model.InternalLLMRequest, error) {
 	var anthropicReq MessageRequest
 	if err := json.Unmarshal(body, &anthropicReq); err != nil {
+		return nil, err
+	}
+	if err := applyToolChanges(&anthropicReq); err != nil {
 		return nil, err
 	}
 	if anthropicReq.MaxTokens < 1 {
@@ -311,13 +316,7 @@ func (i *MessagesInbound) TransformRequest(ctx context.Context, body []byte) (*m
 						BlockType: block.Type,
 					}
 					if block.Content != nil {
-						if block.Content.Content != nil {
-							b, _ := json.Marshal(*block.Content.Content)
-							result.Content = b
-						} else if len(block.Content.MultipleContent) > 0 {
-							b, _ := json.Marshal(block.Content.MultipleContent)
-							result.Content = b
-						}
+						result.Content, _ = json.Marshal(block.Content)
 					}
 					contentParts = append(contentParts, model.MessageContentPart{
 						Type:             "server_tool_result",
@@ -722,6 +721,8 @@ func (i *MessagesInbound) TransformResponse(ctx context.Context, response *model
 		}
 	}
 
+	searchBlocks := searchResponseBlocks(response.WebSearchCalls)
+	resp.Content = append(searchBlocks, resp.Content...)
 	// Convert usage
 	if response.Usage != nil {
 		resp.Usage = i.convertUsage(response.Usage)
@@ -731,6 +732,9 @@ func (i *MessagesInbound) TransformResponse(ctx context.Context, response *model
 }
 
 func (i *MessagesInbound) TransformStream(ctx context.Context, stream *model.InternalLLMResponse) ([]byte, error) {
+	if stream != nil && (len(stream.WebSearchCalls) > 0 || len(i.searchCalls) > 0) {
+		return i.TransformStreamEvents(ctx, model.StreamEventsFromInternalResponse(stream))
+	}
 	// Handle upstream error event: forward as Anthropic SSE `event: error` and
 	// terminate the stream. Reference:
 	// https://docs.anthropic.com/en/api/messages-streaming#error-events
@@ -1231,6 +1235,11 @@ func (i *MessagesInbound) TransformStreamEvents(ctx context.Context, events []mo
 			break
 		}
 	}
+	for _, event := range events {
+		if event.WebSearchCall != nil {
+			i.searchCalls = model.MergeWebSearchCalls(i.searchCalls, *event.WebSearchCall)
+		}
+	}
 
 	var out [][]byte
 	ensureStarted := func(event model.StreamEvent) error {
@@ -1343,6 +1352,27 @@ func (i *MessagesInbound) TransformStreamEvents(ctx context.Context, events []mo
 		}
 		if event.Model != "" {
 			i.modelName = event.Model
+		}
+		if !i.searchesEmitted && len(i.searchCalls) > 0 && (event.Kind == model.StreamEventKindMessageStop || event.Kind == model.StreamEventKindError || event.Kind == model.StreamEventKindDone) {
+			if err := ensureStarted(event); err != nil {
+				return nil, err
+			}
+			if err := closeOpenBlock(); err != nil {
+				return nil, err
+			}
+			for _, block := range searchResponseBlocks(i.searchCalls) {
+				start, err := json.Marshal(StreamEvent{Type: "content_block_start", Index: &i.contentIndex, ContentBlock: &block})
+				if err != nil {
+					return nil, err
+				}
+				stop, err := json.Marshal(StreamEvent{Type: "content_block_stop", Index: &i.contentIndex})
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, formatSSEEvent("content_block_start", start), formatSSEEvent("content_block_stop", stop))
+				i.contentIndex++
+			}
+			i.searchesEmitted = true
 		}
 		switch event.Kind {
 		case model.StreamEventKindMessageStart:

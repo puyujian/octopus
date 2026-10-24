@@ -46,6 +46,9 @@ func (a *StreamAggregator) Response() *InternalLLMResponse {
 		if chunk.Usage != nil {
 			result.Usage = chunk.Usage
 		}
+		for _, call := range chunk.WebSearchCalls {
+			result.WebSearchCalls = MergeWebSearchCalls(result.WebSearchCalls, call)
+		}
 		for _, choice := range chunk.Choices {
 			existingChoice := choicesMap[choice.Index]
 			if existingChoice == nil {
@@ -120,7 +123,7 @@ func mergeChoiceDelta(existingChoice *Choice, choice Choice) {
 			existingChoice.Message.ToolCalls = MergeToolCallDelta(existingChoice.Message.ToolCalls, toolCall)
 		}
 		if delta.Refusal != "" {
-			existingChoice.Message.Refusal = delta.Refusal
+			existingChoice.Message.Refusal += delta.Refusal
 		}
 	}
 	if choice.FinishReason != nil {

@@ -12,6 +12,7 @@ RUN apk add --no-cache alpine-conf ca-certificates su-exec && \
 COPY build/docker/${TARGETPLATFORM}/octopus /app/octopus
 COPY scripts/dockerfiles/entrypoint.sh /entrypoint.sh
 
-RUN chmod +x /entrypoint.sh
+# Fail the image build if the binary cannot run in Alpine (e.g. a glibc build).
+RUN chmod +x /entrypoint.sh /app/octopus && /app/octopus --help > /dev/null
 
 CMD ["/entrypoint.sh"]

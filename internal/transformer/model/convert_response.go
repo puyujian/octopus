@@ -337,12 +337,9 @@ func FromLLMUsage(u *llm.Usage) *Usage {
 		out.CacheCreation5mInputTokens = u.PromptTokensDetails.WriteCached5MinTokens
 		out.CacheCreation1hInputTokens = u.PromptTokensDetails.WriteCached1HourTokens
 	}
-	// Anthropic uses explicit cache counters in the unified usage model. AxonHub
-	// also mirrors cache reads in PromptTokensDetails for OpenAI-style callers;
-	// preserve both representations when present.
-	if u.PromptTokensDetails != nil {
-		out.CacheReadInputTokens = u.PromptTokensDetails.CachedTokens
-	}
+	// AxonHub's PromptTokens already includes cached reads, even when TotalTokens
+	// is omitted. Keep the cached subset in PromptTokensDetails only; restoring
+	// Anthropic's separate counters is NormalizeResponseUsageForAPI's job.
 	if u.CompletionTokensDetails != nil {
 		out.CompletionTokensDetails = &CompletionTokensDetails{
 			ReasoningTokens:          u.CompletionTokensDetails.ReasoningTokens,

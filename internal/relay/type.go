@@ -128,6 +128,7 @@ type relayAttempt struct {
 	firstTokenTimeOutSec int
 	firstTokenBudget     *firstTokenBudget
 	retryAfter           time.Duration // forward() 提取后暂存
+	agentContinuations   []dbmodel.ChannelAttempt
 }
 
 // attemptResult 封装单次尝试的结果

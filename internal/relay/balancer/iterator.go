@@ -172,6 +172,14 @@ func (it *Iterator) Attempts() []model.ChannelAttempt {
 	return it.attempts
 }
 
+// RecordFollowup includes real upstream continuation calls in request history.
+func (it *Iterator) RecordFollowup(attempt model.ChannelAttempt) {
+	it.count++
+	attempt.AttemptNum = it.count
+	attempt.Sticky = it.IsSticky()
+	it.attempts = append(it.attempts, attempt)
+}
+
 // AttemptSpan 管理单次通道尝试的生命周期（计时、状态、结果）
 type AttemptSpan struct {
 	attempt   model.ChannelAttempt

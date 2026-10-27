@@ -359,6 +359,61 @@ data: {"type":"message_stop"}
 	}
 }
 
+func TestStreamProcessorIncompleteEOFStillCollectsMetrics(t *testing.T) {
+	collected := false
+	p := NewStreamProcessor(StreamConfig{
+		Source: newMockStreamSource([][]byte{[]byte("partial")}),
+		Writer: newMockStreamWriter(), Context: context.Background(),
+		Complete: func() bool { return false },
+		OnFinish: func(context.Context, []byte) error { collected = true; return nil },
+	})
+	if err := p.Run(); !errors.Is(err, ErrIncompleteUpstreamStream) {
+		t.Fatalf("expected incomplete EOF, got %v", err)
+	}
+	if !collected {
+		t.Fatal("lost partial metrics on premature EOF")
+	}
+}
+
+func TestStreamProcessorPassthroughTerminalUsesTopLevelType(t *testing.T) {
+	for _, tc := range []struct {
+		data     string
+		complete bool
+	}{
+		{`{"response":{"output":[{"type":"message"}]},"type":"response.completed"}`, true},
+		{`{"item":{"type":"response.completed"},"type":"response.output_item.done"}`, false},
+	} {
+		p := NewStreamProcessor(StreamConfig{
+			Source: newMockStreamSource([][]byte{[]byte("data: " + tc.data + "\n\n")}),
+			Writer: newMockStreamWriter(), Context: context.Background(), BufferRawStream: true,
+			TerminalEvents: map[string]struct{}{"response.completed": {}},
+		})
+		err := p.Run()
+		if (err == nil) != tc.complete {
+			t.Fatalf("nested type affected completion: complete=%t err=%v", tc.complete, err)
+		}
+	}
+}
+
+func TestStreamProcessorConvertedDisconnectAfterTerminal(t *testing.T) {
+	for _, complete := range []bool{false, true} {
+		ctx, cancel := context.WithCancel(context.Background())
+		p := NewStreamProcessor(StreamConfig{
+			Writer: newMockStreamWriter(), Context: ctx,
+			Complete: func() bool { return complete },
+		})
+		p.payloadWritten = true
+		cancel()
+		err := p.handleDisconnect()
+		if complete && err != nil {
+			t.Fatalf("completed response counted as cancelled: %v", err)
+		}
+		if !complete && !errors.Is(err, context.Canceled) {
+			t.Fatalf("lost client cancellation: %v", err)
+		}
+	}
+}
+
 func TestRawSource(t *testing.T) {
 	data := []byte("raw chunk data")
 	reader := io.NopCloser(bytes.NewReader(data))

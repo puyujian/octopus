@@ -2397,6 +2397,8 @@ func (o *ResponseOutbound) PassthroughConfig() model.PassthroughConfig {
 			"response.completed":  {},
 			"response.failed":     {},
 			"response.incomplete": {},
+			"response.cancelled":  {},
+			"response.canceled":   {},
 			"error":               {},
 		},
 		CollectMetrics: false, // OpenAI Responses uses different metrics semantics

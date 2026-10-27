@@ -439,6 +439,15 @@ func circuitFailureKind(retryEnabled bool, statusCode int) balancer.FailureKind 
 // attempt 统一管理一次通道尝试的完整生命周期
 func (ra *relayAttempt) attempt() attemptResult {
 	span := ra.iter.StartAttempt(ra.channel.ID, ra.usedKey.ID, ra.channel.Name)
+	defer func() {
+		for _, attempt := range ra.agentContinuations {
+			attempt.ChannelID = ra.channel.ID
+			attempt.ChannelKeyID = ra.usedKey.ID
+			attempt.ChannelName = ra.channel.Name
+			attempt.ModelName = ra.internalRequest.Model
+			ra.iter.RecordFollowup(attempt)
+		}
+	}()
 
 	// 转发请求
 	statusCode, fwdErr := ra.forward()
@@ -768,8 +777,13 @@ func (ra *relayAttempt) handleWSStreamResponseV2(ctx context.Context, reader *ws
 	// Hand off early heartbeat
 	ra.heartbeat.Hand()
 
-	// Build transform function
+	// Validate provider completion before the inbound adapter can synthesize
+	// a terminal event from a bare transport marker.
+	completion := &upstreamStreamCompletion{}
 	transform := func(ctx context.Context, data []byte) ([]byte, error) {
+		if err := completion.observe(data); err != nil {
+			return nil, err
+		}
 		return ra.transformStreamData(ctx, string(data))
 	}
 
@@ -781,7 +795,11 @@ func (ra *relayAttempt) handleWSStreamResponseV2(ctx context.Context, reader *ws
 
 	// Create StreamProcessor
 	processor := stream.NewStreamProcessor(stream.StreamConfig{
-		Source:              stream.NewWSSource(reader),
+		Source:   stream.NewWSSource(reader),
+		Complete: completion.complete,
+		OnFinish: func(ctx context.Context, _ []byte) error {
+			return ra.finishConvertedStream(ctx, completion)
+		},
 		Transform:           transform,
 		Writer:              ra.getStreamWriter(),
 		Context:             ctx,
@@ -930,13 +948,16 @@ func (ra *relayAttempt) handleResponsePassthrough(ctx context.Context, response 
 // forwardViaHTTPStandard 是 forwardViaHTTP 的原路径（直通判定失败时的兜底）。
 // 留作显式出口，避免 passthrough 失败时的递归。
 func (ra *relayAttempt) forwardViaHTTPStandard(ctx context.Context) (int, error) {
-	wireRequest := ra.internalRequest
+	wireRequest, err := projectReplayForOutbound(ctx, ra.internalRequest, ra.channel.Type)
+	if err != nil {
+		return 0, err
+	}
 	developerRoleDowngraded := false
 	reasoningMaxDowngraded := false
 	excludedSemanticParams := make(map[string]struct{})
 	if ra.channel.Type == outbound.OutboundTypeOpenAIChat &&
 		channelModelRequiresSystemRole(ra.channel.ID, ra.internalRequest.Model) {
-		wireRequest, developerRoleDowngraded = requestWithDeveloperRoleDowngraded(ra.internalRequest)
+		wireRequest, developerRoleDowngraded = requestWithDeveloperRoleDowngraded(wireRequest)
 	}
 
 	for {
@@ -1051,7 +1072,18 @@ func (ra *relayAttempt) forwardViaHTTPStandard(ctx context.Context) (int, error)
 		// 处理响应
 		if ra.internalRequest.Stream != nil && *ra.internalRequest.Stream {
 			// Use V2 StreamProcessor-based implementation
-			if err := ra.handleStreamResponseV2(ctx, response); err != nil {
+			var source stream.StreamSource
+			if ra.agentContinuationEnabled() {
+				guard, err := newAgentContinuationSource(ctx, response, outboundRequest, ra.sendAgentContinuation)
+				if err != nil {
+					return 0, fmt.Errorf("failed to prepare agent continuation: %w", err)
+				}
+				if guard != nil {
+					source = guard
+					defer func() { ra.agentContinuations = guard.attempts() }()
+				}
+			}
+			if err := ra.handleStreamResponseWithSourceV2(ctx, response, source); err != nil {
 				return 0, err
 			}
 			return response.StatusCode, nil
@@ -1222,7 +1254,14 @@ func (ra *relayAttempt) firstEventValidator() func([]byte) error {
 
 // handleStreamResponseV2 uses StreamProcessor for unified stream handling.
 func (ra *relayAttempt) handleStreamResponseV2(ctx context.Context, response *http.Response) error {
+	return ra.handleStreamResponseWithSourceV2(ctx, response, nil)
+}
+
+func (ra *relayAttempt) handleStreamResponseWithSourceV2(ctx context.Context, response *http.Response, source stream.StreamSource) error {
 	defer ra.closeFirstTokenBudget()
+	if source != nil {
+		defer source.Close()
+	}
 
 	// Content-Type validation
 	if ct := response.Header.Get("Content-Type"); ct != "" && !strings.Contains(strings.ToLower(ct), "text/event-stream") {
@@ -1233,8 +1272,13 @@ func (ra *relayAttempt) handleStreamResponseV2(ctx context.Context, response *ht
 	// Hand off early heartbeat
 	ra.heartbeat.Hand()
 
-	// Build transform function
+	// Validate provider completion before the inbound adapter can synthesize
+	// a terminal event from a bare transport marker.
+	completion := &upstreamStreamCompletion{}
 	transform := func(ctx context.Context, data []byte) ([]byte, error) {
+		if err := completion.observe(data); err != nil {
+			return nil, err
+		}
 		return ra.transformStreamData(ctx, string(data))
 	}
 
@@ -1245,8 +1289,15 @@ func (ra *relayAttempt) handleStreamResponseV2(ctx context.Context, response *ht
 	}
 
 	// Create StreamProcessor
+	if source == nil {
+		source = stream.NewSSESource(response.Body, maxSSEEventSize)
+	}
 	processor := stream.NewStreamProcessor(stream.StreamConfig{
-		Source:              stream.NewSSESource(response.Body, maxSSEEventSize),
+		Source:   source,
+		Complete: completion.complete,
+		OnFinish: func(ctx context.Context, _ []byte) error {
+			return ra.finishConvertedStream(ctx, completion)
+		},
 		Transform:           transform,
 		Writer:              ra.getStreamWriter(),
 		Context:             ctx,
@@ -1348,7 +1399,8 @@ func (ra *relayAttempt) handleStreamResponsePassthroughV2(ctx context.Context, r
 				if json.Unmarshal([]byte(event.Data), &probe) != nil {
 					continue
 				}
-				if probe.Type == "error" || probe.Type == "response.failed" || probe.Error != nil {
+				if probe.Type == "error" || probe.Type == "response.failed" || probe.Type == "response.incomplete" ||
+					probe.Type == "response.cancelled" || probe.Type == "response.canceled" || probe.Error != nil {
 					if err := inspectFirstSSEEvent(ra.internalRequest.RawAPIFormat, []byte("event: "+event.Type+"\ndata: "+event.Data+"\n\n")); err != nil {
 						return err
 					}
@@ -1587,6 +1639,8 @@ var (
 		"response.completed":  {},
 		"response.failed":     {},
 		"response.incomplete": {},
+		"response.cancelled":  {},
+		"response.canceled":   {},
 		"error":               {},
 	}
 	anthropicPassthroughTerminalEvents = map[string]struct{}{

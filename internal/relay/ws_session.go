@@ -445,7 +445,18 @@ func buildNextReplayWindow(existing json.RawMessage, req *transformerModel.Inter
 		return nil, false
 	}
 	if len(resp.RawResponsesOutputItems) == 0 {
-		return base, true
+		// Converted Chat/Anthropic/Gemini responses have structured choices but
+		// no native Responses output array. Include their assistant turn too;
+		// otherwise the raw replay window silently loses replies and tool calls.
+		messages := assistantMessagesFromResponse(resp)
+		if len(messages) == 0 {
+			return base, true
+		}
+		output, err := openaiOutbound.MarshalResponsesInputItems(messages)
+		if err != nil {
+			return nil, false
+		}
+		return mergeRawJSONArray(base, output)
 	}
 	return mergeRawJSONArray(base, resp.RawResponsesOutputItems)
 }

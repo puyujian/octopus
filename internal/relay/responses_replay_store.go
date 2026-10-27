@@ -1,12 +1,12 @@
 package relay
 
 import (
+	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/bestruirui/octopus/internal/relay/balancer"
@@ -20,17 +20,103 @@ const (
 	responsesReplayStoreSweepInterval = 5 * time.Minute
 )
 
+// Entries are immutable after insertion. A single lock protects both the LRU
+// order and byte accounting, including replacements and concurrent expiry.
 type responsesReplayStateEntry struct {
+	key       string
 	state     *wsConversationState
 	expiresAt time.Time
 	size      int
 }
 
-var responsesReplayStore sync.Map
+type responsesReplayCache struct {
+	mu         sync.Mutex
+	entries    map[string]*list.Element
+	order      list.List // most recently used first
+	totalSize  int
+	maxEntries int
+	maxSize    int
+}
 
-var responsesReplayStoreStats struct {
-	entries   atomic.Int64
-	totalSize atomic.Int64
+func newResponsesReplayCache(maxEntries, maxSize int) *responsesReplayCache {
+	return &responsesReplayCache{
+		entries:    make(map[string]*list.Element),
+		maxEntries: maxEntries,
+		maxSize:    maxSize,
+	}
+}
+
+var responsesReplayStore = newResponsesReplayCache(responsesReplayStoreMaxEntries, responsesReplayStoreMaxSize)
+
+func (c *responsesReplayCache) removeLocked(element *list.Element) {
+	entry := element.Value.(*responsesReplayStateEntry)
+	delete(c.entries, entry.key)
+	c.order.Remove(element)
+	c.totalSize -= entry.size
+}
+
+func (c *responsesReplayCache) sweepLocked(now time.Time) int {
+	removed := 0
+	for _, element := range c.entries {
+		entry := element.Value.(*responsesReplayStateEntry)
+		if !now.Before(entry.expiresAt) {
+			c.removeLocked(element)
+			removed++
+		}
+	}
+	return removed
+}
+
+func (c *responsesReplayCache) load(key string) *wsConversationState {
+	c.mu.Lock()
+	element := c.entries[key]
+	if element == nil {
+		c.mu.Unlock()
+		return nil
+	}
+	entry := element.Value.(*responsesReplayStateEntry)
+	if !time.Now().Before(entry.expiresAt) {
+		c.removeLocked(element)
+		c.mu.Unlock()
+		return nil
+	}
+	c.order.MoveToFront(element)
+	c.mu.Unlock()
+	// The immutable snapshot remains valid if it is evicted while cloning.
+	return cloneWSConversationState(entry.state)
+}
+
+func (c *responsesReplayCache) store(key string, state *wsConversationState, ttl time.Duration) bool {
+	size := estimateStateSize(state) + len(key)
+	// Reject an individually oversized state before evicting anything. Never
+	// silently trim conversation history or discard an existing usable value.
+	if size > c.maxSize || c.maxEntries < 1 || state == nil {
+		return false
+	}
+	entry := &responsesReplayStateEntry{
+		key: key, state: cloneWSConversationState(state), size: size,
+		expiresAt: time.Now().Add(ttl),
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	oldSize, added := 0, 1
+	if old := c.entries[key]; old != nil {
+		oldSize = old.Value.(*responsesReplayStateEntry).size
+		added = 0
+	}
+	if len(c.entries)+added > c.maxEntries || c.totalSize-oldSize+size > c.maxSize {
+		// Prefer expired entries over evicting a still usable conversation.
+		c.sweepLocked(time.Now())
+	}
+	if old := c.entries[key]; old != nil {
+		c.removeLocked(old)
+	}
+	for len(c.entries) >= c.maxEntries || c.totalSize+size > c.maxSize {
+		c.removeLocked(c.order.Back())
+	}
+	c.entries[key] = c.order.PushFront(entry)
+	c.totalSize += size
+	return true
 }
 
 func init() {
@@ -55,31 +141,12 @@ func startResponsesReplayStoreSweeper() {
 }
 
 func sweepExpiredResponsesReplayStates() {
-	now := time.Now()
-	removed := 0
-	responsesReplayStore.Range(func(key, value interface{}) bool {
-		entry, ok := value.(*responsesReplayStateEntry)
-		if !ok || entry == nil {
-			// 使用 CompareAndDelete 确保只删除我们检查过的这个 entry
-			if responsesReplayStore.CompareAndDelete(key, value) {
-				responsesReplayStoreStats.entries.Add(-1)
-				removed++
-			}
-			return true
-		}
-		if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
-			// 使用 CompareAndDelete 防止误删并发写入的新 entry
-			if responsesReplayStore.CompareAndDelete(key, entry) {
-				responsesReplayStoreStats.entries.Add(-1)
-				responsesReplayStoreStats.totalSize.Add(-int64(entry.size))
-				removed++
-			}
-		}
-		return true
-	})
+	responsesReplayStore.mu.Lock()
+	removed := responsesReplayStore.sweepLocked(time.Now())
+	entries, size := len(responsesReplayStore.entries), responsesReplayStore.totalSize
+	responsesReplayStore.mu.Unlock()
 	if removed > 0 {
-		log.Debugf("HTTP replay store sweep: removed %d expired entries, current entries=%d, size=%d",
-			removed, responsesReplayStoreStats.entries.Load(), responsesReplayStoreStats.totalSize.Load())
+		log.Debugf("HTTP replay store sweep: removed %d expired entries, current entries=%d, size=%d", removed, entries, size)
 	}
 }
 
@@ -100,29 +167,7 @@ func loadResponsesReplayState(apiKeyID, groupID int, requestModel, responseID st
 		return nil
 	}
 
-	v, ok := responsesReplayStore.Load(key)
-	if !ok {
-		return nil
-	}
-
-	entry, ok := v.(*responsesReplayStateEntry)
-	if !ok || entry == nil || entry.state == nil {
-		// 使用 CompareAndDelete 确保只删除我们检查过的这个 entry
-		if responsesReplayStore.CompareAndDelete(key, v) {
-			responsesReplayStoreStats.entries.Add(-1)
-		}
-		return nil
-	}
-	if !entry.expiresAt.IsZero() && time.Now().After(entry.expiresAt) {
-		// 使用 CompareAndDelete 防止误删并发写入的新 entry
-		if responsesReplayStore.CompareAndDelete(key, entry) {
-			responsesReplayStoreStats.entries.Add(-1)
-			responsesReplayStoreStats.totalSize.Add(-int64(entry.size))
-		}
-		return nil
-	}
-
-	return cloneWSConversationState(entry.state)
+	return responsesReplayStore.load(key)
 }
 
 func storeResponsesReplayState(apiKeyID, groupID int, requestModel string, state *wsConversationState, ttl time.Duration) {
@@ -143,53 +188,11 @@ func storeResponsesReplayState(apiKeyID, groupID int, requestModel string, state
 		return
 	}
 
-	cloned := cloneWSConversationState(state)
-	if cloned == nil {
-		return
-	}
+	cloned := *state
 	cloned.RequestModel = requestModel
 
-	estimatedSize := estimateStateSize(cloned)
-	newEntry := &responsesReplayStateEntry{
-		state:     cloned,
-		expiresAt: time.Now().Add(ttl),
-		size:      estimatedSize,
-	}
-
-	// 使用 Swap 保证统计一致性：先尝试存入，再根据旧值调整统计
-	old, loaded := responsesReplayStore.Swap(key, newEntry)
-	if loaded {
-		// 更新已有 key：调整 size 差值，entries 不变
-		if oldEntry, ok := old.(*responsesReplayStateEntry); ok && oldEntry != nil {
-			responsesReplayStoreStats.totalSize.Add(int64(estimatedSize) - int64(oldEntry.size))
-			// 替换后也需检查容量：新 entry 可能远大于旧 entry
-			if int64(estimatedSize) > int64(oldEntry.size) &&
-				responsesReplayStoreStats.totalSize.Load() > responsesReplayStoreMaxSize {
-				// 超出容量，回滚为旧 entry
-				if responsesReplayStore.CompareAndSwap(key, newEntry, oldEntry) {
-					responsesReplayStoreStats.totalSize.Add(int64(oldEntry.size) - int64(estimatedSize))
-				}
-				log.Warnf("HTTP replay store size limit reached after replacement (size=%d), rolling back",
-					responsesReplayStoreStats.totalSize.Load())
-			}
-		} else {
-			responsesReplayStoreStats.totalSize.Add(int64(estimatedSize))
-		}
-	} else {
-		// 新 key：增加 entries，检查容量，超限则回滚
-		currentEntries := responsesReplayStoreStats.entries.Add(1)
-		responsesReplayStoreStats.totalSize.Add(int64(estimatedSize))
-
-		if currentEntries > responsesReplayStoreMaxEntries ||
-			responsesReplayStoreStats.totalSize.Load() > responsesReplayStoreMaxSize {
-			// 超出容量，使用 CompareAndDelete 回滚（只删除我们刚写入的 newEntry）
-			if responsesReplayStore.CompareAndDelete(key, newEntry) {
-				responsesReplayStoreStats.entries.Add(-1)
-				responsesReplayStoreStats.totalSize.Add(-int64(estimatedSize))
-			}
-			log.Warnf("HTTP replay store capacity limit reached (entries=%d, size=%d), skipping save",
-				currentEntries-1, responsesReplayStoreStats.totalSize.Load())
-		}
+	if !responsesReplayStore.store(key, &cloned, ttl) {
+		log.Warnf("HTTP replay state exceeds cache capacity (size=%d, limit=%d), skipping save", estimateStateSize(&cloned)+len(key), responsesReplayStoreMaxSize)
 	}
 }
 
@@ -268,7 +271,9 @@ func responsesReplayStateToSticky(state *wsConversationState) *balancer.SessionE
 }
 
 func resetResponsesReplayStore() {
-	responsesReplayStore = sync.Map{}
-	responsesReplayStoreStats.entries.Store(0)
-	responsesReplayStoreStats.totalSize.Store(0)
+	responsesReplayStore.mu.Lock()
+	defer responsesReplayStore.mu.Unlock()
+	responsesReplayStore.entries = make(map[string]*list.Element)
+	responsesReplayStore.order.Init()
+	responsesReplayStore.totalSize = 0
 }

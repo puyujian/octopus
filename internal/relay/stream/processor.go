@@ -3,6 +3,7 @@ package stream
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/bestruirui/octopus/internal/utils/log"
 	"github.com/bestruirui/octopus/internal/utils/safe"
+	"github.com/looplj/axonhub/llm"
 	"github.com/tmaxmax/go-sse"
 )
 
@@ -19,6 +21,9 @@ import (
 // any payload (all events skipped by transform or no events at all).
 // Relay should fail over to another channel.
 var ErrEmptyUpstreamStream = errors.New("upstream stream ended without forwarding any payload")
+
+// Share the transformer error so callers can classify premature EOF with errors.Is.
+var ErrIncompleteUpstreamStream = llm.ErrStreamIncomplete
 
 // StreamSource abstracts different event sources (SSE, WebSocket, raw bytes).
 type StreamSource interface {
@@ -61,6 +66,9 @@ type StreamConfig struct {
 	// Callbacks
 	OnFirstToken func()                                            // Called when first payload written
 	OnFinish     func(ctx context.Context, rawStream []byte) error // Called on stream end
+	// Complete checks protocol completion for converted streams without buffering
+	// their contents. A transport EOF alone does not imply a complete response.
+	Complete func() bool
 
 	// First-event validation: if non-nil, called before the first payload is
 	// written to the client. Returning an error aborts the stream before any
@@ -172,6 +180,9 @@ func (p *StreamProcessor) Run() error {
 				if r.err == io.EOF {
 					return p.finalize()
 				}
+				if p.config.Context.Err() != nil {
+					return p.handleDisconnect()
+				}
 				return fmt.Errorf("stream read error: %w", r.err)
 			}
 
@@ -260,7 +271,7 @@ func (p *StreamProcessor) writeHeartbeat() error {
 // handleDisconnect handles context cancellation or timeout.
 func (p *StreamProcessor) handleDisconnect() error {
 	// Check for terminal events in buffered stream
-	if p.config.BufferRawStream && len(p.config.TerminalEvents) > 0 {
+	if p.config.Complete != nil || (p.config.BufferRawStream && len(p.config.TerminalEvents) > 0) {
 		if p.streamReachedTerminal() {
 			log.Debugf("client disconnected but stream reached terminal event, treating as success")
 			return p.finalize()
@@ -301,6 +312,9 @@ func (p *StreamProcessor) finalize() error {
 			return err
 		}
 	}
+	if (p.config.Complete != nil || len(p.config.TerminalEvents) > 0) && !p.streamReachedTerminal() {
+		return ErrIncompleteUpstreamStream
+	}
 
 	return nil
 }
@@ -312,6 +326,9 @@ func (p *StreamProcessor) PayloadWritten() bool {
 
 // streamReachedTerminal checks if buffered stream contains a terminal event.
 func (p *StreamProcessor) streamReachedTerminal() bool {
+	if p.config.Complete != nil {
+		return p.config.Complete()
+	}
 	if p.rawBuffer.Len() == 0 {
 		return false
 	}
@@ -339,21 +356,14 @@ func (p *StreamProcessor) streamReachedTerminal() bool {
 	return false
 }
 
-// extractJSONType extracts "type" field from JSON without full unmarshaling.
+// extractJSONType reads the top-level type, independent of property order.
+// Nested output items and text containing "type" are not stream terminals.
 func extractJSONType(data string) string {
-	// Simple extraction: find "type":"value"
-	if idx := strings.Index(data, `"type"`); idx >= 0 {
-		rest := data[idx+6:]
-		if idx := strings.IndexByte(rest, ':'); idx >= 0 {
-			rest = rest[idx+1:]
-			rest = strings.TrimSpace(rest)
-			if len(rest) > 0 && rest[0] == '"' {
-				rest = rest[1:]
-				if idx := strings.IndexByte(rest, '"'); idx >= 0 {
-					return rest[:idx]
-				}
-			}
-		}
+	var event struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal([]byte(data), &event) == nil {
+		return event.Type
 	}
 	return ""
 }

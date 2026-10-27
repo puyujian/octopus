@@ -2,11 +2,108 @@ package relay
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	transformerModel "github.com/bestruirui/octopus/internal/transformer/model"
 )
+
+func replayCacheTestState(id string, padding int) *wsConversationState {
+	return &wsConversationState{LastResponseID: id, ReplayWindowItems: json.RawMessage(strings.Repeat("x", padding))}
+}
+
+func TestResponsesReplayCacheEvictsLeastRecentlyUsed(t *testing.T) {
+	c := newResponsesReplayCache(2, 4096)
+	c.store("a", replayCacheTestState("a", 0), time.Minute)
+	c.store("b", replayCacheTestState("b", 0), time.Minute)
+	if c.load("a") == nil {
+		t.Fatal("missing first entry")
+	}
+	if !c.store("c", replayCacheTestState("c", 0), time.Minute) {
+		t.Fatal("new conversation rejected at capacity")
+	}
+	if c.load("b") != nil || c.load("a") == nil || c.load("c") == nil {
+		t.Fatal("expected recently read and newly written conversations to survive")
+	}
+}
+
+func TestResponsesReplayCacheByteLimitAndReplacement(t *testing.T) {
+	c := newResponsesReplayCache(10, 1100)
+	for _, key := range []string{"a", "b", "c"} {
+		c.store(key, replayCacheTestState(key, 50), time.Minute)
+	}
+	// Growing a hot entry must free space by evicting older entries.
+	if !c.store("c", replayCacheTestState("c", 500), time.Minute) {
+		t.Fatal("replacement rejected instead of evicting an older state")
+	}
+	if c.load("a") != nil || c.load("c") == nil {
+		t.Fatal("byte limit did not preserve the updated conversation")
+	}
+	// A state exceeding the whole budget must not flush the cache or replace
+	// the previous usable state with a truncated transcript.
+	before := c.totalSize
+	if c.store("c", replayCacheTestState("c", 2000), time.Minute) {
+		t.Fatal("accepted an oversized state")
+	}
+	if c.totalSize != before || len(c.load("c").ReplayWindowItems) != 500 {
+		t.Fatal("oversized replacement destroyed existing state")
+	}
+}
+
+func TestResponsesReplayCacheExpiresBeforeEvictingLiveState(t *testing.T) {
+	c := newResponsesReplayCache(2, 4096)
+	c.store("live", replayCacheTestState("live", 0), time.Minute)
+	c.store("expired", replayCacheTestState("expired", 0), -time.Second)
+	c.store("new", replayCacheTestState("new", 0), time.Minute)
+	if c.load("expired") != nil || c.load("live") == nil || c.load("new") == nil {
+		t.Fatal("evicted a usable state before clearing expired entries")
+	}
+	if c.totalSize != estimateStateSize(replayCacheTestState("live", 0))+len("live")+estimateStateSize(replayCacheTestState("new", 0))+len("new") {
+		t.Fatal("expiry left incorrect byte accounting")
+	}
+}
+
+func TestResponsesReplayCacheConcurrentAccounting(t *testing.T) {
+	c := newResponsesReplayCache(12, 6000)
+	var wg sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for turn := 0; turn < 100; turn++ {
+				key := fmt.Sprintf("state-%d", (worker+turn)%20)
+				ttl := time.Minute
+				if turn%7 == 0 {
+					ttl = -time.Second
+				}
+				c.store(key, replayCacheTestState(key, turn%5*50), ttl)
+				if loaded := c.load(key); loaded != nil {
+					loaded.LastResponseID = "mutation must not change cache"
+				}
+				c.mu.Lock()
+				c.sweepLocked(time.Now())
+				c.mu.Unlock()
+			}
+		}(worker)
+	}
+	wg.Wait()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var size int
+	for key, el := range c.entries {
+		entry := el.Value.(*responsesReplayStateEntry)
+		if entry.state.LastResponseID != key {
+			t.Fatal("a caller mutated cached state")
+		}
+		size += entry.size
+	}
+	if size != c.totalSize || size > c.maxSize || len(c.entries) > c.maxEntries || c.order.Len() != len(c.entries) {
+		t.Fatalf("inconsistent cache: bytes=%d recorded=%d entries=%d list=%d", size, c.totalSize, len(c.entries), c.order.Len())
+	}
+}
 
 func TestResponsesReplayStateKey(t *testing.T) {
 	key1 := responsesReplayStateKey(1, 10, "gpt-4", "resp_abc123")

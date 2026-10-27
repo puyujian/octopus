@@ -118,7 +118,7 @@ func (i *ResponseInbound) TransformResponse(ctx context.Context, response *model
 func (i *ResponseInbound) TransformStream(ctx context.Context, stream *model.InternalLLMResponse) ([]byte, error) {
 	// Handle [DONE] marker
 	if stream.Object == "[DONE]" {
-		return []byte("data: [DONE]\n\n"), nil
+		return i.processStreamEvents(ctx, []model.StreamEvent{{Kind: model.StreamEventKindDone}}, false)
 	}
 
 	// Preserve the original chunk for aggregation; the stream-event view is a
@@ -234,34 +234,20 @@ func (i *ResponseInbound) processStreamEvents(ctx context.Context, events []mode
 			}
 
 		case model.StreamEventKindUsageDelta:
-			if event.Usage != nil && i.hasFinished && !i.responseCompleted {
-				i.responseCompleted = true
+			if event.Usage != nil {
 				i.usage = event.Usage
-				eventType, status := responsesTerminalEvent(i.finalFinishReason)
-				output := i.finalOutputItems()
-				if event.ProviderExtensions != nil && event.ProviderExtensions.OpenAI != nil && len(event.ProviderExtensions.OpenAI.RawResponseItems) > 0 {
-					var items []ResponsesItem
-					if err := json.Unmarshal(event.ProviderExtensions.OpenAI.RawResponseItems, &items); err == nil {
-						output = items
-					}
+				var rawOutput json.RawMessage
+				if event.ProviderExtensions != nil && event.ProviderExtensions.OpenAI != nil {
+					rawOutput = event.ProviderExtensions.OpenAI.RawResponseItems
 				}
-				response := &ResponsesResponse{
-					Object:     "response",
-					ID:         i.responseID,
-					Model:      i.model,
-					CreatedAt:  i.createdAt,
-					Status:     &status,
-					Truncation: i.truncation,
-					Output:     output,
-					Usage:      convertUsageToResponses(i.usage),
-				}
-				out = append(out, i.enqueueEvent(&ResponsesStreamEvent{Type: eventType, Response: response}))
+				out = append(out, i.completeStreamResponse(rawOutput))
 			}
 
 		case model.StreamEventKindDone:
-			if len(out) == 0 {
-				return []byte("data: [DONE]\n\n"), nil
-			}
+			// Usage is optional in Chat SSE. A semantic finish followed by
+			// transport completion must still produce the native terminal event.
+			out = append(out, i.completeStreamResponse(nil))
+			out = append(out, []byte("data: [DONE]\n\n"))
 
 		case model.StreamEventKindError:
 			if event.Error == nil {
@@ -298,6 +284,27 @@ func (i *ResponseInbound) processStreamEvents(ctx context.Context, events []mode
 		}
 	}
 	return result, nil
+}
+
+// completeStreamResponse never turns a transport-only close into success.
+func (i *ResponseInbound) completeStreamResponse(rawOutput json.RawMessage) []byte {
+	if !i.hasFinished || i.responseCompleted {
+		return nil
+	}
+	i.responseCompleted = true
+	eventType, status := responsesTerminalEvent(i.finalFinishReason)
+	output := i.finalOutputItems()
+	if len(rawOutput) > 0 {
+		var items []ResponsesItem
+		if json.Unmarshal(rawOutput, &items) == nil {
+			output = items
+		}
+	}
+	return i.enqueueEvent(&ResponsesStreamEvent{Type: eventType, Response: &ResponsesResponse{
+		Object: "response", ID: i.responseID, Model: i.model, CreatedAt: i.createdAt,
+		Status: &status, Truncation: i.truncation, Output: output,
+		Usage: convertUsageToResponses(i.usage),
+	}})
 }
 
 func (i *ResponseInbound) enqueueEvent(ev *ResponsesStreamEvent) []byte {
@@ -1687,20 +1694,25 @@ func firstUnsupportedResponsesTopLevelItemType(item *ResponsesItem) string {
 	default:
 		return item.Type
 	}
-	if unsupported := firstUnsupportedResponsesContentItemType(item.Content); unsupported != "" {
+	if unsupported := firstUnsupportedResponsesContentItemType(item.Content, item.Type); unsupported != "" {
 		return unsupported
 	}
-	if unsupported := firstUnsupportedResponsesContentItemType(item.Output); unsupported != "" {
+	if unsupported := firstUnsupportedResponsesContentItemType(item.Output, ""); unsupported != "" {
 		return unsupported
 	}
 	return ""
 }
 
-func firstUnsupportedResponsesContentItemType(input *ResponsesInput) string {
+func firstUnsupportedResponsesContentItemType(input *ResponsesInput, parentType string) string {
 	if input == nil || input.Text != nil || len(input.Items) == 0 {
 		return ""
 	}
 	for _, item := range input.Items {
+		// Reasoning history is convertible to Chat reasoning_content. The same
+		// part inside a message is not ordinary message text.
+		if parentType == "reasoning" && item.Type == "reasoning_text" {
+			continue
+		}
 		switch item.Type {
 		case "input_text", "text", "output_text", "input_image", "compaction", "compaction_summary":
 			continue
@@ -1909,8 +1921,23 @@ func convertItemToMessage(item *ResponsesItem) (*model.Message, error) {
 		}
 
 		var reasoningText strings.Builder
-		for _, summary := range item.Summary {
-			reasoningText.WriteString(summary.Text)
+		if item.Content != nil {
+			if item.Content.Text != nil {
+				reasoningText.WriteString(*item.Content.Text)
+			} else {
+				for _, part := range item.Content.Items {
+					if part.Type == "reasoning_text" && part.Text != nil {
+						reasoningText.WriteString(*part.Text)
+					}
+				}
+			}
+		}
+		// Full reasoning and its summary describe the same thinking. Prefer
+		// the full content and retain summary-only clients as a fallback.
+		if reasoningText.Len() == 0 {
+			for _, summary := range item.Summary {
+				reasoningText.WriteString(summary.Text)
+			}
 		}
 
 		if reasoningText.Len() > 0 || item.EncryptedContent != nil {

@@ -704,7 +704,7 @@ func TestHandlerFirstTokenTimeoutCoversUpstreamHeaderWaitAndFailsOver(t *testing
 	secondServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		secondHits.Add(1)
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte(`data: {"id":"fast","object":"chat.completion.chunk","created":1,"model":"fast-model","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"}}]}
+		_, _ = w.Write([]byte(`data: {"id":"fast","object":"chat.completion.chunk","created":1,"model":"fast-model","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}
 
 data: [DONE]
 
@@ -803,7 +803,7 @@ func TestHandlerFirstTokenTimeoutStopsAfterFirstStreamChunk(t *testing.T) {
 			flusher.Flush()
 		}
 		time.Sleep(1200 * time.Millisecond)
-		_, _ = w.Write([]byte(`data: {"id":"stream","object":"chat.completion.chunk","created":1,"model":"stream-model","choices":[{"index":0,"delta":{"content":" second"}}]}
+		_, _ = w.Write([]byte(`data: {"id":"stream","object":"chat.completion.chunk","created":1,"model":"stream-model","choices":[{"index":0,"delta":{"content":" second"},"finish_reason":"stop"}]}
 
 data: [DONE]
 

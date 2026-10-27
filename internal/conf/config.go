@@ -38,11 +38,17 @@ type Startup struct {
 	CacheInitTimeoutSeconds int `mapstructure:"cache_init_timeout_seconds"`
 }
 
+type Relay struct {
+	// Opt in only channels with observed premature text-only agent stops.
+	AgentAutoContinueChannelIDs []int `mapstructure:"agent_auto_continue_channel_ids"`
+}
+
 type Config struct {
 	Server   Server   `mapstructure:"server"`
 	Log      Log      `mapstructure:"log"`
 	Database Database `mapstructure:"database"`
 	Startup  Startup  `mapstructure:"startup"`
+	Relay    Relay    `mapstructure:"relay"`
 }
 
 var AppConfig Config
@@ -105,4 +111,5 @@ func setDefaults() {
 	viper.SetDefault("log.access.slow_threshold_ms", 3000)
 	viper.SetDefault("log.relay.summary", true)
 	viper.SetDefault("startup.cache_init_timeout_seconds", 120)
+	viper.SetDefault("relay.agent_auto_continue_channel_ids", []int{})
 }

@@ -184,6 +184,68 @@ func TestConvertToInternalRequestMarksPassthroughForUnsupportedInputItem(t *test
 	}
 }
 
+func TestResponsesReasoningContentSurvivesChatConversion(t *testing.T) {
+	for _, tc := range []struct {
+		name, reasoning, want string
+	}{
+		{"content", `"content":[{"type":"reasoning_text","text":"first "},{"type":"reasoning_text","text":"second"}],"summary":[]`, "first second"},
+		{"summary", `"summary":[{"type":"summary_text","text":"summary"}]`, "summary"},
+		{"content and summary", `"content":[{"type":"reasoning_text","text":"full reasoning"}],"summary":[{"type":"summary_text","text":"short summary"}]`, "full reasoning"},
+		{"text content", `"content":"plain reasoning","summary":[]`, "plain reasoning"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"model":"deepseek-v4-flash","input":[{"type":"message","role":"user","content":"hello"},{"type":"reasoning","id":"rs_1","encrypted_content":"opaque",` + tc.reasoning + `},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]},{"type":"message","role":"user","content":"continue"}]}`)
+			req, err := (&ResponseInbound{}).TransformRequest(context.Background(), body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if req.HasOpenAIResponsesPassthrough() {
+				t.Fatalf("reasoning text must be convertible to Chat: %#v", req.GetOpenAIExtensions())
+			}
+			if len(req.Messages) < 2 || req.Messages[1].ReasoningContent == nil || *req.Messages[1].ReasoningContent != tc.want {
+				t.Fatalf("reasoning content lost: %#v", req.Messages)
+			}
+			if req.Messages[1].ReasoningSignature == nil || *req.Messages[1].ReasoningSignature != "opaque" {
+				t.Fatal("encrypted reasoning signature lost")
+			}
+			httpReq, err := (&openaiOutbound.ChatOutbound{}).TransformRequest(context.Background(), req, "https://example.com/v1", "test-key")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer httpReq.Body.Close()
+			var wire struct {
+				Messages []struct {
+					ReasoningContent string `json:"reasoning_content"`
+				} `json:"messages"`
+			}
+			if err := json.NewDecoder(httpReq.Body).Decode(&wire); err != nil {
+				t.Fatal(err)
+			}
+			for _, msg := range wire.Messages {
+				if msg.ReasoningContent == tc.want {
+					return
+				}
+			}
+			t.Fatalf("Chat wire lost reasoning: %#v", wire.Messages)
+		})
+	}
+}
+
+func TestResponsesReasoningContentRejectsUnsupportedContext(t *testing.T) {
+	for _, item := range []string{
+		`{"type":"message","role":"assistant","content":[{"type":"reasoning_text","text":"misplaced"}]}`,
+		`{"type":"reasoning","content":[{"type":"input_file","file_id":"file_1"}]}`,
+	} {
+		req, err := (&ResponseInbound{}).TransformRequest(context.Background(), []byte(`{"model":"test","input":[`+item+`]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !req.HasOpenAIResponsesPassthrough() {
+			t.Fatalf("unsupported content must still require Responses: %s", item)
+		}
+	}
+}
+
 func TestConvertToInternalRequestPreservesFileAndAudioInputsAsRawFragments(t *testing.T) {
 	req := &ResponsesRequest{
 		Model: "gpt-4o",
